@@ -24,9 +24,20 @@
 #include <queue>
 #include <chrono>
 
+#ifdef __APPLE__
+#include <os/log.h>
+#define NDI_LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "NDI Plugin: " fmt, ##__VA_ARGS__)
+#else
+#define NDI_LOG(fmt, ...) printf("NDI Plugin: " fmt "\n", ##__VA_ARGS__)
+#endif
+
 #include "ofxImageEffect.h"
 #include "ofxMemory.h"
 #include "ofxMultiThread.h"
+
+#ifdef __APPLE__
+#include "MetalGPUAcceleration.h"
+#endif
 
 // GPU acceleration headers (forward declarations only)
 #ifdef __APPLE__
@@ -66,13 +77,14 @@
 #define kPluginName "NDIOutput"
 #define kPluginGrouping "LSVR"
 #define kPluginDescription \
-"NDI Advanced Output v" kPluginVersionString ": GPU-accelerated NDI streaming with HDR support. \n" \
-"Configure the NDI source name, HDR settings, GPU acceleration, and enable/disable the output stream."
+"NDI Advanced Output v" kPluginVersionString " (GPU-Accelerated): GPU-accelerated NDI streaming with HDR support. \n" \
+"Configure the NDI source name, HDR settings, GPU acceleration, and enable/disable the output stream. \n" \
+"Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 1
+#define kPluginVersionMinor 2
 #define kPluginVersionPatch 4
-#define kPluginVersionString "1.1.4"
+#define kPluginVersionString "1.2.4"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -99,6 +111,11 @@
 #define kParamOptimalFormat "optimalFormat"
 #define kParamOptimalFormatLabel "Optimal Color Format"
 #define kParamOptimalFormatHint "Use UYVY color format for optimal NDI performance"
+
+// Version Display Parameter
+#define kParamVersionLabel "versionLabel"
+#define kParamVersionLabelLabel "Plugin Version"
+#define kParamVersionLabelHint "Current version of the NDI Output plugin"
 
 // HDR Parameters
 #define kParamHDREnabled "hdrEnabled"
@@ -143,10 +160,7 @@ OfxMessageSuiteV1       *gMessageSuite = 0;
 // GPU Processing Context
 struct GPUContext {
 #ifdef __APPLE__
-    void* metalDevice;
-    void* commandQueue;
-    void* colorConversionPipeline;
-    void* frameBuffer;
+    MetalGPUContextRef metalContext;
 #elif defined(_WIN32)
     void* d3dDevice;
     void* d3dContext;
@@ -184,6 +198,7 @@ struct NDIInstanceData {
     OfxParamHandle gpuAccelerationParam;
     OfxParamHandle asyncSendingParam;
     OfxParamHandle optimalFormatParam;
+    OfxParamHandle versionLabelParam;
     OfxParamHandle hdrEnabledParam;
     OfxParamHandle colorSpaceParam;
     OfxParamHandle transferFunctionParam;
@@ -241,18 +256,26 @@ static bool initializeGPUContext(NDIInstanceData* data)
         return true; // GPU acceleration disabled
     }
 
-    printf("NDI Plugin: Initializing GPU acceleration...\n");
+    NDI_LOG("Initializing GPU acceleration...");
     
     data->gpuContext = std::make_unique<GPUContext>();
     data->gpuContext->initialized = false;
 
 #ifdef __APPLE__
-    // Initialize Metal for macOS (simplified approach)
-    printf("NDI Plugin: Metal GPU acceleration available\n");
-    // Note: Actual Metal initialization would be done in a separate .mm file
-    // For now, we'll use CPU fallback but indicate GPU capability
-    data->gpuContext->metalDevice = nullptr; // Will be initialized when needed
-    data->gpuContext->commandQueue = nullptr;
+    // Check if Metal is available
+    if (!metal_gpu_is_available()) {
+        NDI_LOG("Metal is not available on this system\n");
+        return false;
+    }
+    
+    // Initialize Metal GPU acceleration
+    data->gpuContext->metalContext = metal_gpu_init();
+    if (!data->gpuContext->metalContext) {
+        NDI_LOG("Failed to initialize Metal GPU acceleration\n");
+        return false;
+    }
+    
+    NDI_LOG("Metal GPU acceleration initialized successfully\n");
     
 #elif defined(_WIN32)
     // Initialize D3D11 for Windows
@@ -263,15 +286,15 @@ static bool initializeGPUContext(NDIInstanceData* data)
         nullptr, (ID3D11DeviceContext**)&data->gpuContext->d3dContext);
     
     if (FAILED(hr)) {
-        printf("NDI Plugin: Failed to create D3D11 device\n");
+        NDI_LOG("Failed to create D3D11 device\n");
         return false;
     }
     
-    printf("NDI Plugin: D3D11 GPU acceleration initialized\n");
+    NDI_LOG("D3D11 GPU acceleration initialized\n");
 #else
     // Initialize OpenGL for Linux
     // Note: This would require proper OpenGL context setup
-    printf("NDI Plugin: OpenGL GPU acceleration available\n");
+    NDI_LOG("OpenGL GPU acceleration available\n");
 #endif
 
     data->gpuContext->initialized = true;
@@ -284,12 +307,14 @@ static void shutdownGPUContext(NDIInstanceData* data)
         return;
     }
 
-    printf("NDI Plugin: Shutting down GPU acceleration...\n");
+    NDI_LOG("Shutting down GPU acceleration...\n");
 
 #ifdef __APPLE__
-    // Metal cleanup would be done in separate .mm file
-    data->gpuContext->commandQueue = nullptr;
-    data->gpuContext->metalDevice = nullptr;
+    // Shutdown Metal GPU acceleration
+    if (data->gpuContext->metalContext) {
+        metal_gpu_shutdown(data->gpuContext->metalContext);
+        data->gpuContext->metalContext = nullptr;
+    }
 #elif defined(_WIN32)
     if (data->gpuContext->d3dContext) {
         ((ID3D11DeviceContext*)data->gpuContext->d3dContext)->Release();
@@ -305,7 +330,7 @@ static void shutdownGPUContext(NDIInstanceData* data)
 static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int width, int height)
 {
     if (!data->gpuContext || !data->gpuContext->initialized) {
-        // Fallback to CPU conversion
+        NDI_LOG("⚠️ GPU context not available, falling back to CPU\n");
         convertRGBAToUYVY_CPU(data, rgbaData, width, height);
         return;
     }
@@ -318,11 +343,30 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
     }
 
 #ifdef __APPLE__
-    // Metal implementation for RGBA to UYVY conversion
-    // For now, fallback to CPU until Metal implementation is complete
-    printf("NDI Plugin: Metal GPU conversion available, using CPU fallback for now\n");
+    // Use Metal GPU acceleration for RGBA to UYVY conversion
+    if (data->gpuContext->metalContext) {
+        NDI_LOG("🚀 Attempting Metal GPU acceleration...\n");
+        
+        bool success = metal_gpu_convert_rgba_to_uyvy(
+            data->gpuContext->metalContext,
+            static_cast<const float*>(rgbaData),
+            data->uyvyFrameBuffer.data(),
+            width,
+            height
+        );
+        
+        if (success) {
+            NDI_LOG("✅ Metal GPU acceleration SUCCESS!\n");
+            return;
+        } else {
+            NDI_LOG("❌ Metal GPU conversion failed, falling back to CPU\n");
+        }
+    } else {
+        NDI_LOG("⚠️ Metal context not available, falling back to CPU\n");
+    }
+    
+    // Fallback to CPU if Metal fails
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    return;
     
 #elif defined(_WIN32)
     // D3D11 implementation for RGBA to UYVY conversion
@@ -331,23 +375,25 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
     
     // Create buffers and execute compute shader
     // ... D3D11 compute shader execution ...
-    printf("NDI Plugin: D3D11 GPU conversion available, using CPU fallback for now\n");
+    NDI_LOG("D3D11 GPU conversion available, using CPU fallback for now\n");
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
     return;
     
 #else
     // OpenGL implementation for Linux
     // ... OpenGL compute shader execution ...
-    printf("NDI Plugin: OpenGL GPU conversion available, using CPU fallback for now\n");
+    NDI_LOG("OpenGL GPU conversion available, using CPU fallback for now\n");
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
     return;
 #endif
-
-    printf("NDI Plugin: GPU RGBA to UYVY conversion completed\n");
 }
 
 static void convertRGBAToUYVY_CPU(NDIInstanceData* data, void* rgbaData, int width, int height)
 {
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
+    NDI_LOG("Starting CPU RGBA->UYVY conversion (%dx%d)\n", width, height);
+    
     const size_t uyvySize = width * height * 2; // UYVY is 2 bytes per pixel
     if (data->uyvyFrameBuffer.size() != uyvySize) {
         data->uyvyFrameBuffer.resize(uyvySize);
@@ -386,11 +432,17 @@ static void convertRGBAToUYVY_CPU(NDIInstanceData* data, void* rgbaData, int wid
             dstData[dstIdx + 3] = static_cast<uint8_t>(y2 * 255.0f);          // Y2
         }
     }
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+    
+    NDI_LOG("🖥️ CPU RGBA->UYVY conversion completed in %lld μs (%.2f ms)\n", 
+           duration.count(), duration.count() / 1000.0);
 }
 
 static void asyncFrameProcessor(NDIInstanceData* data)
 {
-    printf("NDI Plugin: Async frame processor thread started\n");
+    NDI_LOG("Async frame processor thread started\n");
     
     while (!data->stopAsyncThread) {
         std::unique_lock<std::mutex> lock(data->queueMutex);
@@ -416,7 +468,7 @@ static void asyncFrameProcessor(NDIInstanceData* data)
         }
     }
     
-    printf("NDI Plugin: Async frame processor thread stopped\n");
+    NDI_LOG("Async frame processor thread stopped\n");
 }
 
 // Utility functions
@@ -453,13 +505,15 @@ static bool initializeNDI(NDIInstanceData* data)
         return true;
     }
 
-    printf("NDI Plugin: Initializing NDI Advanced SDK...\n");
+    NDI_LOG("Initializing NDI Advanced SDK...");
     
     // Initialize NDI
     if (!NDIlib_initialize()) {
-        printf("NDI Plugin: Failed to initialize NDI library\n");
+        NDI_LOG("Failed to initialize NDI library");
         return false;
     }
+    
+    NDI_LOG("NDI library initialized successfully");
 
     // Create NDI source description with advanced settings
     NDIlib_send_create_t NDI_send_create_desc;
@@ -468,17 +522,22 @@ static bool initializeNDI(NDIInstanceData* data)
     NDI_send_create_desc.clock_video = true;
     NDI_send_create_desc.clock_audio = false;
 
+    NDI_LOG("Creating NDI sender with name: '%s'", data->sourceName.c_str());
+
     // Create the NDI sender
     data->ndiSend = NDIlib_send_create(&NDI_send_create_desc);
     if (!data->ndiSend) {
-        printf("NDI Plugin: Failed to create NDI sender\n");
+        NDI_LOG("Failed to create NDI sender - this might be due to NDI runtime not being available");
+        NDI_LOG("Please ensure NDI Tools or NDI Runtime is installed on this system");
         NDIlib_destroy();
         return false;
     }
+    
+    NDI_LOG("NDI sender created successfully");
 
     // Enable hardware acceleration if GPU acceleration is enabled
     if (data->gpuAcceleration) {
-        printf("NDI Plugin: Enabling hardware acceleration hints\n");
+        NDI_LOG("Enabling hardware acceleration hints");
         
         // Send hardware acceleration metadata hint
         const char* hwAccelMetadata = "<ndi_video_codec type=\"hardware\"/>";
@@ -492,7 +551,7 @@ static bool initializeNDI(NDIInstanceData* data)
 
     // Initialize GPU context if enabled
     if (!initializeGPUContext(data)) {
-        printf("NDI Plugin: GPU acceleration initialization failed, falling back to CPU\n");
+        NDI_LOG("GPU acceleration initialization failed, falling back to CPU");
         data->gpuAcceleration = false;
     }
 
@@ -500,12 +559,12 @@ static bool initializeNDI(NDIInstanceData* data)
     if (data->asyncSending) {
         data->stopAsyncThread = false;
         data->asyncThread = std::thread(asyncFrameProcessor, data);
-        printf("NDI Plugin: Asynchronous frame processing enabled\n");
+        NDI_LOG("Asynchronous frame processing enabled");
     }
 
     data->ndiInitialized = true;
-    printf("NDI Plugin: NDI Advanced SDK initialized successfully with source name '%s'\n", data->sourceName.c_str());
-    printf("NDI Plugin: GPU Acceleration: %s, Async Sending: %s, Optimal Format: %s\n",
+    NDI_LOG("NDI Advanced SDK initialized successfully with source name '%s'", data->sourceName.c_str());
+    NDI_LOG("GPU Acceleration: %s, Async Sending: %s, Optimal Format: %s",
            data->gpuAcceleration ? "Enabled" : "Disabled",
            data->asyncSending ? "Enabled" : "Disabled",
            data->optimalFormat ? "Enabled" : "Disabled");
@@ -519,14 +578,14 @@ static void shutdownNDI(NDIInstanceData* data)
         return;
     }
 
-    printf("NDI Plugin: Shutting down NDI Advanced SDK...\n");
+    NDI_LOG("Shutting down NDI SDK...");
     
     // Stop async processing thread
     if (data->asyncSending && data->asyncThread.joinable()) {
         data->stopAsyncThread = true;
         data->queueCondition.notify_all();
         data->asyncThread.join();
-        printf("NDI Plugin: Async processing thread stopped\n");
+        NDI_LOG("Async processing thread stopped");
     }
     
     // Clear any remaining frames in queue
@@ -551,38 +610,38 @@ static void shutdownNDI(NDIInstanceData* data)
 
 static void createHDRMetadata(NDIInstanceData* data)
 {
-    // Create HDR metadata XML according to NDI Advanced SDK specifications
-    data->hdrMetadataXML = "<ndi_hdr>";
+    // Create HDR metadata XML according to NDI SDK v6 specifications
+    // Reference: https://docs.ndi.video/all/developing-with-ndi/sdk/hdr#hdr-metadata
     
-    // Color space information
-    data->hdrMetadataXML += "<color_space>";
+    std::string primaries, transfer, matrix;
+    
+    // Map our color space to NDI primaries
     if (data->colorSpace == kColorSpaceRec2020) {
-        data->hdrMetadataXML += "rec2020";
+        primaries = "bt_2020";
+        matrix = "bt_2020";
     } else if (data->colorSpace == kColorSpaceP3) {
-        data->hdrMetadataXML += "p3";
+        primaries = "bt_2020"; // P3 uses bt_2020 primaries in NDI context
+        matrix = "bt_2020";
     } else {
-        data->hdrMetadataXML += "rec709";
+        primaries = "bt_709";
+        matrix = "bt_709";
     }
-    data->hdrMetadataXML += "</color_space>";
     
-    // Transfer function
-    data->hdrMetadataXML += "<transfer_function>";
+    // Map our transfer function to NDI transfer
     if (data->transferFunction == kTransferFunctionPQ) {
-        data->hdrMetadataXML += "pq";
+        transfer = "bt_2100_pq";
     } else if (data->transferFunction == kTransferFunctionHLG) {
-        data->hdrMetadataXML += "hlg";
+        transfer = "bt_2100_hlg";
     } else {
-        data->hdrMetadataXML += "sdr";
+        transfer = "bt_709";
     }
-    data->hdrMetadataXML += "</transfer_function>";
     
-    // Content light levels
-    data->hdrMetadataXML += "<max_cll>" + std::to_string(static_cast<int>(data->maxCLL)) + "</max_cll>";
-    data->hdrMetadataXML += "<max_fall>" + std::to_string(static_cast<int>(data->maxFALL)) + "</max_fall>";
+    // Create proper NDI color info metadata
+    data->hdrMetadataXML = "<ndi_color_info primaries=\"" + primaries + 
+                          "\" transfer=\"" + transfer + 
+                          "\" matrix=\"" + matrix + "\" />";
     
-    data->hdrMetadataXML += "</ndi_hdr>";
-    
-    printf("NDI Plugin: HDR Metadata: %s\n", data->hdrMetadataXML.c_str());
+    NDI_LOG("HDR Metadata: %s", data->hdrMetadataXML.c_str());
 }
 
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -591,35 +650,100 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
         return;
     }
     
-    printf("NDI Plugin: Sending HDR frame %dx%d to NDI\n", width, height);
+    NDI_LOG("Sending HDR frame %dx%d to NDI", width, height);
 
-    // Prepare HDR frame buffer (16-bit per channel)
-    const size_t frameSize = width * height * 4 * sizeof(uint16_t); // RGBA 16-bit
+    // Prepare HDR frame buffer (16-bit per channel, P216 format)
+    // P216 is planar YUV 4:2:2 with 16-bit samples
+    const size_t frameSize = width * height * 2 * sizeof(uint16_t); // Y plane + UV plane (4:2:2)
     if (data->hdrFrameBuffer.size() != frameSize / sizeof(uint16_t)) {
         data->hdrFrameBuffer.resize(frameSize / sizeof(uint16_t));
     }
 
-    // Convert float RGBA to uint16_t RGBA for HDR NDI with vertical flip
-    float* srcData = static_cast<float*>(imageData);
     uint16_t* dstData = data->hdrFrameBuffer.data();
-    
-    // HDR conversion - preserve values above 1.0 for HDR content
-    float maxValue = (data->transferFunction == kTransferFunctionPQ) ? 10000.0f : 1000.0f; // PQ supports up to 10,000 nits
-    
-    // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
-    for (int y = 0; y < height; ++y) {
-        int srcRow = height - 1 - y; // Flip vertically
-        for (int x = 0; x < width; ++x) {
-            int srcIdx = (srcRow * width + x) * 4;
-            int dstIdx = (y * width + x) * 4;
-            
-            for (int c = 0; c < 4; ++c) {
-                float value = srcData[srcIdx + c];
-                if (c == 3) { // Alpha channel
-                    dstData[dstIdx + c] = static_cast<uint16_t>(std::max(0.0f, std::min(1.0f, value)) * 65535.0f);
-                } else { // RGB channels
-                    dstData[dstIdx + c] = static_cast<uint16_t>(std::max(0.0f, std::min(maxValue, value)) * (65535.0f / maxValue));
+    float* srcData = static_cast<float*>(imageData);
+
+    // Try GPU acceleration first for HDR conversion
+    bool gpuSuccess = false;
+#ifdef __APPLE__
+    if (data->gpuAcceleration && data->gpuContext && data->gpuContext->initialized && data->gpuContext->metalContext) {
+        // For HDR, we need to convert to 16-bit limited range
+        // The scale factor should be for 16-bit limited range (not full range)
+        float scale = 65472.0f; // 16-bit limited range: (235-16) * 256 + (240-16) * 256 for chroma
+        
+        gpuSuccess = metal_gpu_convert_rgba_to_hdr(
+            data->gpuContext->metalContext,
+            srcData,
+            dstData,
+            width,
+            height,
+            scale
+        );
+        
+        if (gpuSuccess) {
+            NDI_LOG("Metal GPU HDR conversion completed");
+        } else {
+            NDI_LOG("Metal GPU HDR conversion failed, falling back to CPU");
+        }
+    }
+#endif
+
+    // Fallback to CPU conversion if GPU failed or not available
+    if (!gpuSuccess) {
+        // Convert RGBA float to YUV 16-bit limited range (P216 format)
+        // Reference: ITU BT.2100 quantization equations
+        
+        uint16_t* yPlane = dstData;
+        uint16_t* uvPlane = dstData + (width * height);
+        
+        for (int y = 0; y < height; ++y) {
+            int srcRow = height - 1 - y; // Flip vertically
+            for (int x = 0; x < width; x += 2) {
+                // Process two pixels for 4:2:2 subsampling
+                int srcIdx1 = (srcRow * width + x) * 4;
+                int srcIdx2 = (srcRow * width + x + 1) * 4;
+                
+                // Get RGB values (clamped to 0-1)
+                float r1 = std::max(0.0f, std::min(1.0f, srcData[srcIdx1 + 0]));
+                float g1 = std::max(0.0f, std::min(1.0f, srcData[srcIdx1 + 1]));
+                float b1 = std::max(0.0f, std::min(1.0f, srcData[srcIdx1 + 2]));
+                
+                float r2 = (x + 1 < width) ? std::max(0.0f, std::min(1.0f, srcData[srcIdx2 + 0])) : r1;
+                float g2 = (x + 1 < width) ? std::max(0.0f, std::min(1.0f, srcData[srcIdx2 + 1])) : g1;
+                float b2 = (x + 1 < width) ? std::max(0.0f, std::min(1.0f, srcData[srcIdx2 + 2])) : b1;
+                
+                // Convert to YUV using Rec.2020 coefficients for HDR
+                float y1 = 0.2627f * r1 + 0.6780f * g1 + 0.0593f * b1;
+                float y2 = 0.2627f * r2 + 0.6780f * g2 + 0.0593f * b2;
+                
+                // Average chroma for 4:2:2 subsampling
+                float avgR = (r1 + r2) * 0.5f;
+                float avgG = (g1 + g2) * 0.5f;
+                float avgB = (b1 + b2) * 0.5f;
+                
+                float u = -0.1396f * avgR - 0.3604f * avgG + 0.5f * avgB;
+                float v = 0.5f * avgR - 0.4598f * avgG - 0.0402f * avgB;
+                
+                // Convert to 16-bit limited range (ITU BT.2100)
+                // Y: 16-bit limited range [4096, 60160] for 10-bit equivalent [64, 940]
+                // UV: 16-bit limited range [4096, 61440] for 10-bit equivalent [64, 960]
+                uint16_t y1_16 = static_cast<uint16_t>(4096 + y1 * 56064); // (60160-4096)
+                uint16_t y2_16 = static_cast<uint16_t>(4096 + y2 * 56064);
+                uint16_t u_16 = static_cast<uint16_t>(32768 + u * 28672); // Center + range
+                uint16_t v_16 = static_cast<uint16_t>(32768 + v * 28672);
+                
+                // Store in P216 format (planar)
+                int yIdx1 = y * width + x;
+                int yIdx2 = y * width + x + 1;
+                int uvIdx = (y * width + x) / 2; // 4:2:2 subsampling
+                
+                yPlane[yIdx1] = y1_16;
+                if (x + 1 < width) {
+                    yPlane[yIdx2] = y2_16;
                 }
+                
+                // Store U and V interleaved for 4:2:2
+                uvPlane[uvIdx * 2] = u_16;     // U
+                uvPlane[uvIdx * 2 + 1] = v_16; // V
             }
         }
     }
@@ -627,18 +751,18 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
     // Create HDR metadata
     createHDRMetadata(data);
 
-    // Setup NDI HDR video frame
+    // Setup NDI HDR video frame with proper P216 format
     NDIlib_video_frame_v2_t ndiVideoFrame;
     ndiVideoFrame.xres = width;
     ndiVideoFrame.yres = height;
-    ndiVideoFrame.FourCC = NDIlib_FourCC_type_RGBA; // Will be enhanced for HDR in Advanced SDK
+    ndiVideoFrame.FourCC = NDIlib_FourCC_video_type_P216; // Proper HDR format
     ndiVideoFrame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
     ndiVideoFrame.frame_rate_D = 1000;
     ndiVideoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
     ndiVideoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
     ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
     ndiVideoFrame.p_data = reinterpret_cast<uint8_t*>(dstData);
-    ndiVideoFrame.line_stride_in_bytes = width * 4 * sizeof(uint16_t);
+    ndiVideoFrame.line_stride_in_bytes = width * sizeof(uint16_t); // Y plane stride
     ndiVideoFrame.p_metadata = data->hdrMetadataXML.empty() ? nullptr : data->hdrMetadataXML.c_str();
 
     // Send the HDR frame
@@ -651,7 +775,7 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
         return;
     }
     
-    printf("NDI Plugin: Sending SDR frame %dx%d to NDI (GPU: %s, Format: %s)\n", 
+    NDI_LOG("Sending SDR frame %dx%d to NDI (GPU: %s, Format: %s)", 
            width, height,
            data->gpuAcceleration ? "Yes" : "No",
            data->optimalFormat ? "UYVY" : "RGBA");
@@ -717,6 +841,15 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
 
 static void sendNDIFrame(NDIInstanceData* data, void* imageData, int width, int height)
 {
+    // Ensure NDI is initialized before sending frames
+    if (!data->ndiInitialized && data->enabled) {
+        NDI_LOG("NDI not initialized, attempting to initialize...");
+        if (!initializeNDI(data)) {
+            NDI_LOG("Failed to initialize NDI, skipping frame");
+            return;
+        }
+    }
+    
     if (data->hdrEnabled) {
         sendHDRFrame(data, imageData, width, height);
     } else {
@@ -737,7 +870,7 @@ static OfxStatus onUnLoad(void)
 
 static OfxStatus createInstance(OfxImageEffectHandle effect)
 {
-    printf("NDI Plugin: Creating instance\n");
+    NDI_LOG("Creating instance");
     
     // Get property set
     OfxPropertySetHandle effectProps;
@@ -779,6 +912,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     gParamHost->paramGetHandle(paramSet, kParamGPUAcceleration, &myData->gpuAccelerationParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamAsyncSending, &myData->asyncSendingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamOptimalFormat, &myData->optimalFormatParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamVersionLabel, &myData->versionLabelParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamColorSpace, &myData->colorSpaceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamTransferFunction, &myData->transferFunctionParam, 0);
@@ -788,13 +922,18 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     // Set instance data
     gPropHost->propSetPointer(effectProps, kOfxPropInstanceData, 0, (void *) myData);
 
-    printf("NDI Plugin: Instance created successfully\n");
+    // Initialize NDI if enabled by default
+    if (myData->enabled) {
+        initializeNDI(myData);
+    }
+
+    NDI_LOG("Instance created successfully");
     return kOfxStatOK;
 }
 
 static OfxStatus destroyInstance(OfxImageEffectHandle effect)
 {
-    printf("NDI Plugin: Destroying instance\n");
+    NDI_LOG("Destroying instance");
     
     NDIInstanceData *myData = getInstanceData(effect);
     if (myData) {
@@ -817,7 +956,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         char *paramName;
         gPropHost->propGetString(inArgs, kOfxPropName, 0, &paramName);
         
-        printf("NDI Plugin: Parameter changed: %s\n", paramName);
+        NDI_LOG("Parameter changed: %s", paramName);
         
         // Update parameter values
         char* sourceName;
@@ -867,12 +1006,16 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         gParamHost->paramGetValue(myData->maxFALLParam, &maxFALL);
         myData->maxFALL = maxFALL;
         
-        printf("NDI Plugin: Updated params - sourceName='%s', enabled=%d, frameRate=%.2f, hdr=%d, colorSpace='%s', transferFunc='%s'\n", 
+        NDI_LOG("Updated params - sourceName='%s', enabled=%d, frameRate=%.2f, hdr=%d, colorSpace='%s', transferFunc='%s'", 
                myData->sourceName.c_str(), myData->enabled, myData->frameRate, myData->hdrEnabled, 
                myData->colorSpace.c_str(), myData->transferFunction.c_str());
         
-        // Restart NDI if source name changed
-        if (strcmp(paramName, kParamSourceName) == 0 && myData->ndiInitialized) {
+        // Restart NDI if source name changed or HDR settings changed
+        if ((strcmp(paramName, kParamSourceName) == 0 || 
+             strcmp(paramName, kParamHDREnabled) == 0 ||
+             strcmp(paramName, kParamColorSpace) == 0 ||
+             strcmp(paramName, kParamTransferFunction) == 0) && myData->ndiInitialized) {
+            NDI_LOG("Restarting NDI due to %s parameter change", paramName);
             shutdownNDI(myData);
         }
         
@@ -889,10 +1032,27 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
 
 static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inArgs, OfxPropertySetHandle /*outArgs*/)
 {
-    printf("NDI Plugin: Render called\n");
+    NDI_LOG("Render called");
     
     NDIInstanceData *myData = getInstanceData(instance);
     if (!myData) return kOfxStatFailed;
+
+    // Read current parameter values at render time
+    int hdrEnabled;
+    gParamHost->paramGetValue(myData->hdrEnabledParam, &hdrEnabled);
+    myData->hdrEnabled = (hdrEnabled != 0);
+    
+    int gpuAcceleration;
+    gParamHost->paramGetValue(myData->gpuAccelerationParam, &gpuAcceleration);
+    myData->gpuAcceleration = (gpuAcceleration != 0);
+    
+    int enabled;
+    gParamHost->paramGetValue(myData->enabledParam, &enabled);
+    myData->enabled = (enabled != 0);
+    
+    // Log current parameter state for debugging
+    NDI_LOG("Render params - enabled=%d, hdr=%d, gpu=%d", 
+           myData->enabled, myData->hdrEnabled, myData->gpuAcceleration);
 
     // Get time
     double time;
@@ -906,7 +1066,7 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     OfxPropertySetHandle sourceImg = NULL;
     gEffectHost->clipGetImage(myData->sourceClip, time, NULL, &sourceImg);
     if (!sourceImg) {
-        printf("NDI Plugin: No source image\n");
+        NDI_LOG("No source image");
         return kOfxStatFailed;
     }
 
@@ -914,7 +1074,7 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     OfxPropertySetHandle outputImg = NULL;
     gEffectHost->clipGetImage(myData->outputClip, time, NULL, &outputImg);
     if (!outputImg) {
-        printf("NDI Plugin: No output image\n");
+        NDI_LOG("No output image");
         gEffectHost->clipReleaseImage(sourceImg);
         return kOfxStatFailed;
     }
@@ -948,13 +1108,13 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     gEffectHost->clipReleaseImage(sourceImg);
     gEffectHost->clipReleaseImage(outputImg);
 
-    printf("NDI Plugin: Render completed\n");
+    NDI_LOG("Render completed");
     return kOfxStatOK;
 }
 
 static OfxStatus describe(OfxImageEffectHandle effect)
 {
-    printf("NDI Plugin: Describe called\n");
+    NDI_LOG("Describe called");
     
     OfxPropertySetHandle props;
     gEffectHost->getPropertySet(effect, &props);
@@ -981,7 +1141,7 @@ static OfxStatus describe(OfxImageEffectHandle effect)
 
 static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs)
 {
-    printf("NDI Plugin: DescribeInContext called\n");
+    NDI_LOG("DescribeInContext called");
     
     // Define clips
     OfxPropertySetHandle sourceClipProps = NULL, outputClipProps = NULL;
@@ -1000,7 +1160,38 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     OfxParamSetHandle paramSet;
     gEffectHost->getParamSet(effect, &paramSet);
 
-    // Define source name parameter
+    // Create parameter groups for better organization
+    OfxPropertySetHandle infoGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "infoGroup", &infoGroupProps);
+    gPropHost->propSetString(infoGroupProps, kOfxPropLabel, 0, "Plugin Information");
+    gPropHost->propSetInt(infoGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
+
+    OfxPropertySetHandle basicGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "basicGroup", &basicGroupProps);
+    gPropHost->propSetString(basicGroupProps, kOfxPropLabel, 0, "Basic Settings");
+    gPropHost->propSetInt(basicGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
+
+    OfxPropertySetHandle performanceGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "performanceGroup", &performanceGroupProps);
+    gPropHost->propSetString(performanceGroupProps, kOfxPropLabel, 0, "Performance Settings");
+    gPropHost->propSetInt(performanceGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
+
+    OfxPropertySetHandle hdrGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "hdrGroup", &hdrGroupProps);
+    gPropHost->propSetString(hdrGroupProps, kOfxPropLabel, 0, "HDR Settings");
+    gPropHost->propSetInt(hdrGroupProps, kOfxParamPropGroupOpen, 0, 0); // Closed by default
+
+    // Define version label parameter (visible read-only display) - in Info group
+    OfxPropertySetHandle versionLabelProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamVersionLabel, &versionLabelProps);
+    gPropHost->propSetString(versionLabelProps, kOfxPropLabel, 0, kParamVersionLabelLabel);
+    gPropHost->propSetString(versionLabelProps, kOfxParamPropScriptName, 0, kParamVersionLabel);
+    gPropHost->propSetString(versionLabelProps, kOfxParamPropHint, 0, kParamVersionLabelHint);
+    gPropHost->propSetString(versionLabelProps, kOfxParamPropDefault, 0, "v" kPluginVersionString " (GPU-Accelerated NDI Advanced)");
+    gPropHost->propSetInt(versionLabelProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(versionLabelProps, kOfxParamPropParent, 0, "infoGroup");
+
+    // Define source name parameter - in Basic group
     OfxPropertySetHandle sourceNameProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamSourceName, &sourceNameProps);
     gPropHost->propSetString(sourceNameProps, kOfxPropLabel, 0, kParamSourceNameLabel);
@@ -1008,8 +1199,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(sourceNameProps, kOfxParamPropHint, 0, kParamSourceNameHint);
     gPropHost->propSetString(sourceNameProps, kOfxParamPropDefault, 0, "DaVinci Resolve NDI Output");
     gPropHost->propSetInt(sourceNameProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(sourceNameProps, kOfxParamPropParent, 0, "basicGroup");
 
-    // Define enabled parameter
+    // Define enabled parameter - in Basic group
     OfxPropertySetHandle enabledProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamEnabled, &enabledProps);
     gPropHost->propSetString(enabledProps, kOfxPropLabel, 0, kParamEnabledLabel);
@@ -1017,8 +1209,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(enabledProps, kOfxParamPropHint, 0, kParamEnabledHint);
     gPropHost->propSetInt(enabledProps, kOfxParamPropDefault, 0, 1); // Default to enabled
     gPropHost->propSetInt(enabledProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(enabledProps, kOfxParamPropParent, 0, "basicGroup");
 
-    // Define frame rate parameter
+    // Define frame rate parameter - in Basic group
     OfxPropertySetHandle frameRateProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeDouble, kParamFrameRate, &frameRateProps);
     gPropHost->propSetString(frameRateProps, kOfxPropLabel, 0, kParamFrameRateLabel);
@@ -1030,8 +1223,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropDisplayMin, 0, 23.976);
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropDisplayMax, 0, 60.0);
     gPropHost->propSetInt(frameRateProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(frameRateProps, kOfxParamPropParent, 0, "basicGroup");
 
-    // Define GPU acceleration parameter
+    // Define GPU acceleration parameter - in Performance group
     OfxPropertySetHandle gpuAccelerationProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamGPUAcceleration, &gpuAccelerationProps);
     gPropHost->propSetString(gpuAccelerationProps, kOfxPropLabel, 0, kParamGPUAccelerationLabel);
@@ -1039,8 +1233,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(gpuAccelerationProps, kOfxParamPropHint, 0, kParamGPUAccelerationHint);
     gPropHost->propSetInt(gpuAccelerationProps, kOfxParamPropDefault, 0, 1); // Default to enabled
     gPropHost->propSetInt(gpuAccelerationProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(gpuAccelerationProps, kOfxParamPropParent, 0, "performanceGroup");
 
-    // Define asynchronous sending parameter
+    // Define asynchronous sending parameter - in Performance group
     OfxPropertySetHandle asyncSendingProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamAsyncSending, &asyncSendingProps);
     gPropHost->propSetString(asyncSendingProps, kOfxPropLabel, 0, kParamAsyncSendingLabel);
@@ -1048,8 +1243,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(asyncSendingProps, kOfxParamPropHint, 0, kParamAsyncSendingHint);
     gPropHost->propSetInt(asyncSendingProps, kOfxParamPropDefault, 0, 1); // Default to enabled
     gPropHost->propSetInt(asyncSendingProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(asyncSendingProps, kOfxParamPropParent, 0, "performanceGroup");
 
-    // Define optimal format parameter
+    // Define optimal format parameter - in Performance group
     OfxPropertySetHandle optimalFormatProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamOptimalFormat, &optimalFormatProps);
     gPropHost->propSetString(optimalFormatProps, kOfxPropLabel, 0, kParamOptimalFormatLabel);
@@ -1057,8 +1253,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(optimalFormatProps, kOfxParamPropHint, 0, kParamOptimalFormatHint);
     gPropHost->propSetInt(optimalFormatProps, kOfxParamPropDefault, 0, 1); // Default to enabled
     gPropHost->propSetInt(optimalFormatProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(optimalFormatProps, kOfxParamPropParent, 0, "performanceGroup");
 
-    // Define HDR enabled parameter
+    // Define HDR enabled parameter - in HDR group
     OfxPropertySetHandle hdrEnabledProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamHDREnabled, &hdrEnabledProps);
     gPropHost->propSetString(hdrEnabledProps, kOfxPropLabel, 0, kParamHDREnabledLabel);
@@ -1066,8 +1263,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(hdrEnabledProps, kOfxParamPropHint, 0, kParamHDREnabledHint);
     gPropHost->propSetInt(hdrEnabledProps, kOfxParamPropDefault, 0, 0); // Default to disabled
     gPropHost->propSetInt(hdrEnabledProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(hdrEnabledProps, kOfxParamPropParent, 0, "hdrGroup");
 
-    // Define color space parameter
+    // Define color space parameter - in HDR group
     OfxPropertySetHandle colorSpaceProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamColorSpace, &colorSpaceProps);
     gPropHost->propSetString(colorSpaceProps, kOfxPropLabel, 0, kParamColorSpaceLabel);
@@ -1078,8 +1276,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(colorSpaceProps, kOfxParamPropChoiceOption, 2, "DCI-P3");
     gPropHost->propSetInt(colorSpaceProps, kOfxParamPropDefault, 0, 0); // Rec.709
     gPropHost->propSetInt(colorSpaceProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(colorSpaceProps, kOfxParamPropParent, 0, "hdrGroup");
 
-    // Define transfer function parameter
+    // Define transfer function parameter - in HDR group
     OfxPropertySetHandle transferFunctionProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamTransferFunction, &transferFunctionProps);
     gPropHost->propSetString(transferFunctionProps, kOfxPropLabel, 0, kParamTransferFunctionLabel);
@@ -1090,8 +1289,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(transferFunctionProps, kOfxParamPropChoiceOption, 2, "HLG (Hybrid Log-Gamma)");
     gPropHost->propSetInt(transferFunctionProps, kOfxParamPropDefault, 0, 0); // SDR
     gPropHost->propSetInt(transferFunctionProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(transferFunctionProps, kOfxParamPropParent, 0, "hdrGroup");
 
-    // Define max CLL parameter
+    // Define max CLL parameter - in HDR group
     OfxPropertySetHandle maxCLLProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeDouble, kParamMaxCLL, &maxCLLProps);
     gPropHost->propSetString(maxCLLProps, kOfxPropLabel, 0, kParamMaxCLLLabel);
@@ -1103,8 +1303,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetDouble(maxCLLProps, kOfxParamPropDisplayMin, 0, 100.0);
     gPropHost->propSetDouble(maxCLLProps, kOfxParamPropDisplayMax, 0, 4000.0);
     gPropHost->propSetInt(maxCLLProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(maxCLLProps, kOfxParamPropParent, 0, "hdrGroup");
 
-    // Define max FALL parameter
+    // Define max FALL parameter - in HDR group
     OfxPropertySetHandle maxFALLProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeDouble, kParamMaxFALL, &maxFALLProps);
     gPropHost->propSetString(maxFALLProps, kOfxPropLabel, 0, kParamMaxFALLLabel);
@@ -1116,6 +1317,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetDouble(maxFALLProps, kOfxParamPropDisplayMin, 0, 50.0);
     gPropHost->propSetDouble(maxFALLProps, kOfxParamPropDisplayMax, 0, 1000.0);
     gPropHost->propSetInt(maxFALLProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(maxFALLProps, kOfxParamPropParent, 0, "hdrGroup");
 
     return kOfxStatOK;
 }

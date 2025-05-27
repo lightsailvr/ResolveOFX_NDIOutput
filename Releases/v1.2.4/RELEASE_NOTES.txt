@@ -1,0 +1,53 @@
+NDI Output Plugin v1.2.4 - Critical GPU & HDR Parameter Fixes
+
+🔧 CRITICAL FIXES:
+- Fixed GPU acceleration falling back to CPU due to Metal shader compilation errors
+- Fixed HDR mode not being detected when checkbox is enabled
+- Fixed parameter reading in render function to get real-time values
+
+🚀 TECHNICAL FIXES:
+
+**Issue 1: GPU Acceleration Fallback**
+- Root Cause: Metal HDR shader source was incorrectly embedded as string within string
+- Fix: Properly integrated HDR shader into main Metal shader source
+- Result: GPU acceleration now works correctly for both SDR and HDR modes
+
+**Issue 2: HDR Not Being Detected**
+- Root Cause: render() function only used cached parameter values from instanceChanged()
+- Fix: Added real-time parameter reading in render() function
+- Result: HDR checkbox changes are now immediately detected during rendering
+
+📋 WHAT'S FIXED:
+- GPU acceleration no longer falls back to CPU unexpectedly
+- HDR checkbox changes are immediately recognized
+- Real-time parameter updates during rendering
+- Proper Metal shader compilation for HDR P216 format
+- Enhanced logging shows current parameter state during render
+
+✅ VERIFICATION LOGS:
+You should now see in the logs:
+- "✅ Metal GPU acceleration SUCCESS!" (instead of CPU fallback)
+- "Sending HDR frame" when HDR checkbox is enabled
+- "Render params - enabled=1, hdr=1, gpu=1" showing current state
+
+🎯 EXPECTED BEHAVIOR:
+- Check HDR box → Immediately switches to HDR mode
+- GPU acceleration → No more CPU fallback messages
+- Performance → Significant improvement in HDR mode
+- Logs → Clear indication of current parameter state
+
+📦 INSTALLATION:
+1. Copy NDIOutput.ofx.bundle to /Library/OFX/Plugins/
+2. Restart DaVinci Resolve
+3. Test HDR checkbox - should immediately switch modes
+4. Monitor logs with: ./scripts/monitor_ndi_logs.sh
+
+🔍 DEBUGGING:
+The render function now logs current parameter state:
+```
+NDI Plugin: Render params - enabled=1, hdr=1, gpu=1
+NDI Plugin: Sending HDR frame 1920x1080 to NDI
+NDI Plugin Metal: ✅ Metal HDR P216 conversion completed in 2.5 ms
+```
+
+This release resolves the two critical issues preventing proper GPU acceleration and HDR mode detection, ensuring the plugin works as intended with real-time parameter updates and optimal performance. 
