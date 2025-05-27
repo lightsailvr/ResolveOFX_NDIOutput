@@ -1,270 +1,246 @@
-# NDI Output Plugin for DaVinci Resolve
+# NDI Advanced Output Plugin for DaVinci Resolve
 
-A professional OFX (OpenFX) plugin that enables real-time NDI (Network Device Interface) streaming directly from DaVinci Resolve's timeline. Stream your video content over the network to any NDI-compatible application or device.
+A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Network Device Interface) for streaming over network with comprehensive HDR support.
 
-![NDI Output Plugin](src/BaldavengerOFX.NDIOutput.png)
+> **Latest Release**: v1.1.4 - Fixed vertical flip issue, GPU acceleration framework ready  
+> **Quick Install**: `cd Releases/v1.1.4/ && ./install.sh`
 
 ## Features
 
-- **Real-time NDI Streaming**: Send video frames from DaVinci Resolve to NDI network
-- **Pass-through Effect**: Doesn't modify your video - acts as a transparent output
-- **Configurable Parameters**:
-  - NDI Source Name: Set custom name visible on network
-  - Enable/Disable: Toggle NDI output on/off
-  - Frame Rate Configuration: Match your project settings
-- **Professional Quality**: Float RGBA processing with proper format conversion
-- **Cross-platform**: Supports both macOS and Windows
+- **Modern OFX Implementation**: Uses C API directly for maximum compatibility with DaVinci Resolve 20+
+- **HDR Support**: Full HDR workflow support with:
+  - PQ (ST.2084) and HLG (Hybrid Log-Gamma) transfer functions
+  - Rec.2020, DCI-P3, and Rec.709 color spaces
+  - Configurable Max Content Light Level (CLL) and Max Frame Average Light Level (FALL)
+  - HDR metadata embedding for proper downstream handling
+- **NDI Advanced SDK**: Uses NDI Advanced SDK v6.1.1 for enhanced features and performance
+- **Real-time Streaming**: Low-latency video streaming over network
+- **Pass-through Design**: Maintains original video quality while streaming
+- **User-friendly Controls**: Easy-to-use parameters for configuration
 
-## System Requirements
+## Requirements
 
-### macOS
-- macOS 10.14 or later
-- DaVinci Resolve 17+
-- NDI SDK for Apple
-- Xcode Command Line Tools
-
-### Windows
-- Windows 10 64-bit or later
-- DaVinci Resolve 17+
-- NDI SDK for Windows
-- Visual Studio 2019 or later with C++ development tools
-
-## Prerequisites
-
-### 1. Install NDI SDK
-
-#### macOS
-1. Download NDI SDK for Apple from [NDI Developer Portal](https://ndi.video/for-developers/)
-2. Install to default location: `/Library/NDI SDK for Apple/`
-
-#### Windows
-1. Download NDI SDK for Windows from [NDI Developer Portal](https://ndi.video/for-developers/)
-2. Install to default location: `C:\Program Files\NDI\NDI 5 SDK\`
-
-### 2. Development Tools
-
-#### macOS
-```bash
-# Install Xcode Command Line Tools
-xcode-select --install
-```
-
-#### Windows
-1. Install Visual Studio 2019 or later
-2. Include "Desktop development with C++" workload
-3. Ensure Windows 10 SDK is installed
-
-## Building the Plugin
-
-### macOS Build
-
-1. **Clone and navigate to the repository**:
-   ```bash
-   git clone <repository-url>
-   cd NDIOutput_Standalone
-   ```
-
-2. **Run the build script**:
-   ```bash
-   ./build/mac/build.sh
-   ```
-
-3. **Or build manually**:
-   ```bash
-   make clean
-   make
-   ```
-
-4. **Install the plugin**:
-   ```bash
-   sudo make install
-   ```
-
-### Windows Build
-
-1. **Open Developer Command Prompt**:
-   - Launch "Developer Command Prompt for VS 2019" (or your VS version)
-
-2. **Navigate to the project**:
-   ```cmd
-   cd path\to\NDIOutput_Standalone
-   ```
-
-3. **Run the build script**:
-   ```cmd
-   build\windows\build.bat
-   ```
-
-4. **Build and install in one step**:
-   ```cmd
-   build\windows\build.bat install
-   ```
-
-### Manual Windows Build
-
-If you prefer to build manually:
-
-```cmd
-cd build\windows
-
-# Compile
-cl /I"..\..\openfx\include" /I"C:\Program Files\NDI\NDI 5 SDK\Include" /std:c++11 /EHsc /c "..\..\src\NDIOutputPlugin.cpp"
-
-# Link
-link NDIOutputPlugin.obj "C:\Program Files\NDI\NDI 5 SDK\Lib\x64\Processing.NDI.Lib.x64.lib" /OUT:NDIOutput.ofx /DLL /SUBSYSTEM:WINDOWS
-```
+- macOS 10.15+ (Catalina or later)
+- DaVinci Resolve 17+ (tested with DaVinci Resolve 20)
+- NDI Advanced SDK v6.1.1 (automatically installed)
 
 ## Installation
 
-### Automatic Installation
+### Quick Install from Release (Recommended)
 
-#### macOS
-```bash
-sudo make install
-```
+1. **Download the latest release** from `Releases/v1.1.4/`
+2. **Run the installer**:
+   ```bash
+   cd Releases/v1.1.4/
+   ./install.sh
+   ```
+3. **Restart DaVinci Resolve**
 
-#### Windows
-```cmd
-build\windows\build.bat install
-```
+### Prerequisites
 
-### Manual Installation
+1. **Install NDI Advanced SDK** (if not already installed):
+   ```bash
+   # The SDK should be installed at:
+   /Library/NDI Advanced SDK for Apple/
+   ```
 
-#### macOS
-Copy the plugin bundle to:
-```
-/Library/OFX/Plugins/NDIOutput.ofx.bundle/
-```
+2. **Create symbolic link** (required for build system):
+   ```bash
+   sudo ln -sf "/Library/NDI Advanced SDK for Apple" "/Library/NDI_Advanced_SDK"
+   ```
 
-#### Windows
-Create the following directory structure:
-```
-C:\Program Files\Common Files\OFX\Plugins\NDIOutput.ofx.bundle\
-├── Contents\
-│   ├── Info.plist
-│   └── Win64\
-│       └── NDIOutput.ofx
-```
+### Development Build and Install
 
-## Usage in DaVinci Resolve
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/your-repo/LSVR_ResolveOFX_NDIOutput.git
+   cd LSVR_ResolveOFX_NDIOutput
+   ```
 
-1. **Add the Effect**:
-   - Open DaVinci Resolve
-   - Navigate to Color or Edit page
-   - Find "NDI Output" in Effects Library under "OpenFX"
-   - Drag onto your clip or timeline
+2. **Build and install**:
+   ```bash
+   make install
+   ```
 
-2. **Configure Settings**:
-   - Set NDI Source Name (appears on network)
-   - Enable NDI Output
-   - Adjust frame rate if needed
+3. **Restart DaVinci Resolve** to load the new plugin.
 
-3. **Receive the Stream**:
-   - Use any NDI-compatible application
-   - Look for your source name on the network
-   - Connect and receive the stream
+## Usage
 
-## Troubleshooting
+1. **Add the Effect**: In DaVinci Resolve, go to the Color page and add "NDI Output" from the LSVR category in the OpenFX panel.
 
-### Build Issues
+2. **Configure Parameters**:
+   - **NDI Source Name**: Set the name that will appear on the network (default: "DaVinci Resolve NDI Output")
+   - **Enable NDI Output**: Toggle to start/stop streaming (default: enabled)
+   - **Frame Rate**: Set the output frame rate (default: 25 fps)
 
-#### macOS
-- **NDI SDK not found**: Ensure installed at `/Library/NDI SDK for Apple/`
-- **Command line tools missing**: Run `xcode-select --install`
-- **Permission denied**: Use `sudo` for installation
+3. **HDR Configuration** (when working with HDR content):
+   - **Enable HDR**: Toggle HDR mode for high dynamic range content
+   - **Color Space**: Choose between Rec.709, Rec.2020, or DCI-P3
+   - **Transfer Function**: Select SDR (Gamma 2.4), PQ (ST.2084), or HLG
+   - **Max Content Light Level**: Set maximum brightness in nits (100-10000)
+   - **Max Frame Average Light Level**: Set average brightness in nits (50-4000)
 
-#### Windows
-- **'cl' not recognized**: Use Visual Studio Developer Command Prompt
-- **NDI headers not found**: Verify NDI SDK installation path
-- **Link errors**: Ensure 64-bit NDI libraries are available
+4. **Receive the Stream**: Use any NDI-compatible receiver (NDI Video Monitor, OBS Studio, etc.) to receive the stream on the network.
 
-### Runtime Issues
+## Technical Details
 
-#### Plugin Not Appearing
-- Restart DaVinci Resolve completely
-- Check plugin installation path
-- Verify OFX plugin directory permissions
+### Architecture
 
-#### NDI Not Working
-- Install NDI Tools for testing
-- Check firewall settings (allow NDI traffic)
-- Verify network connectivity
-- Ensure NDI Runtime is installed
+- **Modern OFX C API**: Direct use of OpenFX C API for maximum host compatibility
+- **NDI Advanced SDK Integration**: Leverages advanced NDI features for professional workflows
+- **HDR Metadata**: Embeds proper HDR metadata for downstream applications
+- **Efficient Processing**: Minimal overhead pass-through design
 
-### Performance Tips
+### HDR Implementation
 
-- Use wired network for best performance
-- Match frame rates between source and receiver
-- Consider network bandwidth limitations
-- Monitor CPU usage during streaming
+The plugin supports comprehensive HDR workflows:
+
+- **16-bit Processing**: HDR content uses 16-bit per channel for extended dynamic range
+- **Metadata Embedding**: HDR parameters are embedded as XML metadata in NDI stream
+- **Color Space Conversion**: Proper handling of different color spaces and transfer functions
+- **Brightness Mapping**: Configurable mapping for different HDR standards
+
+### Build System
+
+The project uses a modern, streamlined build system:
+
+- **Modern C API**: Direct use of OpenFX C API for maximum compatibility
+- **NDI Advanced SDK**: Integration with NDI Advanced SDK v6.1.1
+- **Automatic Versioning**: Semantic versioning with automatic patch increment
+- **Clean Dependencies**: No legacy wrapper dependencies
 
 ## Development
 
-### Project Structure
-```
-NDIOutput_Standalone/
-├── src/                          # Source code
-│   ├── NDIOutputPlugin.cpp       # Main plugin implementation
-│   ├── NDIOutputPlugin.h         # Plugin header
-│   ├── libndi.dylib             # NDI library (macOS)
-│   └── BaldavengerOFX.NDIOutput.png # Plugin icon
-├── openfx/                       # OpenFX framework
-│   ├── include/                  # OFX headers
-│   └── Support/                  # OFX support library
-├── SupportExt/                   # Extended support utilities
-├── build/                        # Build scripts
-│   ├── mac/build.sh             # macOS build script
-│   └── windows/                 # Windows build files
-├── Makefile                      # Main build configuration
-└── README.md                     # This file
-```
-
 ### Building from Source
 
-The plugin uses the OpenFX standard and includes all necessary dependencies. The build system automatically handles:
+```bash
+# Clean build
+make clean
 
-- OpenFX framework integration
-- NDI SDK linking
-- Platform-specific compilation
-- Plugin bundle creation
+# Build with automatic version increment (production)
+make
 
-### Contributing
+# Development build without version increment
+make dev
+
+# Install the plugin
+make install
+```
+
+### Version Management
+
+The project uses semantic versioning (MAJOR.MINOR.PATCH):
+
+```bash
+# Show current version
+make show-version
+
+# Automatic patch increment (done on 'make')
+./scripts/increment_version.sh
+
+# Manual version setting
+./scripts/set_version.sh major 2.0.0    # Set major version
+./scripts/set_version.sh minor 1.1.0    # Set minor version  
+./scripts/set_version.sh patch 1.0.5    # Set patch version
+./scripts/set_version.sh 1.2.3          # Set specific version
+
+# Development builds (no version increment)
+make dev
+```
+
+**Version Strategy**:
+- **MAJOR**: Breaking changes or major feature releases
+- **MINOR**: New features, backward compatible
+- **PATCH**: Bug fixes, small improvements (auto-incremented on each build)
+
+**Build Commands**:
+- `make` - Production build with automatic patch increment
+- `make dev` - Development build without version increment
+- `make show-version` - Display current version
+
+### Project Structure
+
+```
+├── src/
+│   ├── NDIOutputPlugin.cpp          # Main plugin implementation (modern C API)
+│   ├── NDIOutputPlugin.h            # Header file
+│   └── LSVR.NDIOutput.png           # Plugin icon
+├── scripts/
+│   ├── increment_version.sh         # Auto-increment patch version
+│   └── set_version.sh               # Manual version management
+├── openfx/                          # OpenFX SDK
+├── VERSION                          # Current semantic version
+├── CHANGELOG.md                     # Version history
+├── Makefile                         # Build configuration
+├── Info.plist                       # Plugin metadata
+└── README.md                        # This file
+```
+
+## Troubleshooting
+
+### Plugin Not Loading
+
+1. **Check NDI SDK Installation**:
+   ```bash
+   ls -la "/Library/NDI Advanced SDK for Apple/"
+   ls -la "/Library/NDI_Advanced_SDK"  # Symbolic link
+   ```
+
+2. **Verify Plugin Installation**:
+   ```bash
+   ls -la "/Library/OFX/Plugins/NDIOutput.ofx.bundle"
+   ```
+
+3. **Check Library Dependencies**:
+   ```bash
+   otool -L "/Library/OFX/Plugins/NDIOutput.ofx.bundle/Contents/macOS/NDIOutput.ofx"
+   ```
+
+### No NDI Source Visible
+
+1. **Check Plugin Parameters**: Ensure "Enable NDI Output" is checked
+2. **Verify Network**: Ensure devices are on the same network
+3. **Check NDI Tools**: Use NDI Video Monitor to verify source availability
+4. **Restart DaVinci Resolve**: Sometimes required after parameter changes
+
+### HDR Issues
+
+1. **Check HDR Settings**: Verify color space and transfer function match your content
+2. **Monitor Compatibility**: Ensure receiving device supports HDR metadata
+3. **Content Verification**: Confirm source material is actually HDR
+
+## Version History
+
+### v1.0.x (Current)
+- **v1.0.2**: Added semantic versioning system with automatic patch increment
+- **v1.0.1**: Version system implementation
+- **v1.0.0**: Modern OFX C API implementation with full HDR support
+  - Modern OFX C API implementation
+  - Full HDR support with PQ/HLG transfer functions
+  - NDI Advanced SDK v6.1.1 integration
+  - Improved compatibility with DaVinci Resolve 20+
+  - Enhanced parameter controls and metadata handling
+
+### v0.x (Legacy)
+- Original implementation using OFX wrapper classes
+- Basic NDI streaming functionality
+- Limited HDR support
+
+## License
+
+This project is licensed under the BSD 3-Clause License - see the LICENSE file for details.
+
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Test on both platforms
+4. Test thoroughly with DaVinci Resolve
 5. Submit a pull request
-
-## Technical Details
-
-- **Plugin Type**: OFX ImageEffect Filter
-- **Pixel Format**: Float RGBA → uint8 RGBA conversion
-- **Threading**: Thread-safe rendering
-- **NDI Format**: Progressive RGBA frames
-- **Timecode**: Synthesized by NDI SDK
-
-## License
-
-This project is licensed under the GPL v3 License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Based on the BaldavengerOFX plugin collection
-- Uses the OpenFX standard for plugin development
-- Integrates NDI SDK from Vizrt/NewTek
-- Inspired by the professional broadcast industry's need for IP-based workflows
 
 ## Support
 
 For issues and questions:
-1. Check the troubleshooting section above
-2. Verify your NDI SDK installation
-3. Test with NDI Tools first
-4. Create an issue with detailed system information
-
-## Version History
-
-- **v1.0**: Initial release with basic NDI streaming functionality
-- Cross-platform support for macOS and Windows
-- Real-time video streaming with configurable parameters
+- Check the troubleshooting section above
+- Review DaVinci Resolve console output for error messages
+- Verify NDI SDK installation and network configuration

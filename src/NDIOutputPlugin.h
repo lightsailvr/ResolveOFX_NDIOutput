@@ -2,6 +2,10 @@
 
 #include "ofxsImageEffect.h"
 
+// Forward declarations for HDR support
+struct NDIlib_video_frame_v2_t;
+struct NDIlib_metadata_frame_t;
+
 class NDIOutputPluginFactory : public OFX::PluginFactoryHelper<NDIOutputPluginFactory>
 {
 public:

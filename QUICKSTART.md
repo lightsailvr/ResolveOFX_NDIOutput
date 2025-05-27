@@ -5,8 +5,9 @@ Get the NDI Output plugin running in DaVinci Resolve in just a few steps!
 ## Prerequisites (5 minutes)
 
 ### macOS
-1. Install NDI SDK: Download from [ndi.video/for-developers](https://ndi.video/for-developers/)
-2. Install Xcode Command Line Tools: `xcode-select --install`
+1. Install NDI Advanced SDK: Download from [ndi.video/for-developers](https://ndi.video/for-developers/)
+2. Create symbolic link: `sudo ln -sf "/Library/NDI Advanced SDK for Apple" "/Library/NDI_Advanced_SDK"`
+3. Install Xcode Command Line Tools: `xcode-select --install`
 
 ### Windows
 1. Install NDI SDK: Download from [ndi.video/for-developers](https://ndi.video/for-developers/)
@@ -62,7 +63,7 @@ build\windows\build.bat install
 - Ensure you've enabled the NDI output in the plugin
 
 **Build failed?**
-- macOS: Ensure NDI SDK is at `/Library/NDI SDK for Apple/`
+- macOS: Ensure NDI Advanced SDK is at `/Library/NDI Advanced SDK for Apple/`
 - Windows: Use Visual Studio Developer Command Prompt
 
 ## Next Steps
