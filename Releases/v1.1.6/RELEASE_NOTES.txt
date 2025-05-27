@@ -1,0 +1,1 @@
+NDI Output Plugin v1.1.6 - Added version display label

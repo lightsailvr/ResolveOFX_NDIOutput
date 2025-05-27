@@ -1,0 +1,26 @@
+NDI Output Plugin v1.1.8 - Added Metal GPU Acceleration
+
+Features:
+- Real Metal GPU acceleration for RGBA to UYVY conversion
+- Metal GPU acceleration for HDR frame processing  
+- Automatic fallback to CPU if Metal fails
+- Improved performance on Apple Silicon and Intel Macs with Metal support
+- Version display label in plugin interface
+
+GPU Acceleration:
+- Uses Metal compute shaders for color space conversion
+- Parallel processing on GPU for better performance
+- Optimized for both SDR and HDR workflows
+- Significant performance improvement over CPU-only processing
+
+Bug Fixes:
+- Fixed NDI source not activating until HDR checkbox was checked
+- Fixed HDR mode sending black frames
+- Improved parameter handling and NDI initialization
+
+Technical Details:
+- Metal compute kernels for RGBA to UYVY conversion
+- GPU-accelerated HDR 16-bit conversion
+- Proper vertical flip handling in GPU shaders
+- Thread-safe GPU context management
+- Automatic Metal availability detection 

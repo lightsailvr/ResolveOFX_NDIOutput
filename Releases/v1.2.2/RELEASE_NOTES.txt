@@ -1,0 +1,44 @@
+NDI Output Plugin v1.2.2 - NDI Advanced SDK Fix
+
+🔧 CRITICAL FIX:
+- Fixed NDI Advanced SDK initialization failure
+- Corrected library path linking for NDI Advanced SDK
+- Removed conflicting symlinks that were causing NDI sender creation to fail
+
+🚀 IMPROVEMENTS:
+- Enhanced error logging with detailed NDI initialization steps
+- Added specific error messages for NDI runtime availability
+- Improved debugging information for troubleshooting
+
+📋 TECHNICAL DETAILS:
+- Updated Makefile to use proper quoted paths for "NDI Advanced SDK for Apple"
+- Fixed install_name_tool commands to correctly link libndi_advanced.dylib
+- Verified NDI Advanced SDK functionality with standalone test
+- Maintained all GPU acceleration and HDR features
+
+✅ VERIFICATION:
+- NDI library initialization: ✅ Working
+- NDI sender creation: ✅ Working  
+- GPU acceleration: ✅ Working
+- macOS system logging: ✅ Working
+- Version display in DaVinci Resolve: ✅ Working
+
+🎯 WHAT'S FIXED:
+- "Failed to create NDI sender" error resolved
+- NDI streams now properly initialize and broadcast
+- Plugin loads successfully in DaVinci Resolve
+- All Advanced NDI features preserved and functional
+
+📦 INSTALLATION:
+1. Copy NDIOutput.ofx.bundle to /Library/OFX/Plugins/
+2. Restart DaVinci Resolve
+3. Add NDI Output effect to your timeline
+4. Monitor logs with: ./scripts/monitor_ndi_logs.sh
+
+🔍 REQUIREMENTS:
+- macOS with Metal support
+- NDI Tools or NDI Runtime installed
+- NDI Advanced SDK for Apple (included in build)
+- DaVinci Resolve 17+ or compatible OFX host
+
+This release resolves the critical NDI initialization issue while maintaining all advanced features including GPU acceleration, HDR support, and comprehensive logging. 

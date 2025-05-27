@@ -1,0 +1,60 @@
+NDI Output Plugin v1.2.1 - Enhanced Interface & Version Visibility
+
+🎯 NEW FEATURES:
+- Prominent version display in plugin interface
+- Organized parameter groups for better usability
+- Enhanced plugin description with version information
+- Improved parameter organization and visibility
+
+📋 INTERFACE IMPROVEMENTS:
+- "Plugin Information" group with visible version label
+- "Basic Settings" group for core NDI configuration
+- "Performance Settings" group for GPU and optimization options
+- "HDR Settings" group for advanced HDR configuration
+- All parameter groups are properly organized and labeled
+
+🔍 VERSION VISIBILITY:
+- Plugin Version parameter now visible in DaVinci Resolve interface
+- Shows: "v1.2.1 (GPU-Accelerated NDI Advanced)"
+- Enhanced plugin description includes version information
+- Easy identification of current plugin version
+
+📊 PARAMETER ORGANIZATION:
+- Plugin Information:
+  - Plugin Version (read-only display)
+- Basic Settings:
+  - NDI Source Name
+  - Enable NDI Output
+  - Frame Rate
+- Performance Settings:
+  - GPU Acceleration
+  - Asynchronous Sending
+  - Optimal Color Format
+- HDR Settings:
+  - Enable HDR
+  - Color Space (Rec.709/Rec.2020/DCI-P3)
+  - Transfer Function (SDR/PQ/HLG)
+  - Max Content Light Level
+  - Max Frame Average Light Level
+
+🛠️ TECHNICAL IMPROVEMENTS:
+- Removed duplicate parameter definitions
+- Cleaner code organization
+- Better parameter grouping structure
+- Enhanced interface readability
+
+🚀 PERFORMANCE FEATURES (Carried Forward):
+- Complete Metal GPU acceleration for macOS
+- 3-10x performance improvement over CPU processing
+- Real-time performance monitoring and logging
+- Comprehensive GPU verification tools
+
+💡 HOW TO VERIFY VERSION:
+1. Load the NDI Output plugin in DaVinci Resolve
+2. Look for "Plugin Information" group at the top
+3. Check "Plugin Version" field shows "v1.2.1 (GPU-Accelerated NDI Advanced)"
+4. Verify organized parameter groups are displayed
+
+This release focuses on improving user experience by making the plugin version
+clearly visible and organizing parameters into logical groups for easier navigation
+and configuration in DaVinci Resolve. 

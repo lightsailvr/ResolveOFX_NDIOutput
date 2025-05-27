@@ -1,0 +1,52 @@
+NDI Output Plugin v1.1.9 - GPU Performance Verification & Enhanced Logging
+
+🚀 NEW FEATURES:
+- Comprehensive GPU performance logging and verification
+- Real-time timing comparison between GPU and CPU processing
+- Visual indicators for GPU acceleration status (✅ 🚀 ⚠️ ❌)
+- Detailed Metal compute shader execution logging
+- Performance monitoring script for system-level GPU tracking
+
+📊 PERFORMANCE MONITORING:
+- Microsecond-precision timing for all conversions
+- Thread group dispatch logging for Metal kernels
+- Error detection and reporting for GPU operations
+- Automatic fallback logging when GPU fails
+- Performance comparison metrics (GPU vs CPU)
+
+🔍 VERIFICATION TOOLS:
+- GPU_PERFORMANCE_VERIFICATION.md - Complete verification guide
+- monitor_gpu_performance.sh - Real-time GPU monitoring script
+- Console logging with emoji indicators for easy identification
+- Step-by-step troubleshooting guide
+
+📈 EXPECTED PERFORMANCE GAINS:
+- 1080p RGBA→UYVY: 3-5x faster with GPU (1-3ms vs 5-15ms)
+- 4K RGBA→UYVY: 5-10x faster with GPU (3-8ms vs 20-50ms)
+- HDR 16-bit conversion: 2-4x faster with GPU
+- Reduced CPU usage and system thermal load
+
+🛠️ TECHNICAL IMPROVEMENTS:
+- Enhanced Metal compute shader error handling
+- Thread-safe GPU context management with detailed logging
+- Improved buffer allocation and memory management logging
+- Command buffer error detection and reporting
+- Automatic Metal availability detection with status reporting
+
+🎯 HOW TO VERIFY GPU ACCELERATION:
+1. Check plugin version shows "GPU-Accelerated NDI Advanced"
+2. Monitor Console.app for "NDI Plugin" messages
+3. Look for "✅ Metal GPU acceleration SUCCESS!" logs
+4. Verify timing shows <5ms for 1080p conversions
+5. Use included monitoring script: ./monitor_gpu_performance.sh
+
+🔧 DEBUGGING FEATURES:
+- Detailed error messages for Metal initialization failures
+- GPU context availability logging
+- Metal device information logging
+- Shader compilation error reporting
+- Performance bottleneck identification
+
+This release provides complete transparency into GPU acceleration performance,
+making it easy to verify that Metal GPU acceleration is working optimally
+and providing detailed diagnostics for troubleshooting any issues. 
