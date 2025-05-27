@@ -1,0 +1,50 @@
+NDI Output Plugin v1.2.3 - HDR Bug Fix
+
+🔧 CRITICAL HDR FIX:
+- Fixed HDR mode sending black frames and poor performance
+- Implemented proper P216 format for HDR according to NDI SDK v6 specification
+- Fixed HDR metadata format to use standardized ndi_color_info XML structure
+- Corrected 16-bit limited range conversion using ITU BT.2100 quantization
+
+🚀 HDR IMPROVEMENTS:
+- Proper P216 planar YUV 4:2:2 16-bit format for HDR streams
+- Correct Rec.2020 color coefficients for HDR conversion
+- 16-bit limited range encoding [4096-60160] for Y, [32768±28672] for UV
+- Optimized 4:2:2 chroma subsampling for better performance
+- Updated Metal GPU shaders for P216 format acceleration
+
+📋 TECHNICAL DETAILS:
+- HDR metadata now uses proper NDI format: <ndi_color_info primaries="bt_2020" transfer="bt_2100_pq" matrix="bt_2020" />
+- FourCC changed from NDIlib_FourCC_type_RGBA to NDIlib_FourCC_video_type_P216
+- Separate Y and UV plane processing for optimal memory layout
+- GPU acceleration updated for P216 format with separate plane buffers
+
+✅ VERIFICATION:
+- HDR frames now display correctly (no more black frames)
+- Significant performance improvement in HDR mode
+- Proper color space and transfer function metadata
+- GPU acceleration working for both SDR and HDR modes
+- Compatible with NDI Tools and professional NDI receivers
+
+🎯 WHAT'S FIXED:
+- HDR checkbox no longer causes black frames
+- HDR performance dramatically improved
+- Proper HDR color reproduction
+- Correct metadata for HDR streams
+- GPU acceleration for HDR conversion
+
+📦 INSTALLATION:
+1. Copy NDIOutput.ofx.bundle to /Library/OFX/Plugins/
+2. Restart DaVinci Resolve
+3. Enable HDR mode in plugin settings
+4. Monitor logs with: ./scripts/monitor_ndi_logs.sh
+
+🔍 HDR SETTINGS:
+- Color Space: Rec.709, Rec.2020, DCI-P3
+- Transfer Function: SDR (Gamma 2.4), PQ (ST.2084), HLG (Hybrid Log-Gamma)
+- Max Content Light Level: 100-10000 nits
+- Max Frame Average Light Level: 50-4000 nits
+
+This release resolves the critical HDR black frame issue by implementing proper P216 format and NDI v6 compliant HDR metadata, while maintaining all GPU acceleration and performance features.
+
+Reference: https://docs.ndi.video/all/developing-with-ndi/sdk/hdr#sending-uncompressed-hdr-frames 
