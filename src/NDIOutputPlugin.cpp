@@ -39,6 +39,10 @@
 #include "MetalGPUAcceleration.h"
 #endif
 
+#ifdef _WIN32
+#include "CudaGPUAcceleration.h"
+#endif
+
 // GPU acceleration headers (forward declarations only)
 #ifdef __APPLE__
 // Forward declarations for Metal types to avoid Objective-C in C++
@@ -162,6 +166,7 @@ struct GPUContext {
 #ifdef __APPLE__
     MetalGPUContextRef metalContext;
 #elif defined(_WIN32)
+    CudaGPUContextRef cudaContext;
     void* d3dDevice;
     void* d3dContext;
     void* colorConversionShader;
@@ -278,19 +283,42 @@ static bool initializeGPUContext(NDIInstanceData* data)
     NDI_LOG("Metal GPU acceleration initialized successfully\n");
     
 #elif defined(_WIN32)
-    // Initialize D3D11 for Windows
-    HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        0, nullptr, 0, D3D11_SDK_VERSION,
-        (ID3D11Device**)&data->gpuContext->d3dDevice,
-        nullptr, (ID3D11DeviceContext**)&data->gpuContext->d3dContext);
-    
-    if (FAILED(hr)) {
-        NDI_LOG("Failed to create D3D11 device\n");
-        return false;
+    // Try CUDA first, then fallback to D3D11
+    if (cuda_gpu_is_available()) {
+        NDI_LOG("Initializing CUDA GPU acceleration...");
+        data->gpuContext->cudaContext = cuda_gpu_init();
+        if (data->gpuContext->cudaContext) {
+            NDI_LOG("CUDA GPU acceleration initialized successfully");
+            NDI_LOG("Device: %s", cuda_gpu_get_device_name(data->gpuContext->cudaContext));
+            
+            size_t free_mem, total_mem;
+            if (cuda_gpu_get_memory_info(data->gpuContext->cudaContext, &free_mem, &total_mem)) {
+                NDI_LOG("CUDA Memory: %.1f MB free / %.1f MB total", 
+                       free_mem / (1024.0f * 1024.0f), 
+                       total_mem / (1024.0f * 1024.0f));
+            }
+        } else {
+            NDI_LOG("Failed to initialize CUDA GPU acceleration, trying D3D11...");
+        }
+    } else {
+        NDI_LOG("CUDA not available, trying D3D11...");
     }
     
-    NDI_LOG("D3D11 GPU acceleration initialized\n");
+    // Fallback to D3D11 if CUDA failed
+    if (!data->gpuContext->cudaContext) {
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            0, nullptr, 0, D3D11_SDK_VERSION,
+            (ID3D11Device**)&data->gpuContext->d3dDevice,
+            nullptr, (ID3D11DeviceContext**)&data->gpuContext->d3dContext);
+        
+        if (FAILED(hr)) {
+            NDI_LOG("Failed to create D3D11 device");
+            return false;
+        }
+        
+        NDI_LOG("D3D11 GPU acceleration initialized as fallback");
+    }
 #else
     // Initialize OpenGL for Linux
     // Note: This would require proper OpenGL context setup
@@ -316,6 +344,13 @@ static void shutdownGPUContext(NDIInstanceData* data)
         data->gpuContext->metalContext = nullptr;
     }
 #elif defined(_WIN32)
+    // Shutdown CUDA if it was initialized
+    if (data->gpuContext->cudaContext) {
+        cuda_gpu_shutdown(data->gpuContext->cudaContext);
+        data->gpuContext->cudaContext = nullptr;
+    }
+    
+    // Shutdown D3D11 if it was initialized
     if (data->gpuContext->d3dContext) {
         ((ID3D11DeviceContext*)data->gpuContext->d3dContext)->Release();
     }
@@ -369,15 +404,38 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
     
 #elif defined(_WIN32)
-    // D3D11 implementation for RGBA to UYVY conversion
-    ID3D11Device* device = (ID3D11Device*)data->gpuContext->d3dDevice;
-    ID3D11DeviceContext* context = (ID3D11DeviceContext*)data->gpuContext->d3dContext;
+    // Try CUDA first if available
+    if (data->gpuContext->cudaContext) {
+        NDI_LOG("🚀 Attempting CUDA GPU acceleration...");
+        
+        bool success = cuda_gpu_convert_rgba_to_uyvy(
+            data->gpuContext->cudaContext,
+            static_cast<const float*>(rgbaData),
+            data->uyvyFrameBuffer.data(),
+            width,
+            height
+        );
+        
+        if (success) {
+            NDI_LOG("✅ CUDA GPU acceleration SUCCESS!");
+            return;
+        } else {
+            NDI_LOG("❌ CUDA GPU conversion failed, falling back to CPU");
+        }
+    }
     
-    // Create buffers and execute compute shader
-    // ... D3D11 compute shader execution ...
-    NDI_LOG("D3D11 GPU conversion available, using CPU fallback for now\n");
+    // D3D11 implementation for RGBA to UYVY conversion (fallback)
+    if (data->gpuContext->d3dDevice && data->gpuContext->d3dContext) {
+        ID3D11Device* device = (ID3D11Device*)data->gpuContext->d3dDevice;
+        ID3D11DeviceContext* context = (ID3D11DeviceContext*)data->gpuContext->d3dContext;
+        
+        // Create buffers and execute compute shader
+        // ... D3D11 compute shader execution ...
+        NDI_LOG("D3D11 GPU conversion available, using CPU fallback for now");
+    }
+    
+    // Fallback to CPU if both GPU methods failed
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    return;
     
 #else
     // OpenGL implementation for Linux
@@ -683,6 +741,26 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
             NDI_LOG("Metal GPU HDR conversion completed");
         } else {
             NDI_LOG("Metal GPU HDR conversion failed, falling back to CPU");
+        }
+    }
+#elif defined(_WIN32)
+    if (data->gpuAcceleration && data->gpuContext && data->gpuContext->initialized && data->gpuContext->cudaContext) {
+        // For HDR, we need to convert to 16-bit limited range
+        float scale = 65472.0f; // 16-bit limited range
+        
+        gpuSuccess = cuda_gpu_convert_rgba_to_hdr(
+            data->gpuContext->cudaContext,
+            srcData,
+            dstData,
+            width,
+            height,
+            scale
+        );
+        
+        if (gpuSuccess) {
+            NDI_LOG("CUDA GPU HDR conversion completed");
+        } else {
+            NDI_LOG("CUDA GPU HDR conversion failed, falling back to CPU");
         }
     }
 #endif
