@@ -58,7 +58,7 @@ install: $(BUNDLE_EXECUTABLE)
 # Clean
 clean:
 	rm -rf $(BUNDLE_NAME)
-	rm -f *.o
+	rm -f *.o src/*.o
 
 # Version increment (for development)
 bump-patch:

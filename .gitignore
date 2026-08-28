@@ -1,0 +1,25 @@
+# macOS cruft
+.DS_Store
+
+# Build outputs (macOS make build)
+*.o
+/NDIOutput.ofx.bundle/
+
+# CMake build trees (Windows/CUDA build)
+/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Windows build cruft
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+.vs/
+x64/
+
+# Editors
+.vscode/
+.idea/
