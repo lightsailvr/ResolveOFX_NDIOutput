@@ -375,16 +375,20 @@ void metal_gpu_shutdown(MetalGPUContextRef context) {
                 }
             }
             if (anyBusy) {
-                METAL_LOG("Shutdown: async slot still busy after 2s — leaking slot buffers to stay safe");
+                // A completion handler may still fire and touch the slot array
+                // and asyncMutex — leak the whole context rather than free
+                // memory a straggler will dereference.
+                METAL_LOG("Shutdown: async slot still busy after 2s — leaking the Metal context to stay safe");
+                return;
             }
+            std::lock_guard<std::mutex> lock(context->asyncMutex);
             for (int i = 0; i < METAL_ASYNC_SLOTS; ++i) {
                 MetalAsyncSlot& slot = context->asyncSlots[i];
-                if (slot.buffer && !slot.busy) {
+                if (slot.buffer) {
                     [slot.buffer release];
                 }
                 slot.buffer = nil;
                 slot.capacity = 0;
-                slot.busy = false;
             }
         }
 
@@ -580,20 +584,21 @@ bool metal_gpu_buffer_downscale_to_p216(MetalGPUContextRef context,
 
 // Non-blocking variant (issue #5, v1.6.0): encode + commit only. See the
 // header contract. Validation mirrors runDownscaleKernel so both paths refuse
-// the same sources.
-bool metal_gpu_downscale_submit(MetalGPUContextRef context,
-                                void* commandQueue,
-                                void* srcMetalBuffer,
-                                int srcWidth, int srcHeight, int srcRowFloats,
-                                int divisor,
-                                int outWidth, int outHeight,
-                                bool p216,
-                                metal_downscale_done_fn done, void* user)
+// the same sources; refusals are typed (BUSY vs INVALID) because the caller's
+// correct reaction differs — drop vs fall back to the blocking readback.
+metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
+                                               void* commandQueue,
+                                               void* srcMetalBuffer,
+                                               int srcWidth, int srcHeight, int srcRowFloats,
+                                               int divisor,
+                                               int outWidth, int outHeight,
+                                               bool p216,
+                                               metal_downscale_done_fn done, void* user)
 {
-    if (!context || !srcMetalBuffer || !done) return false;
+    if (!context || !srcMetalBuffer || !done) return METAL_SUBMIT_INVALID;
     if (srcWidth <= 0 || srcHeight <= 0 || srcRowFloats < srcWidth * 4 ||
         divisor <= 0 || outWidth < 2 || (outWidth % 2) != 0 || outHeight <= 0) {
-        return false;
+        return METAL_SUBMIT_INVALID;
     }
     const size_t outBytes = static_cast<size_t>(outWidth) * outHeight * 2 *
                             (p216 ? sizeof(unsigned short) : 1);
@@ -602,18 +607,18 @@ bool metal_gpu_downscale_submit(MetalGPUContextRef context,
         id<MTLCommandQueue> queue = commandQueue
             ? static_cast<id<MTLCommandQueue>>(commandQueue)
             : context->commandQueue;
-        if (!queue) return false;
+        if (!queue) return METAL_SUBMIT_INVALID;
         id<MTLDevice> device = queue.device;
         id<MTLBuffer> srcBuffer = static_cast<id<MTLBuffer>>(srcMetalBuffer);
 
         const size_t neededSrcBytes =
             static_cast<size_t>(srcHeight) * static_cast<size_t>(srcRowFloats) * sizeof(float);
         if (srcBuffer.length < neededSrcBytes) {
-            return false;
+            return METAL_SUBMIT_INVALID;
         }
 
         MetalFastPathState* fastPath = fastPathForDevice(context, device);
-        if (!fastPath) return false;
+        if (!fastPath) return METAL_SUBMIT_INVALID;
 
         // Claim a free slot; none free = GPU behind or consumer backlogged —
         // the caller drops this frame (backpressure by dropping, never blocking).
@@ -628,7 +633,7 @@ bool metal_gpu_downscale_submit(MetalGPUContextRef context,
                 }
             }
         }
-        if (!slot) return false;
+        if (!slot) return METAL_SUBMIT_BUSY;
 
         if (!slot->buffer || slot->capacity < outBytes || slot->device != device) {
             if (slot->buffer) [slot->buffer release];
@@ -638,7 +643,7 @@ bool metal_gpu_downscale_submit(MetalGPUContextRef context,
             if (!slot->buffer) {
                 std::lock_guard<std::mutex> lock(context->asyncMutex);
                 slot->busy = false;
-                return false;
+                return METAL_SUBMIT_INVALID; // allocation failure won't heal frame-to-frame
             }
         }
 
@@ -678,7 +683,7 @@ bool metal_gpu_downscale_submit(MetalGPUContextRef context,
             done(user, slot, [outBuf contents], outBytes, gpuMs, ok);
         }];
         [commandBuffer commit]; // no wait — that's the whole point
-        return true;
+        return METAL_SUBMIT_OK;
     }
 }
 

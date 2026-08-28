@@ -90,14 +90,24 @@ typedef void (*metal_downscale_done_fn)(void* user, void* slot,
                                         const void* outPtr, size_t outBytes,
                                         double gpuMs, bool ok);
 
-bool metal_gpu_downscale_submit(MetalGPUContextRef context,
-                                void* commandQueue,
-                                void* srcMetalBuffer,
-                                int srcWidth, int srcHeight, int srcRowFloats,
-                                int divisor,
-                                int outWidth, int outHeight,
-                                bool p216,
-                                metal_downscale_done_fn done, void* user);
+// Why a submit was refused — the caller's reaction differs:
+// BUSY   = every slot in flight (transient): drop this frame, try next render.
+// INVALID = geometry/pipeline/allocation failure (persistent for this source):
+//           fall back to the blocking readback path so the stream survives.
+typedef enum {
+    METAL_SUBMIT_OK = 0,
+    METAL_SUBMIT_BUSY = 1,
+    METAL_SUBMIT_INVALID = 2,
+} metal_submit_status;
+
+metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
+                                               void* commandQueue,
+                                               void* srcMetalBuffer,
+                                               int srcWidth, int srcHeight, int srcRowFloats,
+                                               int divisor,
+                                               int outWidth, int outHeight,
+                                               bool p216,
+                                               metal_downscale_done_fn done, void* user);
 
 void metal_gpu_downscale_release(MetalGPUContextRef context, void* slot);
 

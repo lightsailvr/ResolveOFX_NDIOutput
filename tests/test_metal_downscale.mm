@@ -276,7 +276,7 @@ int main()
             AsyncCapture cap;
             bool submitted = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
                                                         srcW, srcH, srcW * 4, 2, outW, outH,
-                                                        /*p216=*/false, onDone, &cap);
+                                                        /*p216=*/false, onDone, &cap) == METAL_SUBMIT_OK;
             bool done = submitted && waitFired(cap, 1);
             check(done && cap.ok && cap.out.size() == expected.size() &&
                       compareBuffers(cap.out.data(), expected.data(), expected.size(), 2,
@@ -291,7 +291,7 @@ int main()
             AsyncCapture cap;
             bool submitted = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
                                                         srcW, srcH, srcW * 4, 2, outW, outH,
-                                                        /*p216=*/true, onDone, &cap);
+                                                        /*p216=*/true, onDone, &cap) == METAL_SUBMIT_OK;
             bool done = submitted && waitFired(cap, 1);
             check(done && cap.ok && cap.out.size() == expected.size() * sizeof(uint16_t) &&
                       compareBuffers(reinterpret_cast<const uint16_t*>(cap.out.data()),
@@ -308,22 +308,22 @@ int main()
             for (int i = 0; i < 4; ++i) {
                 if (metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
                                                srcW, srcH, srcW * 4, 2, outW, outH,
-                                               false, onDone, &caps[i])) {
+                                               false, onDone, &caps[i]) == METAL_SUBMIT_OK) {
                     ++accepted;
                 }
             }
-            bool fifthRefused = !metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
-                                                            srcW, srcH, srcW * 4, 2, outW, outH,
-                                                            false, onDone, &caps[4]);
+            bool fifthRefused = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                                           srcW, srcH, srcW * 4, 2, outW, outH,
+                                                           false, onDone, &caps[4]) == METAL_SUBMIT_BUSY;
             bool allFired = true;
             for (int i = 0; i < 4; ++i) {
                 allFired = allFired && waitFired(caps[i], 1);
                 if (caps[i].slot) metal_gpu_downscale_release(ctx, caps[i].slot);
             }
             AsyncCapture after;
-            bool afterOk = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
-                                                      srcW, srcH, srcW * 4, 2, outW, outH,
-                                                      false, onDone, &after) &&
+            bool afterOk = (metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                                       srcW, srcH, srcW * 4, 2, outW, outH,
+                                                       false, onDone, &after) == METAL_SUBMIT_OK) &&
                            waitFired(after, 1);
             if (after.slot) metal_gpu_downscale_release(ctx, after.slot);
             check(accepted == 4 && fifthRefused && allFired && afterOk,

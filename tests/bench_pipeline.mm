@@ -413,9 +413,9 @@ int main()
                 blitNoWait();
                 SubmitTag* tag = new SubmitTag{&sim, eye};
                 ++sim.pending;
-                if (!metal_gpu_downscale_submit(ctx, nullptr, srcBuf, SRC_W, SRC_H,
-                                                rowFloatsInt, DIVISOR, outW, outH,
-                                                false, onDone, tag)) {
+                if (metal_gpu_downscale_submit(ctx, nullptr, srcBuf, SRC_W, SRC_H,
+                                               rowFloatsInt, DIVISOR, outW, outH,
+                                               false, onDone, tag) != METAL_SUBMIT_OK) {
                     --sim.pending;
                     delete tag;
                     ++dropped;

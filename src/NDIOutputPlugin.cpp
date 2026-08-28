@@ -280,6 +280,10 @@ struct NDIInstanceData {
     double renderTime;         // kOfxPropTime — the pairing key
     bool renderIsThumbnail;
     int stereoPacking;         // 0 = Side-by-Side, 1 = Top-Bottom
+    // Stream status handoff: the pump worker composes status off-thread while
+    // render threads flush it to the UI param, so both fields live behind
+    // their own small mutex (taken after hub->mutex, never the reverse).
+    std::mutex statusMutex;
     bool statusParamDirty;     // stream status changed; push to the UI param
     std::string statusParamValue;
 
@@ -486,9 +490,13 @@ static inline double msSince(const std::chrono::steady_clock::time_point& t0)
 // Caller holds hub->mutex. Builds and sends one NDI frame of the given wire
 // format. `allowAsync` is false for P216 (HDR sends have always been
 // synchronous here) and for any buffer that can't outlive the call.
+// hdrMetadataXML arrives by reference from the submission (never read off the
+// instance here — the pump worker calls this while render threads own the
+// instance's HDR strings).
 static void hubSendFrameLocked(SenderHub* hub, NDIInstanceData* data,
                                const ndi_stereo::FrameMeta& meta,
-                               const uint8_t* bytes, bool allowAsync)
+                               const uint8_t* bytes, bool allowAsync,
+                               const std::string& hdrMetadataXML)
 {
     NDIlib_video_frame_v2_t frame;
     frame.xres = meta.width;
@@ -505,7 +513,7 @@ static void hubSendFrameLocked(SenderHub* hub, NDIInstanceData* data,
         case ndi_stereo::WireFormat::P216:
             frame.FourCC = NDIlib_FourCC_video_type_P216;
             frame.line_stride_in_bytes = meta.width * static_cast<int>(sizeof(uint16_t));
-            frame.p_metadata = data->hdrMetadataXML.empty() ? nullptr : data->hdrMetadataXML.c_str();
+            frame.p_metadata = hdrMetadataXML.empty() ? nullptr : hdrMetadataXML.c_str();
             break;
         case ndi_stereo::WireFormat::RGBA8:
             frame.FourCC = NDIlib_FourCC_type_RGBA;
@@ -558,21 +566,43 @@ static void hubUpdateStatusLocked(SenderHub* hub, NDIInstanceData* data)
         hub->status = status;
         NDI_LOG_TEXT(("Stream status: " + status).c_str());
     }
+    std::lock_guard<std::mutex> statusLock(data->statusMutex); // after hub->mutex, never reversed
     if (status != data->statusParamValue) {
         data->statusParamValue = status;
         data->statusParamDirty = true;
     }
 }
 
+// One frame handed to the hub: everything the pairer and sender need,
+// captured at the PRODUCING call site. The async pump submits after the
+// originating render call has returned, so nothing here may be read off the
+// instance's render*/HDR fields at consume time — they belong to a later
+// render by then.
+struct HubSubmit {
+    ndi_stereo::WireFormat format = ndi_stereo::WireFormat::UYVY8;
+    int width = 0;
+    int height = 0;
+    const uint8_t* bytes = nullptr;
+    size_t byteCount = 0;
+    bool allowAsync = false;
+    int eye = ndi_stereo::kEyeLeft;
+    double time = 0.0;
+    bool isThumbnail = false;
+    std::string hdrMetadataXML; // P216 only
+};
+
+// Stage timings for one hub submission. Out-param rather than instance fields
+// because render threads and the pump worker submit concurrently — each
+// caller owns its own copy (the render path copies into the mtimer fields,
+// the worker logs a wtimer line).
+struct SubmitTimers {
+    double flushMs = 0.0, packMs = 0.0, sendMs = 0.0;
+};
+
 // The single entry point every converted frame goes through. Consults the
 // process-global pairer: mono frames stream unchanged (zero extra copies),
 // stereo frames wait for their partner and go out as ONE packed frame.
-// eye/time/isThumbnail arrive as explicit arguments because the async pump
-// submits AFTER the render call that produced the frame has returned — the
-// instance's render* fields belong to a later call by then.
-static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
-                           int width, int height, const uint8_t* bytes, size_t byteCount,
-                           bool allowAsync, int eye, double time, bool isThumbnail)
+static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTimers* timers)
 {
     SenderHub* hub = data->hub;
     if (!hub) {
@@ -589,29 +619,29 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
     }
 
     ndi_stereo::FrameMeta meta;
-    meta.width = width;
-    meta.height = height;
-    meta.format = format;
+    meta.width = s.width;
+    meta.height = s.height;
+    meta.format = s.format;
 
     const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 
     ndi_stereo::SubmitResult result = hub->pairer.submit(
-        eye, time, meta, bytes, byteCount, nowMs, isThumbnail);
+        s.eye, s.time, meta, s.bytes, s.byteCount, nowMs, s.isThumbnail);
 
     switch (result.action) {
         case ndi_stereo::SubmitAction::SendMono: {
             const auto sendT0 = std::chrono::steady_clock::now();
-            hubSendFrameLocked(hub, data, meta, bytes, allowAsync);
-            data->timerSendMs = msSince(sendT0);
+            hubSendFrameLocked(hub, data, meta, s.bytes, s.allowAsync, s.hdrMetadataXML);
+            if (timers) timers->sendMs = msSince(sendT0);
             break;
         }
 
         case ndi_stereo::SubmitAction::SendPair: {
-            const uint8_t* left = (eye == ndi_stereo::kEyeLeft)
-                                      ? bytes : result.matePayload.data();
-            const uint8_t* right = (eye == ndi_stereo::kEyeLeft)
-                                       ? result.matePayload.data() : bytes;
+            const uint8_t* left = (s.eye == ndi_stereo::kEyeLeft)
+                                      ? s.bytes : result.matePayload.data();
+            const uint8_t* right = (s.eye == ndi_stereo::kEyeLeft)
+                                       ? result.matePayload.data() : s.bytes;
             const ndi_stereo::StereoLayout layout = (data->stereoPacking == 1)
                                                         ? ndi_stereo::StereoLayout::TopBottom
                                                         : ndi_stereo::StereoLayout::SideBySide;
@@ -622,18 +652,18 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
             if (packed.size() != packedBytes) {
                 const auto flushT0 = std::chrono::steady_clock::now();
                 hubFlushAsyncLocked(hub);
-                data->timerFlushMs = msSince(flushT0);
+                if (timers) timers->flushMs = msSince(flushT0);
                 packed.resize(packedBytes);
             }
             const auto packT0 = std::chrono::steady_clock::now();
             ndi_stereo::packStereoFrame(meta, layout, left, right, packed.data());
-            data->timerPackMs = msSince(packT0);
+            if (timers) timers->packMs = msSince(packT0);
 
             ndi_stereo::FrameMeta packedMeta = meta;
             ndi_stereo::packedDims(meta, layout, &packedMeta.width, &packedMeta.height);
             const auto sendT0 = std::chrono::steady_clock::now();
-            hubSendFrameLocked(hub, data, packedMeta, packed.data(), allowAsync);
-            data->timerSendMs = msSince(sendT0);
+            hubSendFrameLocked(hub, data, packedMeta, packed.data(), s.allowAsync, s.hdrMetadataXML);
+            if (timers) timers->sendMs = msSince(sendT0);
             break;
         }
 
@@ -647,7 +677,7 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
             // 2026-08-28) demands a send or NULL flush closes every window.
             const auto flushT0 = std::chrono::steady_clock::now();
             hubFlushAsyncLocked(hub);
-            data->timerFlushMs = msSince(flushT0);
+            if (timers) timers->flushMs = msSince(flushT0);
             break;
         }
     }
@@ -674,18 +704,10 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
 // the legacy blocking paths. Backpressure anywhere (slot ring, this queue)
 // DROPS the frame — an NDI preview must never block the host.
 // ---------------------------------------------------------------------------
-static void createHDRMetadata(NDIInstanceData* data);
-
 struct AsyncPumpItem {
     void* slot = nullptr;
     MetalGPUContextRef metalContext = nullptr;
-    const uint8_t* bytes = nullptr;
-    size_t byteCount = 0;
-    int width = 0, height = 0;
-    ndi_stereo::WireFormat format = ndi_stereo::WireFormat::UYVY8;
-    int eye = ndi_stereo::kEyeLeft;
-    double time = 0.0;
-    bool isThumbnail = false;
+    HubSubmit submit;  // bytes/byteCount are filled by the completion callback
     double gpuMs = 0.0;
     bool ok = false;
 };
@@ -698,8 +720,8 @@ struct AsyncPump {
     std::atomic<int> pendingSubmits{0}; // Metal callbacks not yet finished with this pump
     bool stop = false;
     std::thread worker;
-    uint64_t drops = 0;
-    std::chrono::steady_clock::time_point lastDropLog{};
+    std::atomic<uint64_t> drops{0};  // incremented from render threads AND the callback
+    std::chrono::steady_clock::time_point lastDropLog{}; // render threads only
 };
 
 static const size_t kAsyncPumpQueueCap = 4;
@@ -728,19 +750,18 @@ static void pumpWorkerLoop(AsyncPump* pump)
             depth = pump->queue.size();
         }
         if (item.ok) {
+            // HDR metadata was captured into item.submit at ENQUEUE time on
+            // the render thread — this worker never reads the instance's
+            // colorSpace/transfer strings (they race with instanceChanged).
+            // Status changes are only FLAGGED inside the hub (statusParamDirty)
+            // — paramSetValue is a host call and stays on render threads.
             const auto t0 = std::chrono::steady_clock::now();
-            if (item.format == ndi_stereo::WireFormat::P216) {
-                createHDRMetadata(data);
-            }
-            hubSubmitFrame(data, item.format, item.width, item.height,
-                           item.bytes, item.byteCount, /*allowAsync=*/false,
-                           item.eye, item.time, item.isThumbnail);
-            // Status changes are only FLAGGED here (statusParamDirty inside the
-            // hub) — paramSetValue is a host call and stays on render threads;
-            // the next render's flushStatusParam pushes it.
+            SubmitTimers timers;
+            hubSubmitFrame(data, item.submit, &timers);
             if (data->timersEnabled) {
-                NDI_LOG("wtimer eye=%d gpu=%.2f submit=%.1f qdepth=%zu",
-                        item.eye, item.gpuMs, msSince(t0), depth);
+                NDI_LOG("wtimer eye=%d gpu=%.2f pack=%.1f send=%.1f total=%.1f qdepth=%zu",
+                        item.submit.eye, item.gpuMs, timers.packMs, timers.sendMs,
+                        msSince(t0), depth);
             }
         }
         metal_gpu_downscale_release(item.metalContext, item.slot);
@@ -766,16 +787,18 @@ static void pumpOnConvertDone(void* user, void* slot, const void* outPtr,
     AsyncSubmitCtx* ctx = static_cast<AsyncSubmitCtx*>(user);
     AsyncPump* pump = ctx->pump;
     ctx->item.slot = slot;
-    ctx->item.bytes = static_cast<const uint8_t*>(outPtr);
-    ctx->item.byteCount = outBytes;
+    ctx->item.submit.bytes = static_cast<const uint8_t*>(outPtr);
+    ctx->item.submit.byteCount = outBytes;
     ctx->item.gpuMs = gpuMs;
     ctx->item.ok = ok;
 
     bool queued = false;
     {
         std::lock_guard<std::mutex> lock(pump->m);
+        // Queue-full is belt-and-braces: the cap equals the slot-ring size and
+        // every queued item pins a distinct busy slot, so today it can't hit.
         if (!pump->stop && pump->queue.size() < kAsyncPumpQueueCap) {
-            pump->queue.push(ctx->item);
+            pump->queue.push(std::move(ctx->item));
             queued = true;
         } else if (!pump->stop) {
             ++pump->drops;
@@ -1228,11 +1251,15 @@ static void shutdownNDI(NDIInstanceData* data)
     data->ndiInitialized = false;
 }
 
-static void createHDRMetadata(NDIInstanceData* data)
+// Build the ndi_color_info XML from the instance's color settings. RENDER
+// THREADS ONLY — it reads the colorSpace/transferFunction strings that
+// instanceChanged rewrites; the async pump captures the RESULT into its item
+// at enqueue time instead of calling this from the worker.
+static std::string composeHDRMetadataXML(NDIInstanceData* data)
 {
     // Create HDR metadata XML according to NDI SDK v6 specifications
     // Reference: https://docs.ndi.video/all/developing-with-ndi/sdk/hdr#hdr-metadata
-    
+
     std::string primaries, transfer, matrix;
     
     // Map our color space to NDI primaries
@@ -1257,10 +1284,14 @@ static void createHDRMetadata(NDIInstanceData* data)
     }
     
     // Create proper NDI color info metadata
-    data->hdrMetadataXML = "<ndi_color_info primaries=\"" + primaries + 
-                          "\" transfer=\"" + transfer + 
-                          "\" matrix=\"" + matrix + "\" />";
-    
+    return "<ndi_color_info primaries=\"" + primaries +
+           "\" transfer=\"" + transfer +
+           "\" matrix=\"" + matrix + "\" />";
+}
+
+static void createHDRMetadata(NDIInstanceData* data)
+{
+    data->hdrMetadataXML = composeHDRMetadataXML(data);
     NDI_LOG("HDR Metadata: %s", data->hdrMetadataXML.c_str());
 }
 
@@ -1268,13 +1299,30 @@ static void createHDRMetadata(NDIInstanceData* data)
 // (which streams it as mono, or pairs and packs it in stereo). Used by both
 // conversion paths: CPU/upload-convert (sendSDRFrame) and the GPU-native
 // fused downscale+convert (renderMetalFrame).
+// Shared tail of the legacy blocking paths — these run on the render thread,
+// so data->render* is current and the stage timings land in the mtimer fields.
+static void hubSubmitFromRenderThread(NDIInstanceData* data, const HubSubmit& s)
+{
+    SubmitTimers timers;
+    hubSubmitFrame(data, s, &timers);
+    data->timerFlushMs = timers.flushMs;
+    data->timerPackMs = timers.packMs;
+    data->timerSendMs = timers.sendMs;
+}
+
 static void sendUYVYToNDI(NDIInstanceData* data, int width, int height)
 {
-    hubSubmitFrame(data, ndi_stereo::WireFormat::UYVY8, width, height,
-                   data->uyvyFrameBuffer.data(),
-                   static_cast<size_t>(width) * height * 2,
-                   /*allowAsync=*/true,
-                   data->renderEye, data->renderTime, data->renderIsThumbnail);
+    HubSubmit s;
+    s.format = ndi_stereo::WireFormat::UYVY8;
+    s.width = width;
+    s.height = height;
+    s.bytes = data->uyvyFrameBuffer.data();
+    s.byteCount = static_cast<size_t>(width) * height * 2;
+    s.allowAsync = true;
+    s.eye = data->renderEye;
+    s.time = data->renderTime;
+    s.isThumbnail = data->renderIsThumbnail;
+    hubSubmitFromRenderThread(data, s);
 }
 
 // Submit the already-packed P216 frame in data->hdrFrameBuffer with HDR
@@ -1282,11 +1330,18 @@ static void sendUYVYToNDI(NDIInstanceData* data, int width, int height)
 static void sendP216ToNDI(NDIInstanceData* data, int width, int height)
 {
     createHDRMetadata(data);
-    hubSubmitFrame(data, ndi_stereo::WireFormat::P216, width, height,
-                   reinterpret_cast<const uint8_t*>(data->hdrFrameBuffer.data()),
-                   static_cast<size_t>(width) * height * 2 * sizeof(uint16_t),
-                   /*allowAsync=*/false,
-                   data->renderEye, data->renderTime, data->renderIsThumbnail);
+    HubSubmit s;
+    s.format = ndi_stereo::WireFormat::P216;
+    s.width = width;
+    s.height = height;
+    s.bytes = reinterpret_cast<const uint8_t*>(data->hdrFrameBuffer.data());
+    s.byteCount = static_cast<size_t>(width) * height * 2 * sizeof(uint16_t);
+    s.allowAsync = false;
+    s.eye = data->renderEye;
+    s.time = data->renderTime;
+    s.isThumbnail = data->renderIsThumbnail;
+    s.hdrMetadataXML = data->hdrMetadataXML; // same thread — safe to copy here
+    hubSubmitFromRenderThread(data, s);
 }
 
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -1464,9 +1519,17 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
         }
     }
 
-    hubSubmitFrame(data, ndi_stereo::WireFormat::RGBA8, width, height,
-                   dstData, frameSize, /*allowAsync=*/true,
-                   data->renderEye, data->renderTime, data->renderIsThumbnail);
+    HubSubmit s;
+    s.format = ndi_stereo::WireFormat::RGBA8;
+    s.width = width;
+    s.height = height;
+    s.bytes = dstData;
+    s.byteCount = frameSize;
+    s.allowAsync = true;
+    s.eye = data->renderEye;
+    s.time = data->renderTime;
+    s.isThumbnail = data->renderIsThumbnail;
+    hubSubmitFromRenderThread(data, s);
 }
 
 static bool ensureNDIReady(NDIInstanceData* data)
@@ -1513,12 +1576,17 @@ static void sendNDIFrame(NDIInstanceData* data, void* imageData, int width, int 
 // always goes to the log too.
 static void flushStatusParam(NDIInstanceData* data)
 {
-    if (!data->statusParamDirty) {
-        return;
+    std::string statusCopy;
+    {
+        std::lock_guard<std::mutex> lock(data->statusMutex);
+        if (!data->statusParamDirty) {
+            return;
+        }
+        data->statusParamDirty = false;
+        statusCopy = data->statusParamValue; // the worker mutates the original
     }
-    data->statusParamDirty = false;
     if (data->stereoStatusParam) {
-        gParamHost->paramSetValue(data->stereoStatusParam, data->statusParamValue.c_str());
+        gParamHost->paramSetValue(data->stereoStatusParam, statusCopy.c_str());
     }
 }
 
@@ -1596,56 +1664,65 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
     ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
     const int rowFloats = srcRowBytes / static_cast<int>(sizeof(float));
 
-    bool converted = false;
-    // The geometry the fused kernels accept — mirrored from the submit's own
-    // validation so a refusal there means "ring full", never "bad geometry"
-    // (bad geometry must keep falling back to the readback path every frame).
-    const bool fusable = (outWidth >= 2) && ((outWidth % 2) == 0) && (rowFloats >= width * 4);
-    if (data->gpuAcceleration && metalContext && fusable &&
+    bool handledByFastPath = false;
+    if (data->gpuAcceleration && metalContext &&
         (data->hdrEnabled || data->optimalFormat)) {
         // Non-blocking fast path (v1.6.0): ENCODE the fused kernel and return.
         // No waitUntilCompleted here — that wait (plus the CPU-side NDI work
         // that followed it) was ~90ms of render-thread blocking per eye and
         // the whole 8K playback collapse (#5). The pump worker pairs and
-        // sends when the GPU finishes.
+        // sends when the GPU finishes. The submit validates geometry itself:
+        // BUSY = ring full (drop this frame, transient); INVALID = this
+        // source can't fuse (fall through to the blocking readback so the
+        // stream survives, every frame).
         std::lock_guard<std::mutex> lock(data->gpuContext->gpuMutex);
         AsyncPump* pump = pumpEnsure(data);
         const bool wantP216 = data->hdrEnabled;
         AsyncSubmitCtx* ctx = new AsyncSubmitCtx();
         ctx->pump = pump;
         ctx->item.metalContext = metalContext;
-        ctx->item.width = outWidth;
-        ctx->item.height = outHeight;
-        ctx->item.format = wantP216 ? ndi_stereo::WireFormat::P216
-                                    : ndi_stereo::WireFormat::UYVY8;
-        ctx->item.eye = data->renderEye;
-        ctx->item.time = data->renderTime;
-        ctx->item.isThumbnail = data->renderIsThumbnail;
+        ctx->item.submit.format = wantP216 ? ndi_stereo::WireFormat::P216
+                                           : ndi_stereo::WireFormat::UYVY8;
+        ctx->item.submit.width = outWidth;
+        ctx->item.submit.height = outHeight;
+        ctx->item.submit.allowAsync = false; // worker sends are synchronous by design
+        ctx->item.submit.eye = data->renderEye;
+        ctx->item.submit.time = data->renderTime;
+        ctx->item.submit.isThumbnail = data->renderIsThumbnail;
+        if (wantP216) {
+            // Captured here, on the render thread — the worker must never
+            // read the instance's color strings (they race instanceChanged).
+            ctx->item.submit.hdrMetadataXML = composeHDRMetadataXML(data);
+        }
         ++pump->pendingSubmits;
         const auto convT0 = std::chrono::steady_clock::now();
-        const bool submitted = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
-                                                          width, height, rowFloats, divisor,
-                                                          outWidth, outHeight, wantP216,
-                                                          pumpOnConvertDone, ctx);
+        const metal_submit_status st = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
+                                                                  width, height, rowFloats, divisor,
+                                                                  outWidth, outHeight, wantP216,
+                                                                  pumpOnConvertDone, ctx);
         data->timerConvMs = msSince(convT0);
-        converted = true; // handled either way: enqueued, or deliberately dropped
-        if (submitted) {
+        if (st == METAL_SUBMIT_OK) {
+            handledByFastPath = true;
             NDI_LOG("GPU-native async: %dx%d Metal frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216)",
                     width, height, outWidth, outHeight, wantP216 ? 1 : 0, divisor);
         } else {
             --pump->pendingSubmits;
             delete ctx;
-            ++pump->drops;
-            const auto now = std::chrono::steady_clock::now();
-            if (now - pump->lastDropLog > std::chrono::seconds(1)) {
-                pump->lastDropLog = now;
-                NDI_LOG("Async pump: frame dropped, %llu total (GPU or NDI worker behind)",
-                        static_cast<unsigned long long>(pump->drops));
+            if (st == METAL_SUBMIT_BUSY) {
+                handledByFastPath = true; // deliberate drop — backpressure, not failure
+                const uint64_t drops = ++pump->drops;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - pump->lastDropLog > std::chrono::seconds(1)) {
+                    pump->lastDropLog = now;
+                    NDI_LOG("Async pump: frame dropped, %llu total (GPU or NDI worker behind)",
+                            static_cast<unsigned long long>(drops));
+                }
             }
+            // METAL_SUBMIT_INVALID falls through to the readback path below.
         }
     }
 
-    if (!converted) {
+    if (!handledByFastPath) {
         const size_t srcBytes = static_cast<size_t>(height) * static_cast<size_t>(srcRowBytes);
         if (data->readbackBuffer.size() * sizeof(float) < srcBytes) {
             data->readbackBuffer.resize(srcBytes / sizeof(float));
