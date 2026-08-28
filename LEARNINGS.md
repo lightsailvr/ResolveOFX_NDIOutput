@@ -76,7 +76,7 @@ From the feasibility research in [docs/2026-08-28-resolve-stereo-program-tap-fea
 | Smart/Render Cache caches OFX node output | NDI feed **freezes** mid-session | Resolve stopped calling the render action; it's not a plugin bug. Keep Render Cache **off** in the test project |
 | Background caching | "Phantom" frames while playback is stopped | Resolve fires renders while parked |
 | Timeline Proxy Mode | Stream resolution silently halves/quarters | The plugin receives proxy-sized frames |
-| Stereo timelines | Only ever single-eye frames | Probe-verified 2026-08-28: a packed L+R frame never reaches OFX. With Stereo 3D palette **Vision: Mono**, only the left eye ever renders; with **Vision: Stereo** (Out: None suffices), both eyes render every frame — **each through its own plugin instance** (R first, L ~32 ms later, same `time`/`src`). Pairing must be cross-instance. See docs/2026-08-28-render-call-probe-findings.md |
+| Stereo timelines | Only ever single-eye frames | Probe-verified 2026-08-28 (VR180 4096² and Apple Immersive 8160×7200): a packed L+R frame never reaches OFX. With Stereo 3D palette **Vision: Mono**, only the left eye ever renders; with **Vision: Stereo** (Out: None suffices), both eyes render every frame — **each through its own plugin instance**, pairs sharing `time`/`src` but with **no guaranteed arrival order** at 8K (either eye can lead by up to ~350 ms; in-eye reordering and unmated frames occur). Pairing must be cross-instance, time-keyed, reorder-buffered. See docs/2026-08-28-render-call-probe-findings.md |
 
 **Rule: when the feed misbehaves, check these four before suspecting the plugin.**
 

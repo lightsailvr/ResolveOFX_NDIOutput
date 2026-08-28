@@ -3,7 +3,9 @@
 **Date started:** 2026-08-28 · **Plugin:** NDIOutput ≥ v1.3.0 · **Host:** DaVinci Resolve Studio 21.0.4, macOS 26.x
 **Issue:** [#3](https://github.com/lightsailvr/ResolveOFX_NDIOutput/issues/3) — instrument every render call (eye, page, thumbnail, cadence) so host behavior is observed, not guessed.
 
-**Status: instrumentation shipped (v1.3.0); scenario 2 fully captured (Mono + Stereo vision, both pages).** Headline: with the Stereo 3D palette at **Vision: Stereo, both eyes render every frame — each through its own plugin instance** (R first, L +32 ms, keyed by `time`/`src`); at Vision: Mono the right eye never renders. Side-discovery: the current plugin's NDI output goes **black** in stereo mode (sender lifecycle bug, feeds issue #6). Remaining: scenarios 1, 3, 4. Each capture needs a human at the Resolve machine — playback cannot be scripted (the Resolve API has no transport control, see [LEARNINGS.md](../LEARNINGS.md) §2). Fill in each *Findings* section from the capture files and flip this line to **complete** when all four are in.
+**Status: COMPLETE (2026-08-28).** Captured: a VR180 project (4096×4096/eye) under both Stereo 3D palette Vision modes on Edit and Color pages, and the true Apple Immersive pipeline (8160×7200/eye). Descoped by Matt: scenario 1 (mono packed passthrough — proven by daily use) and scenario 4 (Timeline Proxy Mode — replaced by the product requirement that the *plugin* offer stream downscaling, Nobe-style → issue #5). Headline: with **Vision: Stereo, both eyes render every frame — each through its own plugin instance** (keyed by `time`/`src`; arrival order NOT guaranteed); at Vision: Mono the right eye never renders. Side-discovery: the current plugin's NDI output goes **black** in stereo mode (sender lifecycle bug, feeds issue #6).
+
+**Correction (Matt, 2026-08-28):** the timeline used for the 4096×4096 captures below was a **VR180 project**, not a plain stereoscopic timeline — so those captures answer scenario 3's VR180 question directly, and the plain-stereo-timeline case is subsumed (same stereo machinery, per-eye mechanism confirmed across two immersive project types). Section headers below keep their original scenario numbering with corrected labels.
 
 ---
 
@@ -51,9 +53,9 @@ Answering cadence questions directly from a capture:
 - **Setup:** mono (non-stereoscopic) timeline with pre-packed SbS media (e.g. 4320×2160, two 2160×2160 eyes). NDIOutput on an **adjustment clip on the Edit page**. Play ~15 s.
 - **Questions:** Does every playback frame reach the plugin at full packed resolution? Is `dt` steady at the timeline frame period? Is `eye` absent or always `L` on a mono timeline? Does `page=Edit` come through (i.e. does Resolve actually provide the page property at createInstance)?
 
-**Findings:** _pending capture_
+**Findings: DESCOPED (Matt, 2026-08-28).** The packed-media passthrough is the plugin's shipping behavior, proven by daily use; and the stereo detector in issue #6 should key on "did an R call arrive for this frame", not on the eye property's presence, so the one open nuance here (does a mono timeline report `eye=L` or omit the property?) decides nothing downstream. Capture it opportunistically if a packed-media project happens to be open with the probe on.
 
-### Scenario 2 — native stereoscopic timeline, Edit page vs Color page ⭐ the key unknown
+### Scenario 2 — stereoscopic timeline (captured on a VR180 project, 4096×4096/eye), Edit page vs Color page ⭐ the key unknown
 
 - **Slugs:** `stereo-timeline-edit-page`, `stereo-timeline-color-page`
 - **Setup:** native stereo timeline (stereo clips via *File → New Stereo Clip* or stereo-camera media). Two captures:
@@ -96,7 +98,12 @@ Flipping the Color-page **Stereo 3D palette from Vision: Mono to Vision: Stereo*
 - **Setup:** new project with Resolve 21's **Standard Immersive** (VR180) project/timeline type and stereo VR180 media. NDIOutput on an Edit-page adjustment clip (add a Color-page capture if behavior differs). Play ~15 s.
 - **Questions:** Does the immersive seam deliver **per-eye renders** (`eye=L`/`eye=R`, one eye's dimensions) or **packed frames** (no/`L`-only eye, double-width or double-height `dim=`)? This decides which plugin mode LSVR's equirect work needs.
 
-**Findings:** _pending capture_
+**Findings: PER-EYE RENDERS, never packed — confirmed on two immersive project types.**
+
+1. **VR180 (4096×4096/eye):** the scenario 2 captures above *were* a VR180 project (see correction at top) — per-eye instances, both eyes when Vision: Stereo, single-eye `dim=4096x4096` on every call.
+2. **Apple Immersive pipeline (8160×7200/eye)** ([capture](captures/2026-08-28-apple-immersive-8160x7200.log), 70 calls): the seam delivers **full-resolution 8160×7200 single-eye frames** — `scale=1.00`, both eyes, again via two per-eye plugin instances. At float32 RGBA that is ~940 MB per eye per frame handed to the plugin, which is the hard evidence behind issue #5's downscale-before-readback requirement (and Matt's product call: the plugin must offer stream downscaling, Nobe-style). Observed cadence ~72–76 ms per eye (~13 fps effective) — Resolve kept feeding full-rate sequential frames; the ceiling is processing, not the seam.
+
+**Pairing is not orderly at 8K — hard requirements for issue #6's pairer,** from the Apple Immersive capture: 31 frames arrived as L/R pairs sharing `time`/`src`, but arrival offset ranged **−334 ms to +78 ms** (avg R leads by 8 ms; **L arrived first in 4 pairs**); `time` went **backwards within a single eye** 4 times mid-stream (e.g. R rendered 8202 before 8201); 3 R-only and 1 L-only frames never got a mate in-window; and after stopping, both instances re-rendered the parked frame repeatedly. So the pairer must be: keyed on `time` (not arrival order), buffered over a several-frame reorder window (≥ ~5 frames at this cadence), duplicate-tolerant (parked re-renders replace the held frame), and timeout-dropping for unmated frames — strict R-then-L alternation, which the 4096² captures suggested, does not survive 8K.
 
 ### Scenario 4 — Timeline Proxy Mode
 
@@ -104,7 +111,7 @@ Flipping the Color-page **Stereo 3D palette from Vision: Mono to Vision: Stereo*
 - **Setup:** any timeline from above; **Playback → Timeline Proxy Resolution → Half** (then Quarter for a second pass). Play ~10 s each.
 - **Questions:** Confirm the plugin receives half/quarter-size frames. Does the host report it via `scale=` (0.50/0.25), via shrunken `dim=`, or both? Documents the "why did the stream go soft" support case.
 
-**Findings:** _pending capture_
+**Findings: DESCOPED (Matt, 2026-08-28).** Proxy-mode behavior stays documented from secondary sources only (Nobe FAQ / Resolve manual — the plugin receives proxy-sized frames; see the pitfalls table in [LEARNINGS.md](../LEARNINGS.md) §2). The product direction replacing this test: **the plugin itself must offer stream downscaling** (Full/Half/Quarter, Nobe-style) so the outgoing NDI resolution is a deliberate choice rather than whatever the host happens to feed — issue #5, now backed by the 8160×7200 findings above. If a support case ever hinges on how proxy mode is reported (`scale=` vs `dim=`), it's a 2-minute capture with the probe.
 
 ## 4. Overhead check (acceptance criterion)
 
@@ -116,9 +123,9 @@ With **Log Render Calls off**, the probe costs one boolean parameter read and on
 |---|---|---|
 | Second eye during Edit-page playback? | **Depends on Stereo 3D palette Vision.** Vision: Mono → left only, always. Vision: Stereo (Out: None suffices) → **both eyes, every frame**, via a second per-eye plugin instance | [mono-vision](captures/2026-08-28-stereo-timeline-edit-page.log), [stereo-vision](captures/2026-08-28-stereo-timeline-edit-page-vision-stereo.log) |
 | Second eye on Color page / with palette armed? | **Identical to Edit page** — same instances, same pairing, same cadence | [color-page](captures/2026-08-28-stereo-timeline-color-page.log) |
-| Pairing key for L/R (same `time`? same `src`?) | **Both** — pairs share `time` and `src` exactly; R first, L +32 ms avg (28–71 ms); 50/50 pairs matched, zero unpaired. Arrives on **separate instances** → pairing must be process-global | stereo-vision captures |
-| VR180 Standard Immersive: per-eye or packed? | _pending_ | |
-| Proxy mode: `scale=` vs `dim=`? | _pending_ | |
+| Pairing key for L/R (same `time`? same `src`?) | **Both** — pairs share `time` and `src` exactly, arriving on **separate instances** → pairing must be process-global. At 4096²: R first, L +32 ms avg, 50/50 matched. **At 8160×7200 order breaks down**: either eye can lead (−334…+78 ms), `time` reverses within one eye, unmated frames occur → time-keyed reorder buffer, not arrival order | stereo-vision + apple-immersive captures |
+| VR180 / immersive: per-eye or packed? | **Per-eye, never packed** — single-eye frames at 4096×4096 (VR180) and full 8160×7200 (Apple Immersive, ~940 MB/eye as float32 — issue #5's downscale-before-readback is mandatory) | [apple-immersive](captures/2026-08-28-apple-immersive-8160x7200.log) + scenario 2 captures |
+| Proxy mode: `scale=` vs `dim=`? | **Descoped** — plugin-side downscale (Full/Half/Quarter, Nobe-style) is the product answer instead → issue #5 | scenario 4 note |
 | Page property actually delivered at createInstance? | **No** — `page=?` on all 192 calls, including the freshly created right-eye instance; don't build on this property | all captures |
 | Thumbnail renders observed (`thumb=1`)? | **Yes** — 184×92 filmstrip renders, correctly flagged | mono-vision capture |
 | NDI output usable in stereo mode today? | **No — feed goes black**: second instance's sender create fails (duplicate default name suspected) and its failure path `NDIlib_destroy()`s the library under the healthy sender | unified log 12:08, scenario 2 findings |
