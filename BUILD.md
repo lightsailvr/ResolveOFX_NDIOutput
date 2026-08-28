@@ -28,7 +28,7 @@ Canonical instructions for building, installing, and verifying the NDI Output OF
 make dev
 ```
 
-Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle and all object files.
+Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle, all object files, and the `build/` test-binary directory.
 
 ### Unit tests
 

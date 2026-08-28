@@ -34,6 +34,8 @@ NDI Plugin: probe #000042 page=Edit eye=R time=86400 src=86399 dim=1920x1080 sca
 | `thumb=` | `kOfxImageClipPropThumbnail` on the source clip | `1` = thumbnail render (filmstrip/gallery), `-` = property absent |
 | `dt=` | wall clock | Spacing since the previous render call on this instance; `-` = first call. Cadence questions are answered from this column |
 
+One caveat for captures: the plugin declares fully-thread-safe rendering, so if Resolve ever renders concurrently, `dt` measures probe-lock spacing and lines can reach the log slightly out of `#` order — sort by `#` before doing cadence math on such a capture.
+
 Answering cadence questions directly from a capture:
 
 - **Playback rate:** steady `dt` ≈ 1000/fps (16.7 ms @ 60, 41.7 ms @ 24). Gaps = dropped/cached frames; `dt` ≪ frame period = burst rendering (e.g. both eyes back-to-back).
