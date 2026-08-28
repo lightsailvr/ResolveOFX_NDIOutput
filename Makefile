@@ -48,6 +48,15 @@ test-metal: src/MetalGPUAcceleration.o
 		-o build/test_metal_downscale -framework Metal -framework Foundation
 	./build/test_metal_downscale
 
+# Pipeline timing harness at production 8K dims (needs Metal + NDI SDK, no
+# Resolve). Reproduces the plugin's per-pair send pattern; see the file header.
+bench: src/MetalGPUAcceleration.o
+	mkdir -p build
+	$(CXX) -Isrc -I$(NDI_INCLUDE) tests/bench_pipeline.mm src/MetalGPUAcceleration.o \
+		-o build/bench_pipeline -framework Metal -framework Foundation $(NDI_LIB)
+	install_name_tool -change "@rpath/libndi_advanced.dylib" $(NDI_LIB) build/bench_pipeline
+	./build/bench_pipeline
+
 $(BUNDLE_EXECUTABLE): $(OBJECTS) | bundle_structure
 	@echo "Building NDI Output Plugin v$(VERSION)"
 	$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)

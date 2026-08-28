@@ -64,6 +64,43 @@ bool metal_gpu_buffer_downscale_to_p216(MetalGPUContextRef context,
                                         int outWidth, int outHeight,
                                         unsigned short* p216Out);
 
+// ---------------------------------------------------------------------------
+// Non-blocking fast path (issue #5, v1.6.0): same fused kernels, but the
+// render thread only ENCODES — no waitUntilCompleted. The kernel writes into
+// one of a small ring of context-owned shared-storage staging buffers
+// (CPU-visible on Apple Silicon: the small converted frame needs no separate
+// readback), and `done` fires from the command buffer's completion handler.
+//
+//   done(user, slot, outPtr, outBytes, ok)
+//
+// Contract:
+// - `done` runs on Metal's completion thread. It must be near-free (push a
+//   pointer, wake a worker) — heavy work there stalls the queue's other
+//   completion handlers, including the host's own.
+// - outPtr stays valid until metal_gpu_downscale_release(context, slot). The
+//   consumer copies or fully consumes it, then releases; a slot is never
+//   reused while unreleased.
+// - Returns false (and never calls done) when no slot is free — GPU behind or
+//   consumer backlogged. Callers drop the frame; dropping is the backpressure.
+// - ok=false reports a failed command buffer; release the slot regardless.
+// ---------------------------------------------------------------------------
+// gpuMs is the kernel's GPU execution time (GPUEndTime-GPUStartTime) — queue
+// wait excluded, so it stays honest under host contention.
+typedef void (*metal_downscale_done_fn)(void* user, void* slot,
+                                        const void* outPtr, size_t outBytes,
+                                        double gpuMs, bool ok);
+
+bool metal_gpu_downscale_submit(MetalGPUContextRef context,
+                                void* commandQueue,
+                                void* srcMetalBuffer,
+                                int srcWidth, int srcHeight, int srcRowFloats,
+                                int divisor,
+                                int outWidth, int outHeight,
+                                bool p216,
+                                metal_downscale_done_fn done, void* user);
+
+void metal_gpu_downscale_release(MetalGPUContextRef context, void* slot);
+
 // Device-to-device copy of byteCount bytes (the render passthrough when the
 // host hands Metal buffers). Committed to commandQueue; waits for completion
 // only when waitForCompletion is set (tests) — the host orders its own

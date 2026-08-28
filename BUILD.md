@@ -42,7 +42,13 @@ Host-independent tests in [tests/](tests/) (render-probe log-line formatter, str
 make test-metal
 ```
 
-GPU kernel correctness tests: runs the fused downscale+convert Metal kernels (UYVY and P216) on a synthetic frame and compares against the CPU reference. Needs a Metal device (any Mac; skips cleanly without one), but still no Resolve or NDI SDK. The kernels are compiled from source at runtime, so this is the only pre-Resolve check that catches shader errors — run it whenever `src/MetalGPUAcceleration.mm` changes.
+GPU kernel correctness tests: runs the fused downscale+convert Metal kernels (UYVY and P216) on a synthetic frame — through both the blocking calls and the non-blocking slot-ring submit path (v1.6.0) — and compares against the CPU reference. Needs a Metal device (any Mac; skips cleanly without one), but still no Resolve or NDI SDK. The kernels are compiled from source at runtime, so this is the only pre-Resolve check that catches shader errors — run it whenever `src/MetalGPUAcceleration.mm` changes.
+
+```bash
+make bench
+```
+
+Pipeline timing harness ([tests/bench_pipeline.mm](tests/bench_pipeline.mm)): reproduces the plugin's per-pair GPU-convert → pack → NDI-send pattern at production 8K dimensions outside Resolve, with an in-process receiver forcing real encode, and reports per-stage timings plus sustained pairs/s. Needs a Metal device **and** the NDI Advanced SDK. Creates NDI source `NDI_BENCH_PIPELINE` (never the production name). Built for the issue #5 performance diagnosis; re-run it when touching the send path or the fused kernels to catch throughput regressions before a Resolve session.
 
 ### Install
 

@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <chrono>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #define METAL_LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "NDI Plugin Metal: " fmt, ##__VA_ARGS__)
@@ -22,6 +24,20 @@ struct MetalFastPathState {
     size_t stagingCapacity;
 };
 
+// One staging slot of the non-blocking fast path's ring. FREE -> BUSY at
+// submit (GPU writing, then consumer reading via the done callback's outPtr)
+// -> FREE again at metal_gpu_downscale_release. Buffers are device-bound and
+// grown as needed; shared storage makes the kernel's output directly
+// CPU-visible, so the small converted frame needs no separate readback.
+struct MetalAsyncSlot {
+    id<MTLBuffer> buffer = nil;
+    size_t capacity = 0;
+    id<MTLDevice> device = nil;
+    bool busy = false;
+};
+
+#define METAL_ASYNC_SLOTS 4
+
 // Metal GPU Context structure
 struct MetalGPUContext {
     id<MTLDevice> device;
@@ -30,6 +46,8 @@ struct MetalGPUContext {
     id<MTLComputePipelineState> rgbaToHdrPipeline;
     id<MTLLibrary> library;
     std::unordered_map<void*, MetalFastPathState> fastPathByDevice; // key: id<MTLDevice>
+    std::mutex asyncMutex;                    // guards the slot ring
+    MetalAsyncSlot asyncSlots[METAL_ASYNC_SLOTS];
 };
 
 // Must match the DownscaleParams struct inside the shader source below.
@@ -338,6 +356,38 @@ void metal_gpu_shutdown(MetalGPUContextRef context) {
     @autoreleasepool {
         METAL_LOG("Shutting down Metal GPU acceleration...\n");
 
+        // Async slots: the plugin drains its pump (all done callbacks fired,
+        // all slots released) before shutting the context down; this wait is
+        // the backstop so a straggling command buffer can't touch freed slots.
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            bool anyBusy = true;
+            while (anyBusy && std::chrono::steady_clock::now() < deadline) {
+                {
+                    std::lock_guard<std::mutex> lock(context->asyncMutex);
+                    anyBusy = false;
+                    for (int i = 0; i < METAL_ASYNC_SLOTS; ++i) {
+                        anyBusy = anyBusy || context->asyncSlots[i].busy;
+                    }
+                }
+                if (anyBusy) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            if (anyBusy) {
+                METAL_LOG("Shutdown: async slot still busy after 2s — leaking slot buffers to stay safe");
+            }
+            for (int i = 0; i < METAL_ASYNC_SLOTS; ++i) {
+                MetalAsyncSlot& slot = context->asyncSlots[i];
+                if (slot.buffer && !slot.busy) {
+                    [slot.buffer release];
+                }
+                slot.buffer = nil;
+                slot.capacity = 0;
+                slot.busy = false;
+            }
+        }
+
         for (auto& entry : context->fastPathByDevice) {
             [entry.second.uyvyPipeline release];
             [entry.second.p216Pipeline release];
@@ -526,6 +576,117 @@ bool metal_gpu_buffer_downscale_to_p216(MetalGPUContextRef context,
     return runDownscaleKernel(context, commandQueue, srcMetalBuffer,
                               srcWidth, srcHeight, srcRowFloats, divisor,
                               outWidth, outHeight, true, p216Out, outBytes, "P216");
+}
+
+// Non-blocking variant (issue #5, v1.6.0): encode + commit only. See the
+// header contract. Validation mirrors runDownscaleKernel so both paths refuse
+// the same sources.
+bool metal_gpu_downscale_submit(MetalGPUContextRef context,
+                                void* commandQueue,
+                                void* srcMetalBuffer,
+                                int srcWidth, int srcHeight, int srcRowFloats,
+                                int divisor,
+                                int outWidth, int outHeight,
+                                bool p216,
+                                metal_downscale_done_fn done, void* user)
+{
+    if (!context || !srcMetalBuffer || !done) return false;
+    if (srcWidth <= 0 || srcHeight <= 0 || srcRowFloats < srcWidth * 4 ||
+        divisor <= 0 || outWidth < 2 || (outWidth % 2) != 0 || outHeight <= 0) {
+        return false;
+    }
+    const size_t outBytes = static_cast<size_t>(outWidth) * outHeight * 2 *
+                            (p216 ? sizeof(unsigned short) : 1);
+
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = commandQueue
+            ? static_cast<id<MTLCommandQueue>>(commandQueue)
+            : context->commandQueue;
+        if (!queue) return false;
+        id<MTLDevice> device = queue.device;
+        id<MTLBuffer> srcBuffer = static_cast<id<MTLBuffer>>(srcMetalBuffer);
+
+        const size_t neededSrcBytes =
+            static_cast<size_t>(srcHeight) * static_cast<size_t>(srcRowFloats) * sizeof(float);
+        if (srcBuffer.length < neededSrcBytes) {
+            return false;
+        }
+
+        MetalFastPathState* fastPath = fastPathForDevice(context, device);
+        if (!fastPath) return false;
+
+        // Claim a free slot; none free = GPU behind or consumer backlogged —
+        // the caller drops this frame (backpressure by dropping, never blocking).
+        MetalAsyncSlot* slot = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(context->asyncMutex);
+            for (int i = 0; i < METAL_ASYNC_SLOTS; ++i) {
+                if (!context->asyncSlots[i].busy) {
+                    slot = &context->asyncSlots[i];
+                    slot->busy = true;
+                    break;
+                }
+            }
+        }
+        if (!slot) return false;
+
+        if (!slot->buffer || slot->capacity < outBytes || slot->device != device) {
+            if (slot->buffer) [slot->buffer release];
+            slot->buffer = [device newBufferWithLength:outBytes options:MTLResourceStorageModeShared];
+            slot->capacity = slot->buffer ? outBytes : 0;
+            slot->device = device;
+            if (!slot->buffer) {
+                std::lock_guard<std::mutex> lock(context->asyncMutex);
+                slot->busy = false;
+                return false;
+            }
+        }
+
+        MetalDownscaleParams params;
+        params.srcWidth = (uint32_t)srcWidth;
+        params.srcHeight = (uint32_t)srcHeight;
+        params.srcRowFloats = (uint32_t)srcRowFloats;
+        params.outWidth = (uint32_t)outWidth;
+        params.outHeight = (uint32_t)outHeight;
+        params.divisor = (uint32_t)divisor;
+
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:(p216 ? fastPath->p216Pipeline : fastPath->uyvyPipeline)];
+        [encoder setBuffer:srcBuffer offset:0 atIndex:0];
+        [encoder setBuffer:slot->buffer offset:0 atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(
+            ((outWidth / 2) + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+            (outHeight + threadsPerThreadgroup.height - 1) / threadsPerThreadgroup.height,
+            1
+        );
+        [encoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [encoder endEncoding];
+
+        id<MTLBuffer> outBuf = slot->buffer;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            const bool ok = (cb.status == MTLCommandBufferStatusCompleted) && !cb.error;
+            const double gpuMs = (cb.GPUEndTime > cb.GPUStartTime)
+                                     ? (cb.GPUEndTime - cb.GPUStartTime) * 1000.0 : 0.0;
+            if (!ok) {
+                METAL_LOG("Fast path async: command buffer failed: %{public}s",
+                          cb.error ? [[cb.error localizedDescription] UTF8String] : "not completed");
+            }
+            done(user, slot, [outBuf contents], outBytes, gpuMs, ok);
+        }];
+        [commandBuffer commit]; // no wait — that's the whole point
+        return true;
+    }
+}
+
+void metal_gpu_downscale_release(MetalGPUContextRef context, void* slot)
+{
+    if (!context || !slot) return;
+    std::lock_guard<std::mutex> lock(context->asyncMutex);
+    static_cast<MetalAsyncSlot*>(slot)->busy = false;
 }
 
 bool metal_gpu_copy_buffer(MetalGPUContextRef context,

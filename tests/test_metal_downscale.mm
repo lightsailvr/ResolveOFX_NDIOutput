@@ -8,10 +8,13 @@
 #include "MetalGPUAcceleration.h"
 #include "StreamResolution.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <mutex>
 #include <vector>
 
 static int failures = 0;
@@ -225,6 +228,108 @@ int main()
         bool ran = metal_gpu_read_buffer(ctx, nullptr, srcBuf, readback.data(), bytes);
         check(ran && std::memcmp(readback.data(), frame.data(), bytes) == 0,
               "read_buffer returns source bytes");
+        metal_gpu_release_buffer(srcBuf);
+    }
+
+    // Non-blocking submit path (v1.6.0): same kernels through the slot ring +
+    // completion callback. Output must match the blocking path bit-for-bit,
+    // the ring must refuse a submit when every slot is held, and released
+    // slots must become claimable again.
+    {
+        struct AsyncCapture {
+            std::mutex m;
+            std::condition_variable cv;
+            int fired = 0;
+            bool ok = false;
+            std::vector<uint8_t> out;
+            void* slot = nullptr;
+        };
+        auto onDone = [](void* user, void* slot, const void* outPtr, size_t outBytes,
+                         double /*gpuMs*/, bool ok) {
+            AsyncCapture* cap = static_cast<AsyncCapture*>(user);
+            std::lock_guard<std::mutex> lock(cap->m);
+            cap->ok = ok;
+            cap->slot = slot;
+            cap->out.assign(static_cast<const uint8_t*>(outPtr),
+                            static_cast<const uint8_t*>(outPtr) + outBytes);
+            ++cap->fired;
+            cap->cv.notify_all();
+        };
+        auto waitFired = [](AsyncCapture& cap, int n) {
+            std::unique_lock<std::mutex> lock(cap.m);
+            return cap.cv.wait_for(lock, std::chrono::seconds(5), [&] { return cap.fired >= n; });
+        };
+
+        std::vector<float> frame;
+        fillFrame(frame, srcW, srcH, srcW * 4);
+        void* srcBuf = metal_gpu_create_shared_buffer(ctx, frame.data(), frame.size() * sizeof(float));
+
+        int outW = 0, outH = 0;
+        ndi_stream::outputDims(srcW, srcH, 2, &outW, &outH);
+        std::vector<float> small(static_cast<size_t>(outW) * outH * 4);
+        ndi_stream::downscaleRGBABox(frame.data(), srcW, srcH, srcW * 4, 2,
+                                     small.data(), outW, outH);
+
+        {
+            std::vector<uint8_t> expected;
+            referenceUYVY(small.data(), outW, outH, expected);
+            AsyncCapture cap;
+            bool submitted = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                                        srcW, srcH, srcW * 4, 2, outW, outH,
+                                                        /*p216=*/false, onDone, &cap);
+            bool done = submitted && waitFired(cap, 1);
+            check(done && cap.ok && cap.out.size() == expected.size() &&
+                      compareBuffers(cap.out.data(), expected.data(), expected.size(), 2,
+                                     "async UYVY"),
+                  "async submit UYVY matches CPU reference (divisor 2)");
+            if (cap.slot) metal_gpu_downscale_release(ctx, cap.slot);
+        }
+
+        {
+            std::vector<uint16_t> expected;
+            referenceP216(small.data(), outW, outH, expected);
+            AsyncCapture cap;
+            bool submitted = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                                        srcW, srcH, srcW * 4, 2, outW, outH,
+                                                        /*p216=*/true, onDone, &cap);
+            bool done = submitted && waitFired(cap, 1);
+            check(done && cap.ok && cap.out.size() == expected.size() * sizeof(uint16_t) &&
+                      compareBuffers(reinterpret_cast<const uint16_t*>(cap.out.data()),
+                                     expected.data(), expected.size(), 64, "async P216"),
+                  "async submit P216 matches CPU reference (divisor 2)");
+            if (cap.slot) metal_gpu_downscale_release(ctx, cap.slot);
+        }
+
+        {
+            // Hold every slot: the 4 ring slots fill, the 5th submit refuses,
+            // and releasing brings the ring back.
+            AsyncCapture caps[5];
+            int accepted = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                               srcW, srcH, srcW * 4, 2, outW, outH,
+                                               false, onDone, &caps[i])) {
+                    ++accepted;
+                }
+            }
+            bool fifthRefused = !metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                                            srcW, srcH, srcW * 4, 2, outW, outH,
+                                                            false, onDone, &caps[4]);
+            bool allFired = true;
+            for (int i = 0; i < 4; ++i) {
+                allFired = allFired && waitFired(caps[i], 1);
+                if (caps[i].slot) metal_gpu_downscale_release(ctx, caps[i].slot);
+            }
+            AsyncCapture after;
+            bool afterOk = metal_gpu_downscale_submit(ctx, nullptr, srcBuf,
+                                                      srcW, srcH, srcW * 4, 2, outW, outH,
+                                                      false, onDone, &after) &&
+                           waitFired(after, 1);
+            if (after.slot) metal_gpu_downscale_release(ctx, after.slot);
+            check(accepted == 4 && fifthRefused && allFired && afterOk,
+                  "slot ring: 4 in flight, 5th refused, released slots reusable");
+        }
+
         metal_gpu_release_buffer(srcBuf);
     }
 

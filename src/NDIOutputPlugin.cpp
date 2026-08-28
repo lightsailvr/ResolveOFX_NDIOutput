@@ -19,6 +19,7 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -96,9 +97,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 5
+#define kPluginVersionMinor 6
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.5.0"
+#define kPluginVersionString "1.6.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -219,6 +220,9 @@ struct AsyncFrameData {
 };
 
 struct SenderHub; // process-shared NDI sender + eye pairer (defined below)
+#ifdef __APPLE__
+struct AsyncPump; // per-instance off-render-thread NDI worker (defined below)
+#endif
 
 // Private instance data
 struct NDIInstanceData {
@@ -250,11 +254,20 @@ struct NDIInstanceData {
     long long probeCallCount;
     std::chrono::steady_clock::time_point probeLastCallTime;
     bool probeHasLastCallTime;
-    
+
+    // In-render stage timers ("mtimer" log line, issue #5 diagnosis). Written
+    // only when Log Render Calls is on; fields are per-instance, and the hub
+    // writes the submit splits into the SUBMITTING instance's fields.
+    bool timersEnabled;
+    double timerBlitMs, timerConvMs, timerFlushMs, timerPackMs, timerSendMs;
+
     // NDI variables. The sender lives in a process-shared hub — Resolve
     // renders each stereo eye through its own plugin instance, so senders and
     // pairing can never be instance state (see the SenderHub comment below).
     SenderHub* hub;
+#ifdef __APPLE__
+    AsyncPump* pump;           // created on first async submit; drained in shutdownNDI
+#endif
     bool ndiInitialized;
     std::string sourceName;
     bool enabled;
@@ -464,6 +477,12 @@ static void flushAsyncSend(NDIInstanceData* data)
     }
 }
 
+// Milliseconds since t0 — for the mtimer diagnostic stage timers (issue #5).
+static inline double msSince(const std::chrono::steady_clock::time_point& t0)
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 // Caller holds hub->mutex. Builds and sends one NDI frame of the given wire
 // format. `allowAsync` is false for P216 (HDR sends have always been
 // synchronous here) and for any buffer that can't outlive the call.
@@ -548,9 +567,12 @@ static void hubUpdateStatusLocked(SenderHub* hub, NDIInstanceData* data)
 // The single entry point every converted frame goes through. Consults the
 // process-global pairer: mono frames stream unchanged (zero extra copies),
 // stereo frames wait for their partner and go out as ONE packed frame.
+// eye/time/isThumbnail arrive as explicit arguments because the async pump
+// submits AFTER the render call that produced the frame has returned — the
+// instance's render* fields belong to a later call by then.
 static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
                            int width, int height, const uint8_t* bytes, size_t byteCount,
-                           bool allowAsync)
+                           bool allowAsync, int eye, double time, bool isThumbnail)
 {
     SenderHub* hub = data->hub;
     if (!hub) {
@@ -575,18 +597,20 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
         std::chrono::steady_clock::now().time_since_epoch()).count());
 
     ndi_stereo::SubmitResult result = hub->pairer.submit(
-        data->renderEye, data->renderTime, meta, bytes, byteCount,
-        nowMs, data->renderIsThumbnail);
+        eye, time, meta, bytes, byteCount, nowMs, isThumbnail);
 
     switch (result.action) {
-        case ndi_stereo::SubmitAction::SendMono:
+        case ndi_stereo::SubmitAction::SendMono: {
+            const auto sendT0 = std::chrono::steady_clock::now();
             hubSendFrameLocked(hub, data, meta, bytes, allowAsync);
+            data->timerSendMs = msSince(sendT0);
             break;
+        }
 
         case ndi_stereo::SubmitAction::SendPair: {
-            const uint8_t* left = (data->renderEye == ndi_stereo::kEyeLeft)
+            const uint8_t* left = (eye == ndi_stereo::kEyeLeft)
                                       ? bytes : result.matePayload.data();
-            const uint8_t* right = (data->renderEye == ndi_stereo::kEyeLeft)
+            const uint8_t* right = (eye == ndi_stereo::kEyeLeft)
                                        ? result.matePayload.data() : bytes;
             const ndi_stereo::StereoLayout layout = (data->stereoPacking == 1)
                                                         ? ndi_stereo::StereoLayout::TopBottom
@@ -596,27 +620,36 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
             std::vector<uint8_t>& packed = hub->packedBuffer[hub->packedIndex ^= 1];
             const size_t packedBytes = ndi_stereo::wireFrameBytes(meta) * 2;
             if (packed.size() != packedBytes) {
+                const auto flushT0 = std::chrono::steady_clock::now();
                 hubFlushAsyncLocked(hub);
+                data->timerFlushMs = msSince(flushT0);
                 packed.resize(packedBytes);
             }
+            const auto packT0 = std::chrono::steady_clock::now();
             ndi_stereo::packStereoFrame(meta, layout, left, right, packed.data());
+            data->timerPackMs = msSince(packT0);
 
             ndi_stereo::FrameMeta packedMeta = meta;
             ndi_stereo::packedDims(meta, layout, &packedMeta.width, &packedMeta.height);
+            const auto sendT0 = std::chrono::steady_clock::now();
             hubSendFrameLocked(hub, data, packedMeta, packed.data(), allowAsync);
+            data->timerSendMs = msSince(sendT0);
             break;
         }
 
         case ndi_stereo::SubmitAction::Hold:
         case ndi_stereo::SubmitAction::Drop:
-        default:
+        default: {
             // No send this call: complete any in-flight async send now. Its
             // buffer belongs to an instance that will overwrite it on its
             // next conversion, and with Hold the next real send could be
             // arbitrarily far away — the async-buffer rule (LEARNINGS
             // 2026-08-28) demands a send or NULL flush closes every window.
+            const auto flushT0 = std::chrono::steady_clock::now();
             hubFlushAsyncLocked(hub);
+            data->timerFlushMs = msSince(flushT0);
             break;
+        }
     }
 
     if (hub->pairer.droppedFrames() != hub->lastLoggedDrops) {
@@ -627,6 +660,174 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
 
     hubUpdateStatusLocked(hub, data);
 }
+
+#ifdef __APPLE__
+// ---------------------------------------------------------------------------
+// Async NDI pump (issue #5, v1.6.0). Diagnosis showed the 8K stereo playback
+// collapse (30fps -> 5fps) was ~90ms of blocking inside each render action —
+// the GPU wait plus the CPU-side NDI work. Now the render action only ENCODES
+// the fused downscale+convert kernel (microseconds); Metal's completion
+// callback queues the finished staging slot here, and this per-instance
+// worker does everything else — pairing, packing, the NDI send — off the
+// render thread. Every worker send is synchronous, so no NDI in-flight buffer
+// ever aliases a staging slot; the async-send flush rules stay confined to
+// the legacy blocking paths. Backpressure anywhere (slot ring, this queue)
+// DROPS the frame — an NDI preview must never block the host.
+// ---------------------------------------------------------------------------
+static void createHDRMetadata(NDIInstanceData* data);
+
+struct AsyncPumpItem {
+    void* slot = nullptr;
+    MetalGPUContextRef metalContext = nullptr;
+    const uint8_t* bytes = nullptr;
+    size_t byteCount = 0;
+    int width = 0, height = 0;
+    ndi_stereo::WireFormat format = ndi_stereo::WireFormat::UYVY8;
+    int eye = ndi_stereo::kEyeLeft;
+    double time = 0.0;
+    bool isThumbnail = false;
+    double gpuMs = 0.0;
+    bool ok = false;
+};
+
+struct AsyncPump {
+    NDIInstanceData* data = nullptr; // owner; outlives the pump (shutdownNDI drains first)
+    std::mutex m;
+    std::condition_variable cv;
+    std::queue<AsyncPumpItem> queue; // bounded by kAsyncPumpQueueCap
+    std::atomic<int> pendingSubmits{0}; // Metal callbacks not yet finished with this pump
+    bool stop = false;
+    std::thread worker;
+    uint64_t drops = 0;
+    std::chrono::steady_clock::time_point lastDropLog{};
+};
+
+static const size_t kAsyncPumpQueueCap = 4;
+
+// The per-render values the pairer needs, captured at ENQUEUE time — the
+// instance's render* fields belong to a later call by completion time.
+struct AsyncSubmitCtx {
+    AsyncPump* pump = nullptr;
+    AsyncPumpItem item;
+};
+
+static void pumpWorkerLoop(AsyncPump* pump)
+{
+    NDIInstanceData* data = pump->data;
+    for (;;) {
+        AsyncPumpItem item;
+        size_t depth = 0;
+        {
+            std::unique_lock<std::mutex> lock(pump->m);
+            pump->cv.wait(lock, [pump] { return pump->stop || !pump->queue.empty(); });
+            if (pump->stop) {
+                return; // leftovers are released by pumpShutdown
+            }
+            item = pump->queue.front();
+            pump->queue.pop();
+            depth = pump->queue.size();
+        }
+        if (item.ok) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (item.format == ndi_stereo::WireFormat::P216) {
+                createHDRMetadata(data);
+            }
+            hubSubmitFrame(data, item.format, item.width, item.height,
+                           item.bytes, item.byteCount, /*allowAsync=*/false,
+                           item.eye, item.time, item.isThumbnail);
+            // Status changes are only FLAGGED here (statusParamDirty inside the
+            // hub) — paramSetValue is a host call and stays on render threads;
+            // the next render's flushStatusParam pushes it.
+            if (data->timersEnabled) {
+                NDI_LOG("wtimer eye=%d gpu=%.2f submit=%.1f qdepth=%zu",
+                        item.eye, item.gpuMs, msSince(t0), depth);
+            }
+        }
+        metal_gpu_downscale_release(item.metalContext, item.slot);
+    }
+}
+
+static AsyncPump* pumpEnsure(NDIInstanceData* data)
+{
+    if (!data->pump) {
+        data->pump = new AsyncPump();
+        data->pump->data = data;
+        data->pump->worker = std::thread(pumpWorkerLoop, data->pump);
+    }
+    return data->pump;
+}
+
+// Metal completion callback. Runs on the queue's completion thread — anything
+// slow here stalls the host's own completion handlers, so it only queues the
+// slot and wakes the worker.
+static void pumpOnConvertDone(void* user, void* slot, const void* outPtr,
+                              size_t outBytes, double gpuMs, bool ok)
+{
+    AsyncSubmitCtx* ctx = static_cast<AsyncSubmitCtx*>(user);
+    AsyncPump* pump = ctx->pump;
+    ctx->item.slot = slot;
+    ctx->item.bytes = static_cast<const uint8_t*>(outPtr);
+    ctx->item.byteCount = outBytes;
+    ctx->item.gpuMs = gpuMs;
+    ctx->item.ok = ok;
+
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(pump->m);
+        if (!pump->stop && pump->queue.size() < kAsyncPumpQueueCap) {
+            pump->queue.push(ctx->item);
+            queued = true;
+        } else if (!pump->stop) {
+            ++pump->drops;
+        }
+    }
+    if (queued) {
+        pump->cv.notify_one();
+    } else {
+        metal_gpu_downscale_release(ctx->item.metalContext, slot);
+    }
+    delete ctx;
+    --pump->pendingSubmits; // last touch: pumpShutdown waits on this before freeing
+}
+
+static void pumpShutdown(NDIInstanceData* data)
+{
+    AsyncPump* pump = data->pump;
+    if (!pump) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pump->m);
+        pump->stop = true;
+    }
+    pump->cv.notify_all();
+    if (pump->worker.joinable()) {
+        pump->worker.join();
+    }
+    // Callbacks for still-executing command buffers release their own slots
+    // once stop is set; wait them out so none touches a freed pump.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pump->pendingSubmits.load() > 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    {
+        // Worker exits on stop with items possibly still queued — release them.
+        std::lock_guard<std::mutex> lock(pump->m);
+        while (!pump->queue.empty()) {
+            metal_gpu_downscale_release(pump->queue.front().metalContext, pump->queue.front().slot);
+            pump->queue.pop();
+        }
+    }
+    if (pump->pendingSubmits.load() > 0) {
+        NDI_LOG("Async pump: %d Metal callback(s) never arrived — leaking pump to stay safe",
+                pump->pendingSubmits.load());
+        data->pump = nullptr;
+        return;
+    }
+    delete pump;
+    data->pump = nullptr;
+}
+#endif // __APPLE__
 
 // GPU Acceleration Functions
 static bool initializeGPUContext(NDIInstanceData* data)
@@ -993,6 +1194,13 @@ static void shutdownNDI(NDIInstanceData* data)
 
     NDI_LOG("Shutting down NDI SDK...");
 
+#ifdef __APPLE__
+    // Drain the async pump FIRST: its worker submits into the hub and its
+    // Metal callbacks write staging slots — both must be quiet before the
+    // GPU context and the hub go away.
+    pumpShutdown(data);
+#endif
+
     // Stop async processing thread
     if (data->asyncSending && data->asyncThread.joinable()) {
         data->stopAsyncThread = true;
@@ -1065,7 +1273,8 @@ static void sendUYVYToNDI(NDIInstanceData* data, int width, int height)
     hubSubmitFrame(data, ndi_stereo::WireFormat::UYVY8, width, height,
                    data->uyvyFrameBuffer.data(),
                    static_cast<size_t>(width) * height * 2,
-                   /*allowAsync=*/true);
+                   /*allowAsync=*/true,
+                   data->renderEye, data->renderTime, data->renderIsThumbnail);
 }
 
 // Submit the already-packed P216 frame in data->hdrFrameBuffer with HDR
@@ -1076,7 +1285,8 @@ static void sendP216ToNDI(NDIInstanceData* data, int width, int height)
     hubSubmitFrame(data, ndi_stereo::WireFormat::P216, width, height,
                    reinterpret_cast<const uint8_t*>(data->hdrFrameBuffer.data()),
                    static_cast<size_t>(width) * height * 2 * sizeof(uint16_t),
-                   /*allowAsync=*/false);
+                   /*allowAsync=*/false,
+                   data->renderEye, data->renderTime, data->renderIsThumbnail);
 }
 
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -1255,7 +1465,8 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
     }
 
     hubSubmitFrame(data, ndi_stereo::WireFormat::RGBA8, width, height,
-                   dstData, frameSize, /*allowAsync=*/true);
+                   dstData, frameSize, /*allowAsync=*/true,
+                   data->renderEye, data->renderTime, data->renderIsThumbnail);
 }
 
 static bool ensureNDIReady(NDIInstanceData* data)
@@ -1368,7 +1579,10 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
     // orders its downstream reads on the same queue (cf. the Resolve
     // GainPlugin sample).
     const size_t frameBytes = static_cast<size_t>(height) * static_cast<size_t>(dstRowBytes);
-    if (!metal_gpu_copy_buffer(metalContext, metalQueue, srcBuffer, dstBuffer, frameBytes, false)) {
+    const auto blitT0 = std::chrono::steady_clock::now();
+    const bool blitOk = metal_gpu_copy_buffer(metalContext, metalQueue, srcBuffer, dstBuffer, frameBytes, false);
+    data->timerBlitMs = msSince(blitT0);
+    if (!blitOk) {
         NDI_LOG("Metal render: passthrough copy failed");
         return kOfxStatFailed;
     }
@@ -1383,37 +1597,52 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
     const int rowFloats = srcRowBytes / static_cast<int>(sizeof(float));
 
     bool converted = false;
-    if (data->gpuAcceleration && metalContext) {
+    // The geometry the fused kernels accept — mirrored from the submit's own
+    // validation so a refusal there means "ring full", never "bad geometry"
+    // (bad geometry must keep falling back to the readback path every frame).
+    const bool fusable = (outWidth >= 2) && ((outWidth % 2) == 0) && (rowFloats >= width * 4);
+    if (data->gpuAcceleration && metalContext && fusable &&
+        (data->hdrEnabled || data->optimalFormat)) {
+        // Non-blocking fast path (v1.6.0): ENCODE the fused kernel and return.
+        // No waitUntilCompleted here — that wait (plus the CPU-side NDI work
+        // that followed it) was ~90ms of render-thread blocking per eye and
+        // the whole 8K playback collapse (#5). The pump worker pairs and
+        // sends when the GPU finishes.
         std::lock_guard<std::mutex> lock(data->gpuContext->gpuMutex);
-        if (data->hdrEnabled) {
-            const size_t p216Values = static_cast<size_t>(outWidth) * outHeight * 2;
-            if (data->hdrFrameBuffer.size() != p216Values) {
-                data->hdrFrameBuffer.resize(p216Values);
-            }
-            converted = metal_gpu_buffer_downscale_to_p216(metalContext, metalQueue, srcBuffer,
-                                                           width, height, rowFloats, divisor,
-                                                           outWidth, outHeight, data->hdrFrameBuffer.data());
-            if (converted) {
-                NDI_LOG("GPU-native path: %dx%d Metal frame -> %dx%d P216 (divisor %d)",
-                        width, height, outWidth, outHeight, divisor);
-                sendP216ToNDI(data, outWidth, outHeight);
-            }
-        } else if (data->optimalFormat) {
-            const size_t uyvySize = static_cast<size_t>(outWidth) * outHeight * 2;
-            if (data->uyvyFrameBuffer.size() != uyvySize) {
-                flushAsyncSend(data);
-                data->uyvyFrameBuffer.resize(uyvySize);
-            }
-            converted = metal_gpu_buffer_downscale_to_uyvy(metalContext, metalQueue, srcBuffer,
-                                                           width, height, rowFloats, divisor,
-                                                           outWidth, outHeight, data->uyvyFrameBuffer.data());
-            if (converted) {
-                NDI_LOG("GPU-native path: %dx%d Metal frame -> %dx%d UYVY (divisor %d)",
-                        width, height, outWidth, outHeight, divisor);
-                sendUYVYToNDI(data, outWidth, outHeight);
+        AsyncPump* pump = pumpEnsure(data);
+        const bool wantP216 = data->hdrEnabled;
+        AsyncSubmitCtx* ctx = new AsyncSubmitCtx();
+        ctx->pump = pump;
+        ctx->item.metalContext = metalContext;
+        ctx->item.width = outWidth;
+        ctx->item.height = outHeight;
+        ctx->item.format = wantP216 ? ndi_stereo::WireFormat::P216
+                                    : ndi_stereo::WireFormat::UYVY8;
+        ctx->item.eye = data->renderEye;
+        ctx->item.time = data->renderTime;
+        ctx->item.isThumbnail = data->renderIsThumbnail;
+        ++pump->pendingSubmits;
+        const auto convT0 = std::chrono::steady_clock::now();
+        const bool submitted = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
+                                                          width, height, rowFloats, divisor,
+                                                          outWidth, outHeight, wantP216,
+                                                          pumpOnConvertDone, ctx);
+        data->timerConvMs = msSince(convT0);
+        converted = true; // handled either way: enqueued, or deliberately dropped
+        if (submitted) {
+            NDI_LOG("GPU-native async: %dx%d Metal frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216)",
+                    width, height, outWidth, outHeight, wantP216 ? 1 : 0, divisor);
+        } else {
+            --pump->pendingSubmits;
+            delete ctx;
+            ++pump->drops;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - pump->lastDropLog > std::chrono::seconds(1)) {
+                pump->lastDropLog = now;
+                NDI_LOG("Async pump: frame dropped, %llu total (GPU or NDI worker behind)",
+                        static_cast<unsigned long long>(pump->drops));
             }
         }
-        // Legacy RGBA output format has no fused kernel — handled by the readback below.
     }
 
     if (!converted) {
@@ -1421,8 +1650,11 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
         if (data->readbackBuffer.size() * sizeof(float) < srcBytes) {
             data->readbackBuffer.resize(srcBytes / sizeof(float));
         }
-        if (metal_gpu_read_buffer(metalContext, metalQueue, srcBuffer,
-                                  data->readbackBuffer.data(), srcBytes)) {
+        const auto convT0 = std::chrono::steady_clock::now();
+        const bool readOk = metal_gpu_read_buffer(metalContext, metalQueue, srcBuffer,
+                                                  data->readbackBuffer.data(), srcBytes);
+        data->timerConvMs = msSince(convT0);
+        if (readOk) {
             NDI_LOG("Metal frame full readback -> CPU fallback path (%dx%d, gpu=%d)",
                     width, height, data->gpuAcceleration ? 1 : 0);
             sendCPUFrameToNDI(data, data->readbackBuffer.data(), width, height, srcRowBytes);
@@ -1547,6 +1779,12 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     myData->resolvePage = "";
     myData->probeCallCount = 0;
     myData->probeHasLastCallTime = false;
+    myData->timersEnabled = false;
+    myData->timerBlitMs = myData->timerConvMs = 0.0;
+    myData->timerFlushMs = myData->timerPackMs = myData->timerSendMs = 0.0;
+#ifdef __APPLE__
+    myData->pump = nullptr;
+#endif
     if (inArgs) {
         char* page = nullptr;
         if (gPropHost->propGetString(inArgs, kOfxImageEffectPropResolvePage, 0, &page) == kOfxStatOK && page) {
@@ -1752,6 +1990,12 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
         NDI_LOG_TEXT(ndi_probe::formatProbeLine(info).c_str());
     }
 
+    // Stage timers for the mtimer diagnostic line (issue #5): reset per render.
+    myData->timersEnabled = (debugLogging != 0);
+    myData->timerBlitMs = myData->timerConvMs = 0.0;
+    myData->timerFlushMs = myData->timerPackMs = myData->timerSendMs = 0.0;
+    const auto renderT0 = std::chrono::steady_clock::now();
+
     // Get source image
     OfxPropertySetHandle sourceImg = NULL;
     gEffectHost->clipGetImage(myData->sourceClip, time, NULL, &sourceImg);
@@ -1768,6 +2012,7 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
         gEffectHost->clipReleaseImage(sourceImg);
         return kOfxStatFailed;
     }
+    const double imagesMs = msSince(renderT0);
 
     // Get image properties
     void *srcData, *dstData;
@@ -1800,6 +2045,14 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
         gEffectHost->clipReleaseImage(sourceImg);
         gEffectHost->clipReleaseImage(outputImg);
         flushStatusParam(myData);
+        if (myData->timersEnabled) {
+            // All-numeric on purpose — dynamic %s strings get redacted to
+            // <private> by unified logging (LEARNINGS 2026-08-28). eye: 0=L 1=R.
+            NDI_LOG("mtimer eye=%d total=%.1f images=%.1f blit=%.1f conv=%.1f flush=%.1f pack=%.1f send=%.1f",
+                    myData->renderEye == ndi_stereo::kEyeRight ? 1 : 0,
+                    msSince(renderT0), imagesMs, myData->timerBlitMs, myData->timerConvMs,
+                    myData->timerFlushMs, myData->timerPackMs, myData->timerSendMs);
+        }
         NDI_LOG("Render completed (Metal)");
         return metalStatus;
     }
