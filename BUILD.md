@@ -36,7 +36,13 @@ Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (de
 make test
 ```
 
-Host-independent tests (currently the render-probe log-line formatter in [tests/](tests/)) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
+Host-independent tests in [tests/](tests/) (render-probe log-line formatter, stream-resolution divisor/dims/box-downscale) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
+
+```bash
+make test-metal
+```
+
+GPU kernel correctness tests: runs the fused downscale+convert Metal kernels (UYVY and P216) on a synthetic frame and compares against the CPU reference. Needs a Metal device (any Mac; skips cleanly without one), but still no Resolve or NDI SDK. The kernels are compiled from source at runtime, so this is the only pre-Resolve check that catches shader errors — run it whenever `src/MetalGPUAcceleration.mm` changes.
 
 ### Install
 

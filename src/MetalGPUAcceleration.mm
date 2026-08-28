@@ -6,9 +6,21 @@
 #import <os/log.h>
 #include "MetalGPUAcceleration.h"
 #include <stdio.h>
+#include <string.h>
 #include <chrono>
+#include <unordered_map>
 
 #define METAL_LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "NDI Plugin Metal: " fmt, ##__VA_ARGS__)
+
+// GPU-native fast-path state. Pipelines and the staging buffer they write are
+// device-bound, and on a multi-GPU system the host's command queue can live on
+// a different device than this context's default — so cache one state per device.
+struct MetalFastPathState {
+    id<MTLComputePipelineState> uyvyPipeline;
+    id<MTLComputePipelineState> p216Pipeline;
+    id<MTLBuffer> staging;          // readback target, grown as needed
+    size_t stagingCapacity;
+};
 
 // Metal GPU Context structure
 struct MetalGPUContext {
@@ -17,6 +29,17 @@ struct MetalGPUContext {
     id<MTLComputePipelineState> rgbaToUyvyPipeline;
     id<MTLComputePipelineState> rgbaToHdrPipeline;
     id<MTLLibrary> library;
+    std::unordered_map<void*, MetalFastPathState> fastPathByDevice; // key: id<MTLDevice>
+};
+
+// Must match the DownscaleParams struct inside the shader source below.
+struct MetalDownscaleParams {
+    uint32_t srcWidth;
+    uint32_t srcHeight;
+    uint32_t srcRowFloats;
+    uint32_t outWidth;
+    uint32_t outHeight;
+    uint32_t divisor;
 };
 
 // Metal shader source code
@@ -140,6 +163,96 @@ kernel void rgba_to_hdr_p216(
     uvPlaneOutput[uvIdx * 2] = u_16;     // U
     uvPlaneOutput[uvIdx * 2 + 1] = v_16; // V
 }
+
+// ---------------------------------------------------------------------------
+// GPU-native fast path: fused box-downscale (divisor 1/2/4) + vertical flip +
+// color conversion, reading the float RGBA frame the host left on the device.
+// Row/column sampling matches the CPU composition exactly
+// (ndi_stream::downscaleRGBABox followed by the flipping CPU converters):
+// output top-down row y averages source bottom-up rows
+// (outHeight-1-y)*divisor + [0, divisor), edge-clamped.
+// ---------------------------------------------------------------------------
+
+struct DownscaleParams {
+    uint srcWidth;
+    uint srcHeight;
+    uint srcRowFloats;   // source stride in floats (rowBytes / 4)
+    uint outWidth;
+    uint outHeight;
+    uint divisor;
+};
+
+static inline float3 box_sample_rgb(device const float* src,
+                                    constant DownscaleParams& p,
+                                    uint ox, uint oy) {
+    float3 sum = float3(0.0f);
+    for (uint sy = 0; sy < p.divisor; ++sy) {
+        uint srcRow = min((p.outHeight - 1u - oy) * p.divisor + sy, p.srcHeight - 1u);
+        for (uint sx = 0; sx < p.divisor; ++sx) {
+            uint srcX = min(ox * p.divisor + sx, p.srcWidth - 1u);
+            device const float* px = src + srcRow * p.srcRowFloats + srcX * 4u;
+            sum += float3(px[0], px[1], px[2]);
+        }
+    }
+    return clamp(sum / float(p.divisor * p.divisor), 0.0f, 1.0f);
+}
+
+// One thread emits one UYVY macropixel (two output pixels), Rec.709.
+kernel void downscale_rgba_to_uyvy(device const float* src [[buffer(0)]],
+                                   device uchar4* dst [[buffer(1)]],
+                                   constant DownscaleParams& p [[buffer(2)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    uint x0 = gid.x * 2;
+    if (x0 >= p.outWidth || gid.y >= p.outHeight) return;
+
+    float3 rgb1 = box_sample_rgb(src, p, x0, gid.y);
+    float3 rgb2 = (x0 + 1 < p.outWidth) ? box_sample_rgb(src, p, x0 + 1, gid.y) : rgb1;
+
+    float y1 = 0.2126f * rgb1.r + 0.7152f * rgb1.g + 0.0722f * rgb1.b;
+    float y2 = 0.2126f * rgb2.r + 0.7152f * rgb2.g + 0.0722f * rgb2.b;
+    float3 avg = (rgb1 + rgb2) * 0.5f;
+    float u = -0.1146f * avg.r - 0.3854f * avg.g + 0.5f * avg.b;
+    float v = 0.5f * avg.r - 0.4542f * avg.g - 0.0458f * avg.b;
+
+    dst[gid.y * (p.outWidth / 2) + gid.x] = uchar4(
+        uchar((u + 0.5f) * 255.0f),
+        uchar(y1 * 255.0f),
+        uchar((v + 0.5f) * 255.0f),
+        uchar(y2 * 255.0f)
+    );
+}
+
+// One thread emits two output pixels of P216: planar Y at [0, outW*outH),
+// interleaved UV at [outW*outH, 2*outW*outH), 16-bit BT.2100 limited range,
+// Rec.2020 coefficients — same quantization as rgba_to_hdr_p216 above.
+kernel void downscale_rgba_to_p216(device const float* src [[buffer(0)]],
+                                   device ushort* dst [[buffer(1)]],
+                                   constant DownscaleParams& p [[buffer(2)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    uint x0 = gid.x * 2;
+    if (x0 >= p.outWidth || gid.y >= p.outHeight) return;
+
+    float3 rgb1 = box_sample_rgb(src, p, x0, gid.y);
+    float3 rgb2 = (x0 + 1 < p.outWidth) ? box_sample_rgb(src, p, x0 + 1, gid.y) : rgb1;
+
+    float y1 = 0.2627f * rgb1.r + 0.6780f * rgb1.g + 0.0593f * rgb1.b;
+    float y2 = 0.2627f * rgb2.r + 0.6780f * rgb2.g + 0.0593f * rgb2.b;
+    float3 avg = (rgb1 + rgb2) * 0.5f;
+    float u = -0.1396f * avg.r - 0.3604f * avg.g + 0.5f * avg.b;
+    float v = 0.5f * avg.r - 0.4598f * avg.g - 0.0402f * avg.b;
+
+    device ushort* yPlane = dst;
+    device ushort* uvPlane = dst + p.outWidth * p.outHeight;
+
+    uint yIdx = gid.y * p.outWidth + x0;
+    yPlane[yIdx] = ushort(4096.0f + y1 * 56064.0f);
+    if (x0 + 1 < p.outWidth) {
+        yPlane[yIdx + 1] = ushort(4096.0f + y2 * 56064.0f);
+    }
+    uint uvIdx = yIdx / 2;
+    uvPlane[uvIdx * 2] = ushort(32768.0f + u * 28672.0f);
+    uvPlane[uvIdx * 2 + 1] = ushort(32768.0f + v * 28672.0f);
+}
 )";
 
 bool metal_gpu_is_available(void) {
@@ -224,15 +337,298 @@ void metal_gpu_shutdown(MetalGPUContextRef context) {
     
     @autoreleasepool {
         METAL_LOG("Shutting down Metal GPU acceleration...\n");
-        
+
+        for (auto& entry : context->fastPathByDevice) {
+            [entry.second.uyvyPipeline release];
+            [entry.second.p216Pipeline release];
+            if (entry.second.staging) [entry.second.staging release];
+        }
+        context->fastPathByDevice.clear();
+
         [context->device release];
         [context->commandQueue release];
         [context->rgbaToUyvyPipeline release];
         [context->rgbaToHdrPipeline release];
         [context->library release];
-        
+
         delete context;
     }
+}
+
+// --- GPU-native fast path -------------------------------------------------
+
+static MetalFastPathState* fastPathForDevice(MetalGPUContextRef context, id<MTLDevice> device)
+{
+    void* key = (void*)device;
+    auto it = context->fastPathByDevice.find(key);
+    if (it != context->fastPathByDevice.end()) {
+        return &it->second;
+    }
+
+    NSError* error = nil;
+    NSString* shaderSource = [NSString stringWithUTF8String:metalShaderSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:shaderSource options:nil error:&error];
+    if (!library) {
+        METAL_LOG("Fast path: failed to compile library for device %{public}s: %{public}s",
+                  [[device name] UTF8String], [[error localizedDescription] UTF8String]);
+        return nullptr;
+    }
+
+    id<MTLFunction> uyvyFunction = [library newFunctionWithName:@"downscale_rgba_to_uyvy"];
+    id<MTLFunction> p216Function = [library newFunctionWithName:@"downscale_rgba_to_p216"];
+    MetalFastPathState state = {};
+    if (uyvyFunction && p216Function) {
+        state.uyvyPipeline = [device newComputePipelineStateWithFunction:uyvyFunction error:&error];
+        if (state.uyvyPipeline) {
+            state.p216Pipeline = [device newComputePipelineStateWithFunction:p216Function error:&error];
+        }
+    }
+    if (uyvyFunction) [uyvyFunction release];
+    if (p216Function) [p216Function release];
+    [library release];
+
+    if (!state.uyvyPipeline || !state.p216Pipeline) {
+        METAL_LOG("Fast path: failed to create pipelines: %{public}s",
+                  error ? [[error localizedDescription] UTF8String] : "missing kernel function");
+        if (state.uyvyPipeline) [state.uyvyPipeline release];
+        if (state.p216Pipeline) [state.p216Pipeline release];
+        return nullptr;
+    }
+
+    auto result = context->fastPathByDevice.emplace(key, state);
+    return &result.first->second;
+}
+
+static id<MTLBuffer> ensureStagingBuffer(MetalFastPathState* fastPath, id<MTLDevice> device, size_t byteCount)
+{
+    if (fastPath->staging && fastPath->stagingCapacity >= byteCount) {
+        return fastPath->staging;
+    }
+    if (fastPath->staging) {
+        [fastPath->staging release];
+        fastPath->staging = nil;
+        fastPath->stagingCapacity = 0;
+    }
+    fastPath->staging = [device newBufferWithLength:byteCount options:MTLResourceStorageModeShared];
+    if (fastPath->staging) {
+        fastPath->stagingCapacity = byteCount;
+    }
+    return fastPath->staging;
+}
+
+static bool runDownscaleKernel(MetalGPUContextRef context, void* commandQueue, void* srcMetalBuffer,
+                               int srcWidth, int srcHeight, int srcRowFloats, int divisor,
+                               int outWidth, int outHeight,
+                               bool p216, void* cpuOut, size_t outBytes, const char* label)
+{
+    if (!context || !srcMetalBuffer || !cpuOut) return false;
+    // Odd widths can't pack 4:2:2 rows cleanly — refuse so the caller falls
+    // back to the CPU path (pre-fast-path behavior for such sources).
+    if (srcWidth <= 0 || srcHeight <= 0 || srcRowFloats < srcWidth * 4 ||
+        divisor <= 0 || outWidth < 2 || (outWidth % 2) != 0 || outHeight <= 0) {
+        return false;
+    }
+
+    @autoreleasepool {
+        auto startTime = std::chrono::high_resolution_clock::now();
+
+        id<MTLCommandQueue> queue = commandQueue
+            ? static_cast<id<MTLCommandQueue>>(commandQueue)
+            : context->commandQueue;
+        if (!queue) return false;
+        id<MTLDevice> device = queue.device;
+        id<MTLBuffer> srcBuffer = static_cast<id<MTLBuffer>>(srcMetalBuffer);
+
+        const size_t neededSrcBytes =
+            static_cast<size_t>(srcHeight) * static_cast<size_t>(srcRowFloats) * sizeof(float);
+        if (srcBuffer.length < neededSrcBytes) {
+            METAL_LOG("Fast path: source buffer too small (%zu < %zu bytes)",
+                      (size_t)srcBuffer.length, neededSrcBytes);
+            return false;
+        }
+
+        MetalFastPathState* fastPath = fastPathForDevice(context, device);
+        if (!fastPath) return false;
+
+        id<MTLBuffer> staging = ensureStagingBuffer(fastPath, device, outBytes);
+        if (!staging) {
+            METAL_LOG("Fast path: failed to allocate %zu-byte staging buffer", outBytes);
+            return false;
+        }
+
+        MetalDownscaleParams params;
+        params.srcWidth = (uint32_t)srcWidth;
+        params.srcHeight = (uint32_t)srcHeight;
+        params.srcRowFloats = (uint32_t)srcRowFloats;
+        params.outWidth = (uint32_t)outWidth;
+        params.outHeight = (uint32_t)outHeight;
+        params.divisor = (uint32_t)divisor;
+
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:(p216 ? fastPath->p216Pipeline : fastPath->uyvyPipeline)];
+        [encoder setBuffer:srcBuffer offset:0 atIndex:0];
+        [encoder setBuffer:staging offset:0 atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(
+            ((outWidth / 2) + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width,
+            (outHeight + threadsPerThreadgroup.height - 1) / threadsPerThreadgroup.height,
+            1
+        );
+        [encoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.status != MTLCommandBufferStatusCompleted || commandBuffer.error) {
+            METAL_LOG("Fast path: command buffer failed: %{public}s",
+                      commandBuffer.error ? [[commandBuffer.error localizedDescription] UTF8String] : "not completed");
+            return false;
+        }
+
+        memcpy(cpuOut, [staging contents], outBytes);
+
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+        METAL_LOG("✅ Fast path %{public}s: %dx%d -> %dx%d (divisor %d) in %lld μs (%.2f ms)",
+                  label, srcWidth, srcHeight, outWidth, outHeight, divisor,
+                  duration.count(), duration.count() / 1000.0);
+        return true;
+    }
+}
+
+bool metal_gpu_buffer_downscale_to_uyvy(MetalGPUContextRef context,
+                                        void* commandQueue,
+                                        void* srcMetalBuffer,
+                                        int srcWidth, int srcHeight, int srcRowFloats,
+                                        int divisor,
+                                        int outWidth, int outHeight,
+                                        unsigned char* uyvyOut)
+{
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2;
+    return runDownscaleKernel(context, commandQueue, srcMetalBuffer,
+                              srcWidth, srcHeight, srcRowFloats, divisor,
+                              outWidth, outHeight, false, uyvyOut, outBytes, "UYVY");
+}
+
+bool metal_gpu_buffer_downscale_to_p216(MetalGPUContextRef context,
+                                        void* commandQueue,
+                                        void* srcMetalBuffer,
+                                        int srcWidth, int srcHeight, int srcRowFloats,
+                                        int divisor,
+                                        int outWidth, int outHeight,
+                                        unsigned short* p216Out)
+{
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2 * sizeof(unsigned short);
+    return runDownscaleKernel(context, commandQueue, srcMetalBuffer,
+                              srcWidth, srcHeight, srcRowFloats, divisor,
+                              outWidth, outHeight, true, p216Out, outBytes, "P216");
+}
+
+bool metal_gpu_copy_buffer(MetalGPUContextRef context,
+                           void* commandQueue,
+                           void* srcMetalBuffer, void* dstMetalBuffer,
+                           size_t byteCount, bool waitForCompletion)
+{
+    if (!srcMetalBuffer || !dstMetalBuffer || byteCount == 0) return false;
+
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = commandQueue
+            ? static_cast<id<MTLCommandQueue>>(commandQueue)
+            : (context ? context->commandQueue : nil);
+        if (!queue) return false;
+        id<MTLBuffer> src = static_cast<id<MTLBuffer>>(srcMetalBuffer);
+        id<MTLBuffer> dst = static_cast<id<MTLBuffer>>(dstMetalBuffer);
+
+        size_t copyBytes = byteCount;
+        if (copyBytes > src.length) copyBytes = src.length;
+        if (copyBytes > dst.length) copyBytes = dst.length;
+        if (copyBytes != byteCount) {
+            METAL_LOG("Passthrough copy clamped from %zu to %zu bytes", byteCount, copyBytes);
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit copyFromBuffer:src sourceOffset:0 toBuffer:dst destinationOffset:0 size:copyBytes];
+        [blit endEncoding];
+        [commandBuffer commit];
+        if (waitForCompletion) {
+            [commandBuffer waitUntilCompleted];
+            if (commandBuffer.status != MTLCommandBufferStatusCompleted || commandBuffer.error) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+bool metal_gpu_read_buffer(MetalGPUContextRef context,
+                           void* commandQueue,
+                           void* srcMetalBuffer,
+                           void* cpuDst, size_t byteCount)
+{
+    if (!srcMetalBuffer || !cpuDst || byteCount == 0) return false;
+
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = commandQueue
+            ? static_cast<id<MTLCommandQueue>>(commandQueue)
+            : (context ? context->commandQueue : nil);
+        if (!queue) return false;
+        id<MTLBuffer> src = static_cast<id<MTLBuffer>>(srcMetalBuffer);
+        if (byteCount > src.length) return false;
+
+        if (src.storageMode == MTLStorageModeShared) {
+            // Empty command buffer as a queue barrier: the host's producer work
+            // committed before us must finish writing before the CPU reads.
+            id<MTLCommandBuffer> barrier = [queue commandBuffer];
+            [barrier commit];
+            [barrier waitUntilCompleted];
+            memcpy(cpuDst, [src contents], byteCount);
+            return true;
+        }
+
+        id<MTLBuffer> staging = [queue.device newBufferWithLength:byteCount
+                                                          options:MTLResourceStorageModeShared];
+        if (!staging) return false;
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit copyFromBuffer:src sourceOffset:0 toBuffer:staging destinationOffset:0 size:byteCount];
+        [blit endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        bool ok = (commandBuffer.status == MTLCommandBufferStatusCompleted && !commandBuffer.error);
+        if (ok) {
+            memcpy(cpuDst, [staging contents], byteCount);
+        }
+        [staging release];
+        return ok;
+    }
+}
+
+void* metal_gpu_create_shared_buffer(MetalGPUContextRef context, const void* initialData, size_t byteCount)
+{
+    if (!context || byteCount == 0) return nullptr;
+    @autoreleasepool {
+        id<MTLBuffer> buffer = initialData
+            ? [context->device newBufferWithBytes:initialData length:byteCount options:MTLResourceStorageModeShared]
+            : [context->device newBufferWithLength:byteCount options:MTLResourceStorageModeShared];
+        return (void*)buffer; // retained (new*); release with metal_gpu_release_buffer
+    }
+}
+
+void* metal_gpu_buffer_contents(void* metalBuffer)
+{
+    if (!metalBuffer) return nullptr;
+    return [static_cast<id<MTLBuffer>>(metalBuffer) contents];
+}
+
+void metal_gpu_release_buffer(void* metalBuffer)
+{
+    if (!metalBuffer) return;
+    [static_cast<id<MTLBuffer>>(metalBuffer) release];
 }
 
 bool metal_gpu_convert_rgba_to_uyvy(MetalGPUContextRef context, 

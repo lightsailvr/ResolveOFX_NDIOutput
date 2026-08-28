@@ -25,7 +25,7 @@ BUNDLE_NAME = NDIOutput.ofx.bundle
 BUNDLE_EXECUTABLE = $(BUNDLE_NAME)/Contents/macOS/NDIOutput.ofx
 
 # Build targets
-.PHONY: all clean dev install test
+.PHONY: all clean dev install test test-metal
 
 all: $(BUNDLE_EXECUTABLE)
 
@@ -36,6 +36,15 @@ test:
 	mkdir -p build
 	$(CXX) -Isrc tests/test_render_probe.cpp -o build/test_render_probe
 	./build/test_render_probe
+	$(CXX) -Isrc tests/test_stream_resolution.cpp -o build/test_stream_resolution
+	./build/test_stream_resolution
+
+# GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
+test-metal: src/MetalGPUAcceleration.o
+	mkdir -p build
+	$(CXX) -Isrc tests/test_metal_downscale.mm src/MetalGPUAcceleration.o \
+		-o build/test_metal_downscale -framework Metal -framework Foundation
+	./build/test_metal_downscale
 
 $(BUNDLE_EXECUTABLE): $(OBJECTS) | bundle_structure
 	@echo "Building NDI Output Plugin v$(VERSION)"

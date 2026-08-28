@@ -143,6 +143,22 @@ Seeded from release notes and the 2026-08-28 cleanup. Newest entries at the bott
 ### OPEN — Stereo vision mode blacks out the NDI feed (found 2026-08-28, probe session)
 With the Stereo 3D palette at Vision: Stereo, Resolve creates a **second plugin instance for the right eye**. Both instances create NDI senders with the same default source name; the unified log shows `NDIlib_send_create` failing every render in R/L pair cadence, and `initializeNDI`'s failure path calls **`NDIlib_destroy()`** — killing the process-wide NDI library under the other instance's healthy sender, so the feed goes black and never recovers (L). Duplicate-name registration is the suspected trigger for the first failure (T — confirm once sender names log publicly). Fix belongs to issue #6: process-shared NDI lifecycle, single sender ownership or eye-suffixed names, and never `NDIlib_destroy()` while another instance is live.
 
+### 2026-08-28 — NDI async send vs. send-buffer reallocation (latent, found building the GPU fast path v1.4.0)
+**Symptom:** none yet — latent use-after-free. `NDIlib_send_send_video_async_v2` keeps reading the submitted buffer until the *next* send call, but the send buffers (`uyvyFrameBuffer`, `frameBuffer`) were `resize()`d whenever the frame size changed. The new Resolution control (Full/Half/Quarter) makes mid-stream size changes routine, which would have turned the latent bug live.
+**Root cause:** NDI async-send buffer contract + `std::vector::resize` reallocation.
+**Fix:** `flushAsyncSend()` — a NULL-frame async send completes the in-flight frame — called before any send-buffer reallocation (v1.4.0).
+**Validated by:** code inspection against the NDI Advanced SDK async-send contract; Tier 2 re-verify by switching Resolution mid-playback.
+**Rule:** any buffer handed to `NDIlib_send_send_video_async_v2` stays untouched until a subsequent send or NULL flush — flush before every reallocation.
+
+### 2026-08-28 — Metal OFX render semantics (P — verified against Resolve 21's shipped GainPlugin sample, v1.4.0)
+Facts the GPU fast path is built on, from `/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/OpenFX/GainPlugin/MetalKernel.mm`:
+- Declaring `kOfxImageEffectPropMetalRenderSupported = "true"` in describe makes Resolve set `kOfxImageEffectPropMetalEnabled` per render; when set, `kOfxImagePropData` on the clip images is an **`id<MTLBuffer>`** (cast the pointer), *not* CPU memory — the old `memcpy` passthrough would crash on it.
+- The host's `id<MTLCommandQueue>` arrives via `kOfxImageEffectPropMetalCommandQueue`. **Encode onto that queue** — same-queue ordering is the only guarantee that the host's upstream renders finished writing the source buffer (our own queue would race). The sample commits without waiting; we wait only on command buffers whose output the CPU reads back (NDI conversion).
+- Sample kernels index buffers tightly packed (`(y*width + x) * 4`), i.e. Resolve hands tight rows; the fast path still passes rowBytes through and the kernels honor it.
+- Pipelines (and buffers) are **device-bound**, and the host queue's device can differ from `MTLCreateSystemDefaultDevice()` on multi-GPU Macs — the sample caches pipelines per queue; we cache per device.
+- Metal shaders in this plugin compile from source **at runtime** — a shader typo builds fine in Tier 0 and dies inside Resolve. `make test-metal` compiles and runs the real kernels against the CPU reference; run it whenever `MetalGPUAcceleration.mm` changes.
+**Rule:** under Metal render, never touch image data pointers with CPU code, and always encode on the host's command queue.
+
 ### OPEN — Windows/CUDA build failing (as of 2026-08-28)
 Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
 

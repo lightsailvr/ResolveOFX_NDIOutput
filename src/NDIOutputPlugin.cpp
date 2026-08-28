@@ -41,6 +41,7 @@
 #include "ofxMultiThread.h"
 
 #include "RenderProbe.h"
+#include "StreamResolution.h"
 
 #ifdef __APPLE__
 #include "MetalGPUAcceleration.h"
@@ -93,9 +94,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 3
+#define kPluginVersionMinor 4
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.3.0"
+#define kPluginVersionString "1.4.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -109,6 +110,10 @@
 #define kParamFrameRate "frameRate"
 #define kParamFrameRateLabel "Frame Rate"
 #define kParamFrameRateHint "Frame rate for NDI output"
+
+#define kParamResolution "resolution"
+#define kParamResolutionLabel "Resolution"
+#define kParamResolutionHint "NDI stream resolution as a fraction of the incoming frame: Full, Half, or Quarter. When the host provides GPU frames, the downscale runs on the GPU before any readback."
 
 // GPU Acceleration Parameters
 #define kParamGPUAcceleration "gpuAcceleration"
@@ -212,6 +217,7 @@ struct NDIInstanceData {
     OfxParamHandle sourceNameParam;
     OfxParamHandle enabledParam;
     OfxParamHandle frameRateParam;
+    OfxParamHandle resolutionParam;
     OfxParamHandle gpuAccelerationParam;
     OfxParamHandle asyncSendingParam;
     OfxParamHandle optimalFormatParam;
@@ -240,6 +246,7 @@ struct NDIInstanceData {
     // GPU acceleration settings
     bool gpuAcceleration;
     bool asyncSending;
+    bool asyncFrameInFlight; // an async NDI send may still be reading its buffer
     bool optimalFormat;
     std::unique_ptr<GPUContext> gpuContext;
     
@@ -250,10 +257,15 @@ struct NDIInstanceData {
     double maxCLL;
     double maxFALL;
     
+    // Stream resolution (issue #5): divisor 1/2/4, read fresh each render
+    int resolutionDivisor;
+
     // Frame buffers
     std::vector<uint8_t> frameBuffer;
     std::vector<uint16_t> hdrFrameBuffer;
     std::vector<uint8_t> uyvyFrameBuffer; // UYVY format for optimal performance
+    std::vector<float> downscaleBuffer;   // CPU-path box-downscale output
+    std::vector<float> readbackBuffer;    // full-frame readback when a Metal frame needs the CPU path
     std::string hdrMetadataXML;
     
     // Asynchronous processing
@@ -273,6 +285,20 @@ struct NDIInstanceData {
 static void convertRGBAToUYVY_CPU(NDIInstanceData* data, void* rgbaData, int width, int height);
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height);
 static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int height);
+
+// An NDI async send keeps reading the previously submitted buffer until the
+// next send call; sending a NULL frame completes the in-flight send. Call this
+// before any send buffer reallocates (e.g. the Resolution divisor changed
+// mid-stream) so NDI never reads freed memory. Keyed on the in-flight flag,
+// not the live Async Sending param — toggling the param off must not skip the
+// flush for a frame already submitted.
+static void flushAsyncSend(NDIInstanceData* data)
+{
+    if (data->asyncFrameInFlight && data->ndiInitialized && data->ndiSend) {
+        NDIlib_send_send_video_async_v2(data->ndiSend, nullptr);
+    }
+    data->asyncFrameInFlight = false;
+}
 
 // GPU Acceleration Functions
 static bool initializeGPUContext(NDIInstanceData* data)
@@ -394,6 +420,7 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
 
     const size_t uyvySize = width * height * 2; // UYVY is 2 bytes per pixel
     if (data->uyvyFrameBuffer.size() != uyvySize) {
+        flushAsyncSend(data);
         data->uyvyFrameBuffer.resize(uyvySize);
     }
 
@@ -471,9 +498,10 @@ static void convertRGBAToUYVY_CPU(NDIInstanceData* data, void* rgbaData, int wid
     auto startTime = std::chrono::high_resolution_clock::now();
     
     NDI_LOG("Starting CPU RGBA->UYVY conversion (%dx%d)\n", width, height);
-    
+
     const size_t uyvySize = width * height * 2; // UYVY is 2 bytes per pixel
     if (data->uyvyFrameBuffer.size() != uyvySize) {
+        flushAsyncSend(data);
         data->uyvyFrameBuffer.resize(uyvySize);
     }
 
@@ -678,10 +706,11 @@ static void shutdownNDI(NDIInstanceData* data)
     shutdownGPUContext(data);
     
     if (data->ndiSend) {
-        NDIlib_send_destroy(data->ndiSend);
+        NDIlib_send_destroy(data->ndiSend); // blocks until any in-flight async send completes
         data->ndiSend = nullptr;
     }
-    
+    data->asyncFrameInFlight = false;
+
     NDIlib_destroy();
     data->ndiInitialized = false;
 }
@@ -720,6 +749,53 @@ static void createHDRMetadata(NDIInstanceData* data)
                           "\" matrix=\"" + matrix + "\" />";
     
     NDI_LOG("HDR Metadata: %s", data->hdrMetadataXML.c_str());
+}
+
+// Send the already-packed UYVY frame in data->uyvyFrameBuffer. Used by both
+// conversion paths: CPU/upload-convert (sendSDRFrame) and the GPU-native
+// fused downscale+convert (renderMetalFrame).
+static void sendUYVYToNDI(NDIInstanceData* data, int width, int height)
+{
+    NDIlib_video_frame_v2_t ndiVideoFrame;
+    ndiVideoFrame.xres = width;
+    ndiVideoFrame.yres = height;
+    ndiVideoFrame.FourCC = NDIlib_FourCC_type_UYVY;
+    ndiVideoFrame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
+    ndiVideoFrame.frame_rate_D = 1000;
+    ndiVideoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+    ndiVideoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
+    ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
+    ndiVideoFrame.p_metadata = nullptr;
+    ndiVideoFrame.p_data = data->uyvyFrameBuffer.data();
+    ndiVideoFrame.line_stride_in_bytes = width * 2; // UYVY is 2 bytes per pixel
+
+    if (data->asyncSending) {
+        NDIlib_send_send_video_async_v2(data->ndiSend, &ndiVideoFrame);
+        data->asyncFrameInFlight = true;
+    } else {
+        NDIlib_send_send_video_v2(data->ndiSend, &ndiVideoFrame);
+    }
+}
+
+// Send the already-packed P216 frame in data->hdrFrameBuffer with HDR metadata.
+static void sendP216ToNDI(NDIInstanceData* data, int width, int height)
+{
+    createHDRMetadata(data);
+
+    NDIlib_video_frame_v2_t ndiVideoFrame;
+    ndiVideoFrame.xres = width;
+    ndiVideoFrame.yres = height;
+    ndiVideoFrame.FourCC = NDIlib_FourCC_video_type_P216; // Proper HDR format
+    ndiVideoFrame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
+    ndiVideoFrame.frame_rate_D = 1000;
+    ndiVideoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+    ndiVideoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
+    ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
+    ndiVideoFrame.p_data = reinterpret_cast<uint8_t*>(data->hdrFrameBuffer.data());
+    ndiVideoFrame.line_stride_in_bytes = width * sizeof(uint16_t); // Y plane stride
+    ndiVideoFrame.p_metadata = data->hdrMetadataXML.empty() ? nullptr : data->hdrMetadataXML.c_str();
+
+    NDIlib_send_send_video_v2(data->ndiSend, &ndiVideoFrame);
 }
 
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -846,25 +922,8 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
         }
     }
 
-    // Create HDR metadata
-    createHDRMetadata(data);
-
-    // Setup NDI HDR video frame with proper P216 format
-    NDIlib_video_frame_v2_t ndiVideoFrame;
-    ndiVideoFrame.xres = width;
-    ndiVideoFrame.yres = height;
-    ndiVideoFrame.FourCC = NDIlib_FourCC_video_type_P216; // Proper HDR format
-    ndiVideoFrame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
-    ndiVideoFrame.frame_rate_D = 1000;
-    ndiVideoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
-    ndiVideoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
-    ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
-    ndiVideoFrame.p_data = reinterpret_cast<uint8_t*>(dstData);
-    ndiVideoFrame.line_stride_in_bytes = width * sizeof(uint16_t); // Y plane stride
-    ndiVideoFrame.p_metadata = data->hdrMetadataXML.empty() ? nullptr : data->hdrMetadataXML.c_str();
-
     // Send the HDR frame
-    NDIlib_send_send_video_v2(data->ndiSend, &ndiVideoFrame);
+    sendP216ToNDI(data, width, height);
 }
 
 static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -878,6 +937,17 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
            data->gpuAcceleration ? "Yes" : "No",
            data->optimalFormat ? "UYVY" : "RGBA");
 
+    if (data->optimalFormat) {
+        // Use UYVY format for optimal NDI performance
+        if (data->gpuAcceleration) {
+            convertRGBAToUYVY_GPU(data, imageData, width, height);
+        } else {
+            convertRGBAToUYVY_CPU(data, imageData, width, height);
+        }
+        sendUYVYToNDI(data, width, height);
+        return;
+    }
+
     NDIlib_video_frame_v2_t ndiVideoFrame;
     ndiVideoFrame.xres = width;
     ndiVideoFrame.yres = height;
@@ -888,72 +958,195 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
     ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
     ndiVideoFrame.p_metadata = nullptr;
 
-    if (data->optimalFormat) {
-        // Use UYVY format for optimal NDI performance
-        if (data->gpuAcceleration) {
-            convertRGBAToUYVY_GPU(data, imageData, width, height);
-        } else {
-            convertRGBAToUYVY_CPU(data, imageData, width, height);
-        }
-        
-        ndiVideoFrame.FourCC = NDIlib_FourCC_type_UYVY;
-        ndiVideoFrame.p_data = data->uyvyFrameBuffer.data();
-        ndiVideoFrame.line_stride_in_bytes = width * 2; // UYVY is 2 bytes per pixel
-    } else {
-        // Use RGBA format (legacy compatibility)
-        const size_t frameSize = width * height * 4 * sizeof(uint8_t);
-        if (data->frameBuffer.size() != frameSize) {
-            data->frameBuffer.resize(frameSize);
-        }
-
-        // Convert float RGBA to uint8_t RGBA for NDI with vertical flip
-        float* srcData = static_cast<float*>(imageData);
-        uint8_t* dstData = data->frameBuffer.data();
-        
-        // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
-        for (int y = 0; y < height; ++y) {
-            int srcRow = height - 1 - y; // Flip vertically
-            for (int x = 0; x < width; ++x) {
-                int srcIdx = (srcRow * width + x) * 4;
-                int dstIdx = (y * width + x) * 4;
-                
-                dstData[dstIdx + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 0])) * 255.0f); // R
-                dstData[dstIdx + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 1])) * 255.0f); // G
-                dstData[dstIdx + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 2])) * 255.0f); // B
-                dstData[dstIdx + 3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 3])) * 255.0f); // A
-            }
-        }
-
-        ndiVideoFrame.FourCC = NDIlib_FourCC_type_RGBA;
-        ndiVideoFrame.p_data = dstData;
-        ndiVideoFrame.line_stride_in_bytes = width * 4;
+    // Use RGBA format (legacy compatibility)
+    const size_t frameSize = width * height * 4 * sizeof(uint8_t);
+    if (data->frameBuffer.size() != frameSize) {
+        flushAsyncSend(data);
+        data->frameBuffer.resize(frameSize);
     }
+
+    // Convert float RGBA to uint8_t RGBA for NDI with vertical flip
+    float* srcData = static_cast<float*>(imageData);
+    uint8_t* dstData = data->frameBuffer.data();
+
+    // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
+    for (int y = 0; y < height; ++y) {
+        int srcRow = height - 1 - y; // Flip vertically
+        for (int x = 0; x < width; ++x) {
+            int srcIdx = (srcRow * width + x) * 4;
+            int dstIdx = (y * width + x) * 4;
+
+            dstData[dstIdx + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 0])) * 255.0f); // R
+            dstData[dstIdx + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 1])) * 255.0f); // G
+            dstData[dstIdx + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 2])) * 255.0f); // B
+            dstData[dstIdx + 3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 3])) * 255.0f); // A
+        }
+    }
+
+    ndiVideoFrame.FourCC = NDIlib_FourCC_type_RGBA;
+    ndiVideoFrame.p_data = dstData;
+    ndiVideoFrame.line_stride_in_bytes = width * 4;
 
     // Send the frame (asynchronously if enabled)
     if (data->asyncSending) {
         NDIlib_send_send_video_async_v2(data->ndiSend, &ndiVideoFrame);
+        data->asyncFrameInFlight = true;
     } else {
         NDIlib_send_send_video_v2(data->ndiSend, &ndiVideoFrame);
     }
 }
 
-static void sendNDIFrame(NDIInstanceData* data, void* imageData, int width, int height)
+static bool ensureNDIReady(NDIInstanceData* data)
 {
-    // Ensure NDI is initialized before sending frames
-    if (!data->ndiInitialized && data->enabled) {
+    if (!data->enabled) {
+        return false;
+    }
+    if (!data->ndiInitialized) {
         NDI_LOG("NDI not initialized, attempting to initialize...");
         if (!initializeNDI(data)) {
             NDI_LOG("Failed to initialize NDI, skipping frame");
-            return;
+            return false;
         }
     }
-    
+    return true;
+}
+
+static void sendNDIFrame(NDIInstanceData* data, void* imageData, int width, int height)
+{
+    if (!ensureNDIReady(data)) {
+        return;
+    }
+
     if (data->hdrEnabled) {
         sendHDRFrame(data, imageData, width, height);
     } else {
         sendSDRFrame(data, imageData, width, height);
     }
 }
+
+// Frame arrived in CPU memory: apply the Resolution downscale (box filter)
+// before the conversion+send path. Also repacks a padded row stride — the
+// converters assume tight rows.
+static void sendCPUFrameToNDI(NDIInstanceData* data, void* imageData, int width, int height, int rowBytes)
+{
+    int rowFloats = rowBytes / static_cast<int>(sizeof(float));
+    if (rowFloats < width * 4) {
+        rowFloats = width * 4; // defensive: hosts hand tight positive strides here
+    }
+
+    const int divisor = data->resolutionDivisor;
+    if (divisor <= 1 && rowFloats == width * 4) {
+        sendNDIFrame(data, imageData, width, height);
+        return;
+    }
+
+    int outWidth = 0, outHeight = 0;
+    ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
+
+    const size_t outFloats = static_cast<size_t>(outWidth) * outHeight * 4;
+    if (data->downscaleBuffer.size() < outFloats) {
+        data->downscaleBuffer.resize(outFloats);
+    }
+    ndi_stream::downscaleRGBABox(static_cast<const float*>(imageData), width, height, rowFloats,
+                                 divisor, data->downscaleBuffer.data(), outWidth, outHeight);
+    NDI_LOG("CPU downscale: %dx%d -> %dx%d (divisor %d)", width, height, outWidth, outHeight, divisor);
+    sendNDIFrame(data, data->downscaleBuffer.data(), outWidth, outHeight);
+}
+
+#ifdef __APPLE__
+// Metal render action (issue #5): the host handed src/dst as id<MTLBuffer>
+// device buffers. Passthrough-copy src→dst on the host's queue for the effect
+// output, then feed NDI through the fused GPU downscale+convert kernels — the
+// downscale happens before any readback, so only the small converted frame
+// crosses to the CPU. Any GPU-convert gap (legacy RGBA format, GPU
+// Acceleration off, kernel failure) falls back to a full-frame readback plus
+// the CPU path, so the stream survives every combination.
+static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* dstBuffer,
+                                  int width, int height, int srcRowBytes, int dstRowBytes,
+                                  void* metalQueue)
+{
+    if (!srcBuffer || !dstBuffer) {
+        NDI_LOG("Metal render: missing device buffer, skipping frame");
+        return kOfxStatOK; // matches the CPU path's leniency for absent images
+    }
+
+    // GPU Acceleration may have been enabled after NDI init skipped the context.
+    if (data->gpuAcceleration && !data->gpuContext) {
+        initializeGPUContext(data);
+    }
+    MetalGPUContextRef metalContext =
+        (data->gpuContext && data->gpuContext->initialized) ? data->gpuContext->metalContext : nullptr;
+
+    // Host output first: the effect is a passthrough. No wait — the host
+    // orders its downstream reads on the same queue (cf. the Resolve
+    // GainPlugin sample).
+    const size_t frameBytes = static_cast<size_t>(height) * static_cast<size_t>(dstRowBytes);
+    if (!metal_gpu_copy_buffer(metalContext, metalQueue, srcBuffer, dstBuffer, frameBytes, false)) {
+        NDI_LOG("Metal render: passthrough copy failed");
+        return kOfxStatFailed;
+    }
+
+    if (!ensureNDIReady(data)) {
+        return kOfxStatOK;
+    }
+
+    const int divisor = data->resolutionDivisor;
+    int outWidth = 0, outHeight = 0;
+    ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
+    const int rowFloats = srcRowBytes / static_cast<int>(sizeof(float));
+
+    bool converted = false;
+    if (data->gpuAcceleration && metalContext) {
+        std::lock_guard<std::mutex> lock(data->gpuContext->gpuMutex);
+        if (data->hdrEnabled) {
+            const size_t p216Values = static_cast<size_t>(outWidth) * outHeight * 2;
+            if (data->hdrFrameBuffer.size() != p216Values) {
+                data->hdrFrameBuffer.resize(p216Values);
+            }
+            converted = metal_gpu_buffer_downscale_to_p216(metalContext, metalQueue, srcBuffer,
+                                                           width, height, rowFloats, divisor,
+                                                           outWidth, outHeight, data->hdrFrameBuffer.data());
+            if (converted) {
+                NDI_LOG("GPU-native path: %dx%d Metal frame -> %dx%d P216 (divisor %d)",
+                        width, height, outWidth, outHeight, divisor);
+                sendP216ToNDI(data, outWidth, outHeight);
+            }
+        } else if (data->optimalFormat) {
+            const size_t uyvySize = static_cast<size_t>(outWidth) * outHeight * 2;
+            if (data->uyvyFrameBuffer.size() != uyvySize) {
+                flushAsyncSend(data);
+                data->uyvyFrameBuffer.resize(uyvySize);
+            }
+            converted = metal_gpu_buffer_downscale_to_uyvy(metalContext, metalQueue, srcBuffer,
+                                                           width, height, rowFloats, divisor,
+                                                           outWidth, outHeight, data->uyvyFrameBuffer.data());
+            if (converted) {
+                NDI_LOG("GPU-native path: %dx%d Metal frame -> %dx%d UYVY (divisor %d)",
+                        width, height, outWidth, outHeight, divisor);
+                sendUYVYToNDI(data, outWidth, outHeight);
+            }
+        }
+        // Legacy RGBA output format has no fused kernel — handled by the readback below.
+    }
+
+    if (!converted) {
+        const size_t srcBytes = static_cast<size_t>(height) * static_cast<size_t>(srcRowBytes);
+        if (data->readbackBuffer.size() * sizeof(float) < srcBytes) {
+            data->readbackBuffer.resize(srcBytes / sizeof(float));
+        }
+        if (metal_gpu_read_buffer(metalContext, metalQueue, srcBuffer,
+                                  data->readbackBuffer.data(), srcBytes)) {
+            NDI_LOG("Metal frame full readback -> CPU fallback path (%dx%d, gpu=%d)",
+                    width, height, data->gpuAcceleration ? 1 : 0);
+            sendCPUFrameToNDI(data, data->readbackBuffer.data(), width, height, srcRowBytes);
+        } else {
+            NDI_LOG("Metal frame readback failed — NDI frame skipped");
+        }
+    }
+
+    return kOfxStatOK;
+}
+#endif // __APPLE__
 
 // Plugin functions
 static OfxStatus onLoad(void)
@@ -985,10 +1178,12 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     myData->sourceName = "DaVinci Resolve NDI Output";
     myData->enabled = true;
     myData->frameRate = 25.0;
+    myData->resolutionDivisor = 1;
     
     // GPU acceleration settings (default enabled for better performance)
     myData->gpuAcceleration = true;
     myData->asyncSending = true;
+    myData->asyncFrameInFlight = false;
     myData->optimalFormat = true;
     myData->stopAsyncThread = false;
     
@@ -1018,6 +1213,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamSourceName, &myData->sourceNameParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamEnabled, &myData->enabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamFrameRate, &myData->frameRateParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamResolution, &myData->resolutionParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamGPUAcceleration, &myData->gpuAccelerationParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamAsyncSending, &myData->asyncSendingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamOptimalFormat, &myData->optimalFormatParam, 0);
@@ -1160,10 +1356,22 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     int enabled;
     gParamHost->paramGetValue(myData->enabledParam, &enabled);
     myData->enabled = (enabled != 0);
-    
+
+    int optimalFormat;
+    gParamHost->paramGetValue(myData->optimalFormatParam, &optimalFormat);
+    myData->optimalFormat = (optimalFormat != 0);
+
+    int asyncSending;
+    gParamHost->paramGetValue(myData->asyncSendingParam, &asyncSending);
+    myData->asyncSending = (asyncSending != 0);
+
+    int resolutionChoice = 0;
+    gParamHost->paramGetValue(myData->resolutionParam, &resolutionChoice);
+    myData->resolutionDivisor = ndi_stream::divisorForResolutionChoice(resolutionChoice);
+
     // Log current parameter state for debugging
-    NDI_LOG("Render params - enabled=%d, hdr=%d, gpu=%d", 
-           myData->enabled, myData->hdrEnabled, myData->gpuAcceleration);
+    NDI_LOG("Render params - enabled=%d, hdr=%d, gpu=%d, divisor=%d",
+           myData->enabled, myData->hdrEnabled, myData->gpuAcceleration, myData->resolutionDivisor);
 
     // Get time
     double time;
@@ -1252,13 +1460,31 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     // Copy source to output (pass-through)
     int width = dstRect.x2 - dstRect.x1;
     int height = dstRect.y2 - dstRect.y1;
-    
+
+#ifdef __APPLE__
+    // Metal render: describe() declared kOfxImageEffectPropMetalRenderSupported,
+    // so when the host sets MetalEnabled the image data pointers are
+    // id<MTLBuffer> device buffers, not CPU memory.
+    int metalEnabled = 0;
+    gPropHost->propGetInt(inArgs, kOfxImageEffectPropMetalEnabled, 0, &metalEnabled);
+    if (metalEnabled) {
+        void* metalQueue = nullptr;
+        gPropHost->propGetPointer(inArgs, kOfxImageEffectPropMetalCommandQueue, 0, &metalQueue);
+        OfxStatus metalStatus = renderMetalFrame(myData, srcData, dstData, width, height,
+                                                 srcRowBytes, dstRowBytes, metalQueue);
+        gEffectHost->clipReleaseImage(sourceImg);
+        gEffectHost->clipReleaseImage(outputImg);
+        NDI_LOG("Render completed (Metal)");
+        return metalStatus;
+    }
+#endif
+
     if (srcData && dstData) {
         // Simple copy for float RGBA
         memcpy(dstData, srcData, height * dstRowBytes);
-        
-        // Send to NDI with vertical flip correction
-        sendNDIFrame(myData, srcData, width, height);
+
+        // Send to NDI (downscale + vertical flip handled inside)
+        sendCPUFrameToNDI(myData, srcData, width, height, srcRowBytes);
     }
 
     // Release images
@@ -1292,6 +1518,13 @@ static OfxStatus describe(OfxImageEffectHandle effect)
     gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultiResolution, 0, 0);
     gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipPARs, 0, 0);
     gPropHost->propSetString(props, kOfxImageEffectPluginRenderThreadSafety, 0, kOfxImageEffectRenderFullySafe);
+
+#ifdef __APPLE__
+    // GPU fast path (issue #5): accept frames as Metal buffers so the
+    // downscale+convert runs before any readback. CPU rendering stays
+    // supported — the host chooses per render via kOfxImageEffectPropMetalEnabled.
+    gPropHost->propSetString(props, kOfxImageEffectPropMetalRenderSupported, 0, "true");
+#endif
 
     return kOfxStatOK;
 }
@@ -1386,6 +1619,19 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropDisplayMax, 0, 60.0);
     gPropHost->propSetInt(frameRateProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(frameRateProps, kOfxParamPropParent, 0, "basicGroup");
+
+    // Define stream resolution parameter - in Basic group
+    OfxPropertySetHandle resolutionProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamResolution, &resolutionProps);
+    gPropHost->propSetString(resolutionProps, kOfxPropLabel, 0, kParamResolutionLabel);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropScriptName, 0, kParamResolution);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropHint, 0, kParamResolutionHint);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 0, "Full");
+    gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 1, "Half");
+    gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 2, "Quarter");
+    gPropHost->propSetInt(resolutionProps, kOfxParamPropDefault, 0, 0); // Full
+    gPropHost->propSetInt(resolutionProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropParent, 0, "basicGroup");
 
     // Define GPU acceleration parameter - in Performance group
     OfxPropertySetHandle gpuAccelerationProps = NULL;

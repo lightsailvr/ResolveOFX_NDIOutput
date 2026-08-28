@@ -5,6 +5,17 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-08-28
+
+### Added
+- **GPU-native fast path** (issue #5): the plugin now declares Metal render support (`OfxImageEffectPropMetalRenderSupported`), so Resolve hands frames as Metal device buffers instead of full-resolution float32 CPU copies. Fused Metal kernels box-downscale, vertically flip, and color-convert (UYVY, or P216 for HDR) on the GPU **before** any readback — only the small converted frame crosses to the CPU. At 8160×7200/eye that removes a ~940 MB/frame float RGBA transfer.
+- **Resolution** control (Basic Settings): stream at **Full**, **Half**, or **Quarter** of the incoming frame. Effective on every path — GPU-native, GPU upload-convert, and pure CPU (box filter, `src/StreamResolution.h`).
+- CPU fallback under Metal render: with GPU Acceleration off — or on any kernel failure, or the legacy RGBA output format — the frame is read back whole and the existing CPU path runs, so the stream works in every combination. Log evidence distinguishes the paths (`GPU-native path:` vs `Metal frame full readback -> CPU fallback path`).
+- `make test-metal` — GPU kernel correctness tests against the CPU reference on a real Metal device (no Resolve or NDI SDK needed). `make test` additionally runs the new stream-resolution unit tests.
+
+### Fixed
+- Latent use-after-free: an async NDI send keeps reading the submitted buffer until the next send call, but send buffers were `resize()`d whenever the frame size changed (routine once the Resolution control lands mid-stream switches). In-flight async sends are now completed (NULL-frame flush) before any send-buffer reallocation.
+
 ## [1.3.0] - 2026-08-28
 
 ### Added
