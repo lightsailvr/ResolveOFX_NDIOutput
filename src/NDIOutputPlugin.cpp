@@ -27,13 +27,20 @@
 #ifdef __APPLE__
 #include <os/log.h>
 #define NDI_LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "NDI Plugin: " fmt, ##__VA_ARGS__)
+// For dynamic strings a human must be able to read in `log stream`/`log show`:
+// os_log can redact plain %s arguments as <private> depending on system config.
+#define NDI_LOG_TEXT(str) os_log(OS_LOG_DEFAULT, "NDI Plugin: %{public}s", str)
 #else
 #define NDI_LOG(fmt, ...) printf("NDI Plugin: " fmt "\n", ##__VA_ARGS__)
+#define NDI_LOG_TEXT(str) printf("NDI Plugin: %s\n", str)
 #endif
 
 #include "ofxImageEffect.h"
+#include "ofxImageEffectExt.h"
 #include "ofxMemory.h"
 #include "ofxMultiThread.h"
+
+#include "RenderProbe.h"
 
 #ifdef __APPLE__
 #include "MetalGPUAcceleration.h"
@@ -86,9 +93,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 2
-#define kPluginVersionPatch 4
-#define kPluginVersionString "1.2.4"
+#define kPluginVersionMinor 3
+#define kPluginVersionPatch 0
+#define kPluginVersionString "1.3.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -120,6 +127,11 @@
 #define kParamVersionLabel "versionLabel"
 #define kParamVersionLabelLabel "Plugin Version"
 #define kParamVersionLabelHint "Current version of the NDI Output plugin"
+
+// Diagnostics Parameters
+#define kParamDebugLogging "debugLogging"
+#define kParamDebugLoggingLabel "Log Render Calls"
+#define kParamDebugLoggingHint "Log one 'NDI Plugin: probe' line per render call (page, eye, thumbnail flag, frame time, dimensions, inter-call spacing) to the system log. Capture with scripts/capture_probe_log.sh. Leave off unless diagnosing host behavior."
 
 // HDR Parameters
 #define kParamHDREnabled "hdrEnabled"
@@ -204,11 +216,19 @@ struct NDIInstanceData {
     OfxParamHandle asyncSendingParam;
     OfxParamHandle optimalFormatParam;
     OfxParamHandle versionLabelParam;
+    OfxParamHandle debugLoggingParam;
     OfxParamHandle hdrEnabledParam;
     OfxParamHandle colorSpaceParam;
     OfxParamHandle transferFunctionParam;
     OfxParamHandle maxCLLParam;
     OfxParamHandle maxFALLParam;
+
+    // Diagnostic render-call probe
+    std::string resolvePage;   // page that instantiated this effect (host provides it only at createInstance)
+    std::mutex probeMutex;     // renders are declared fully thread-safe, so probe state needs its own guard
+    long long probeCallCount;
+    std::chrono::steady_clock::time_point probeLastCallTime;
+    bool probeHasLastCallTime;
     
     // NDI variables
     NDIlib_send_instance_t ndiSend;
@@ -946,7 +966,7 @@ static OfxStatus onUnLoad(void)
     return kOfxStatOK;
 }
 
-static OfxStatus createInstance(OfxImageEffectHandle effect)
+static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs)
 {
     NDI_LOG("Creating instance");
     
@@ -979,6 +999,17 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     myData->maxCLL = 1000.0;
     myData->maxFALL = 400.0;
 
+    // Diagnostic probe state; the page is only handed over here, never at render time
+    myData->resolvePage = "";
+    myData->probeCallCount = 0;
+    myData->probeHasLastCallTime = false;
+    if (inArgs) {
+        char* page = nullptr;
+        if (gPropHost->propGetString(inArgs, kOfxImageEffectPropResolvePage, 0, &page) == kOfxStatOK && page) {
+            myData->resolvePage = page;
+        }
+    }
+
     // Cache clip handles
     gEffectHost->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &myData->sourceClip, 0);
     gEffectHost->clipGetHandle(effect, kOfxImageEffectOutputClipName, &myData->outputClip, 0);
@@ -991,6 +1022,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     gParamHost->paramGetHandle(paramSet, kParamAsyncSending, &myData->asyncSendingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamOptimalFormat, &myData->optimalFormatParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamVersionLabel, &myData->versionLabelParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamDebugLogging, &myData->debugLoggingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamColorSpace, &myData->colorSpaceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamTransferFunction, &myData->transferFunctionParam, 0);
@@ -1005,7 +1037,8 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
         initializeNDI(myData);
     }
 
-    NDI_LOG("Instance created successfully");
+    NDI_LOG_TEXT(("Instance created successfully on page '" +
+                  (myData->resolvePage.empty() ? std::string("?") : myData->resolvePage) + "'").c_str());
     return kOfxStatOK;
 }
 
@@ -1140,6 +1173,52 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     OfxRectI renderWindow;
     gPropHost->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &renderWindow.x1);
 
+    // Diagnostic render-call probe: when enabled, log exactly what the host feeds
+    // this render call — before any image fetch, so calls that fail later still show.
+    int debugLogging = 0;
+    gParamHost->paramGetValue(myData->debugLoggingParam, &debugLogging);
+    if (debugLogging) {
+        ndi_probe::ProbeRenderInfo info;
+        info.page = myData->resolvePage.c_str();
+        info.time = time;
+        info.width = renderWindow.x2 - renderWindow.x1;
+        info.height = renderWindow.y2 - renderWindow.y1;
+
+        int eye = 0;
+        info.hasEye = (gPropHost->propGetInt(inArgs, kOfxImageEffectPropEyeToRender, 0, &eye) == kOfxStatOK);
+        info.eye = eye;
+
+        int srcFrame = 0;
+        info.hasSrcFrame = (gPropHost->propGetInt(inArgs, kOfxImageEffectPropSrcFrame, 0, &srcFrame) == kOfxStatOK);
+        info.srcFrame = srcFrame;
+
+        double scale[2] = {0.0, 0.0};
+        info.hasScale = (gPropHost->propGetDoubleN(inArgs, kOfxImageEffectPropRenderScale, 2, scale) == kOfxStatOK);
+        info.scaleX = scale[0];
+        info.scaleY = scale[1];
+
+        OfxPropertySetHandle srcClipProps = NULL;
+        int thumbnail = 0;
+        if (gEffectHost->clipGetPropertySet(myData->sourceClip, &srcClipProps) == kOfxStatOK && srcClipProps) {
+            info.hasThumbnail = (gPropHost->propGetInt(srcClipProps, kOfxImageClipPropThumbnail, 0, &thumbnail) == kOfxStatOK);
+            info.thumbnail = thumbnail;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(myData->probeMutex);
+            auto now = std::chrono::steady_clock::now();
+            info.callIndex = ++myData->probeCallCount;
+            if (myData->probeHasLastCallTime) {
+                info.hasDt = true;
+                info.dtMs = std::chrono::duration<double, std::milli>(now - myData->probeLastCallTime).count();
+            }
+            myData->probeLastCallTime = now;
+            myData->probeHasLastCallTime = true;
+        }
+
+        NDI_LOG_TEXT(ndi_probe::formatProbeLine(info).c_str());
+    }
+
     // Get source image
     OfxPropertySetHandle sourceImg = NULL;
     gEffectHost->clipGetImage(myData->sourceClip, time, NULL, &sourceImg);
@@ -1258,6 +1337,11 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "hdrGroup", &hdrGroupProps);
     gPropHost->propSetString(hdrGroupProps, kOfxPropLabel, 0, "HDR Settings");
     gPropHost->propSetInt(hdrGroupProps, kOfxParamPropGroupOpen, 0, 0); // Closed by default
+
+    OfxPropertySetHandle diagnosticsGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "diagnosticsGroup", &diagnosticsGroupProps);
+    gPropHost->propSetString(diagnosticsGroupProps, kOfxPropLabel, 0, "Diagnostics");
+    gPropHost->propSetInt(diagnosticsGroupProps, kOfxParamPropGroupOpen, 0, 0); // Closed by default
 
     // Define version label parameter (visible read-only display) - in Info group
     OfxPropertySetHandle versionLabelProps = NULL;
@@ -1397,6 +1481,16 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(maxFALLProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(maxFALLProps, kOfxParamPropParent, 0, "hdrGroup");
 
+    // Define debug logging parameter - in Diagnostics group
+    OfxPropertySetHandle debugLoggingProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamDebugLogging, &debugLoggingProps);
+    gPropHost->propSetString(debugLoggingProps, kOfxPropLabel, 0, kParamDebugLoggingLabel);
+    gPropHost->propSetString(debugLoggingProps, kOfxParamPropScriptName, 0, kParamDebugLogging);
+    gPropHost->propSetString(debugLoggingProps, kOfxParamPropHint, 0, kParamDebugLoggingHint);
+    gPropHost->propSetInt(debugLoggingProps, kOfxParamPropDefault, 0, 0); // Default to disabled
+    gPropHost->propSetInt(debugLoggingProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(debugLoggingProps, kOfxParamPropParent, 0, "diagnosticsGroup");
+
     return kOfxStatOK;
 }
 
@@ -1416,7 +1510,7 @@ static OfxStatus pluginMain(const char *action, const void *handle, OfxPropertyS
             return describeInContext((OfxImageEffectHandle) handle, inArgs);
         }
         else if (strcmp(action, kOfxActionCreateInstance) == 0) {
-            return createInstance((OfxImageEffectHandle) handle);
+            return createInstance((OfxImageEffectHandle) handle, inArgs);
         }
         else if (strcmp(action, kOfxActionDestroyInstance) == 0) {
             return destroyInstance((OfxImageEffectHandle) handle);

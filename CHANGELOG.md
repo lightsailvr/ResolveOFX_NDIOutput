@@ -5,6 +5,15 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-28
+
+### Added
+- Render-call diagnostic probe (issue #3): **Log Render Calls** toggle in a new Diagnostics parameter group, off by default. When on, every render action logs one `NDI Plugin: probe …` line carrying the Resolve page, eye (`OfxImageEffectPropEyeToRender`), frame time, source frame, render-window dimensions, render scale, thumbnail flag (`kOfxImageClipPropThumbnail`), and wall-clock spacing since the previous call. When off, the cost is one parameter read per render.
+- Host-property plumbing the stereo work builds on: the instantiating page (`OfxImageEffectPropResolvePage`) is captured at createInstance, and eye/source-frame/thumbnail are read per render.
+- `scripts/capture_probe_log.sh` — tees probe lines into `docs/captures/` for the findings report (`docs/2026-08-28-render-call-probe-findings.md`).
+- `make test` — host-independent unit tests (probe log-line formatter), no Resolve or NDI SDK required.
+- Vendored `openfx/include/ofxImageEffectExt.h` synced with the Resolve 21.0.4 SDK additions (`EyeToRender`, `SrcFrame`, `SrcFilePath`).
+
 ## [1.0.3] - 2024-05-27
 
 ### Removed

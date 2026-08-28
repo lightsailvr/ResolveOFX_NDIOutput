@@ -25,11 +25,17 @@ BUNDLE_NAME = NDIOutput.ofx.bundle
 BUNDLE_EXECUTABLE = $(BUNDLE_NAME)/Contents/macOS/NDIOutput.ofx
 
 # Build targets
-.PHONY: all clean dev install
+.PHONY: all clean dev install test
 
 all: $(BUNDLE_EXECUTABLE)
 
 dev: $(BUNDLE_EXECUTABLE)
+
+# Host-independent unit tests (no Resolve or NDI SDK needed)
+test:
+	mkdir -p build
+	$(CXX) -Isrc tests/test_render_probe.cpp -o build/test_render_probe
+	./build/test_render_probe
 
 $(BUNDLE_EXECUTABLE): $(OBJECTS) | bundle_structure
 	@echo "Building NDI Output Plugin v$(VERSION)"

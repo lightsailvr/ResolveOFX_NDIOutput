@@ -30,6 +30,14 @@ make dev
 
 Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle and all object files.
 
+### Unit tests
+
+```bash
+make test
+```
+
+Host-independent tests (currently the render-probe log-line formatter in [tests/](tests/)) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
+
 ### Install
 
 ```bash
