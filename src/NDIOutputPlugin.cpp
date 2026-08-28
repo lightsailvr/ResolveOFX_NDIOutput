@@ -98,8 +98,8 @@
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
 #define kPluginVersionMinor 6
-#define kPluginVersionPatch 0
-#define kPluginVersionString "1.6.0"
+#define kPluginVersionPatch 1
+#define kPluginVersionString "1.6.1"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -352,6 +352,11 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
 struct SenderHub {
     std::string name;
     std::mutex mutex;                 // serializes pairer state and sends
+    // Lock-free mirror of `sender != nullptr` for the per-render hot path:
+    // the pump workers hold `mutex` for tens of ms (pairer copy + sync send),
+    // and a render action must never queue behind that just to learn the
+    // sender exists (v1.6.1 — this wait was the residual 8K playback drag).
+    std::atomic<bool> senderReady{false};
     int refCount = 0;
     NDIlib_send_instance_t sender = nullptr;
     bool createAttempted = false;
@@ -416,6 +421,7 @@ static bool hubEnsureSenderLocked(SenderHub* hub)
                       "(dns-sd -B _ndi._tcp local.) or the NDI runtime is missing; retrying every 3s").c_str());
         return false;
     }
+    hub->senderReady.store(true, std::memory_order_release);
     NDI_LOG_TEXT(("NDI sender created: '" + hub->name + "'").c_str());
     return true;
 }
@@ -456,6 +462,7 @@ static void hubRelease(SenderHub* hub)
         hubFlushAsyncLocked(hub);
         destroy = (--hub->refCount == 0);
         if (destroy && hub->sender) {
+            hub->senderReady.store(false, std::memory_order_release);
             NDIlib_send_destroy(hub->sender); // blocks until any in-flight send completes
             hub->sender = nullptr;
             NDI_LOG_TEXT(("NDI sender destroyed: '" + hub->name + "'").c_str());
@@ -658,6 +665,10 @@ static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTime
             const auto packT0 = std::chrono::steady_clock::now();
             ndi_stereo::packStereoFrame(meta, layout, left, right, packed.data());
             if (timers) timers->packMs = msSince(packT0);
+            // Return the consumed mate buffer to the pairer's pool — its warm
+            // pages make the next hold a plain memcpy instead of a page-fault
+            // storm inside this mutex.
+            hub->pairer.recycle(std::move(result.matePayload));
 
             ndi_stereo::FrameMeta packedMeta = meta;
             ndi_stereo::packedDims(meta, layout, &packedMeta.width, &packedMeta.height);
@@ -1544,8 +1555,16 @@ static bool ensureNDIReady(NDIInstanceData* data)
             return false;
         }
     }
-    // A missing sender (name locked elsewhere) skips the conversion work too;
-    // creation retries are throttled inside the hub.
+    // Hot path: a healthy sender answers without touching hub->mutex — the
+    // pump workers hold that lock for tens of ms per frame, and a render
+    // action queueing behind them was the residual 8K playback drag (v1.6.1).
+    // hubSubmitFrame re-verifies under the lock, so a sender dying between
+    // this check and the submit is still caught.
+    if (data->hub->senderReady.load(std::memory_order_acquire)) {
+        return true;
+    }
+    // Slow path — a missing sender (name locked elsewhere) skips the
+    // conversion work too; creation retries are throttled inside the hub.
     std::lock_guard<std::mutex> lock(data->hub->mutex);
     const bool ready = hubEnsureSenderLocked(data->hub);
     if (!ready) {

@@ -47,6 +47,8 @@ enum class WireFormat { UYVY8 = 0, P216 = 1, RGBA8 = 2 };
 //   eye-arrival skew, and stay short enough that stale holds never pile up.
 constexpr size_t kMaxPending = 8;
 constexpr uint64_t kPendingTimeoutMs = 1000;
+// Recycled hold-payload buffers kept warm (see EyePairer::recycle).
+constexpr size_t kPayloadPoolCap = 4;
 // A partner eye silent this long means it stopped rendering (Vision switched
 // to Mono, instance gone): degrade to labeled mono rather than freeze. Must
 // sit well above the pending timeout plus the observed arrival skew so a slow
@@ -207,6 +209,9 @@ public:
             stereoActive_ = false;
             fallbackEye_ = eye;
             dropped_ += pending_.size();
+            for (auto& entry : pending_) {
+                recycle(std::move(entry.second.payload));
+            }
             pending_.clear();
             result.action = SubmitAction::SendMono;
             return result;
@@ -227,20 +232,38 @@ public:
             }
             // Mismatched partner (e.g. format/resolution param settling):
             // unpackable — drop the stale held frame, hold the new one.
+            recycle(std::move(it->second.payload));
             pending_.erase(it);
             ++dropped_;
         }
 
-        // No partner yet: hold this frame until it arrives.
+        // No partner yet: hold this frame until it arrives. The hold buffer
+        // comes from the recycle pool — a fresh multi-MB vector per held eye
+        // costs mmap + zero-fill page faults on every pair (measured ~30 ms
+        // at 8K under playback load, inside the caller's lock); warm pages
+        // make it a plain memcpy.
         PendingFrame& slot = pending_[time];
         slot.eye = eye;
         slot.meta = meta;
+        if (slot.payload.capacity() == 0) {
+            slot.payload = takePooled();
+        }
         slot.payload.assign(payload, payload + payloadBytes);
         slot.heldAtMs = nowMs;
         slot.heldSeq = ++holdSeq_;
         evictOverCapacity();
         result.action = SubmitAction::Hold;
         return result;
+    }
+
+    // Return a payload buffer for reuse (e.g. a consumed matePayload after
+    // packing). Capacity is kept; contents are discarded.
+    void recycle(std::vector<uint8_t>&& v)
+    {
+        if (pool_.size() < kPayloadPoolCap && v.capacity() > 0) {
+            v.clear();
+            pool_.push_back(std::move(v));
+        }
     }
 
     StreamMode mode() const
@@ -263,10 +286,21 @@ private:
         unsigned long long heldSeq = 0; // hold order (heldAtMs can tie)
     };
 
+    std::vector<uint8_t> takePooled()
+    {
+        if (pool_.empty()) {
+            return {};
+        }
+        std::vector<uint8_t> v = std::move(pool_.back());
+        pool_.pop_back();
+        return v;
+    }
+
     void sweepStalePending(uint64_t nowMs)
     {
         for (auto it = pending_.begin(); it != pending_.end();) {
             if (nowMs - it->second.heldAtMs > kPendingTimeoutMs) {
+                recycle(std::move(it->second.payload));
                 it = pending_.erase(it);
                 ++dropped_;
             } else {
@@ -284,6 +318,7 @@ private:
                     oldest = it;
                 }
             }
+            recycle(std::move(oldest->second.payload));
             pending_.erase(oldest);
             ++dropped_;
         }
@@ -292,6 +327,7 @@ private:
     // Keyed on the exact frame time — mates share it bit-for-bit (probe-verified),
     // and exact double equality keeps fractional (retimed) times working.
     std::map<double, PendingFrame> pending_;
+    std::vector<std::vector<uint8_t>> pool_; // recycled hold-payload buffers
     bool stereoActive_ = false;
     int fallbackEye_ = -1;             // -1 = never fallen back; else the eye still flowing
     uint64_t stereoActivatedMs_ = 0;
