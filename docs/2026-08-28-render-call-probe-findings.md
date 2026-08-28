@@ -3,7 +3,7 @@
 **Date started:** 2026-08-28 · **Plugin:** NDIOutput ≥ v1.3.0 · **Host:** DaVinci Resolve Studio 21.0.4, macOS 26.x
 **Issue:** [#3](https://github.com/lightsailvr/ResolveOFX_NDIOutput/issues/3) — instrument every render call (eye, page, thumbnail, cadence) so host behavior is observed, not guessed.
 
-**Status: instrumentation shipped (v1.3.0); scenario 2 Edit-page captured — headline: the right eye never renders on the Edit page.** Remaining: scenario 2 Color page + palette-armed variant, scenarios 1, 3, 4. Each capture needs a human at the Resolve machine — playback cannot be scripted (the Resolve API has no transport control, see [LEARNINGS.md](../LEARNINGS.md) §2). Fill in each *Findings* section from the capture files and flip this line to **complete** when all four are in.
+**Status: instrumentation shipped (v1.3.0); scenario 2 fully captured (Mono + Stereo vision, both pages).** Headline: with the Stereo 3D palette at **Vision: Stereo, both eyes render every frame — each through its own plugin instance** (R first, L +32 ms, keyed by `time`/`src`); at Vision: Mono the right eye never renders. Side-discovery: the current plugin's NDI output goes **black** in stereo mode (sender lifecycle bug, feeds issue #6). Remaining: scenarios 1, 3, 4. Each capture needs a human at the Resolve machine — playback cannot be scripted (the Resolve API has no transport control, see [LEARNINGS.md](../LEARNINGS.md) §2). Fill in each *Findings* section from the capture files and flip this line to **complete** when all four are in.
 
 ---
 
@@ -77,7 +77,18 @@ Supporting observations from the same capture:
 - `page=?` on all calls — **Resolve 21.0.4 did not deliver `OfxImageEffectPropResolvePage` at createInstance** for this instance (created at project load), contradicting the shipped header's stated delivery point. Needs a re-test with the effect freshly added from the UI on a known page.
 - `src − time = 215400` constant on every line — `src` tracks the timeline frame exactly (clip offset), so it remains the candidate L/R pairing key if per-eye calls ever appear.
 
-**Still pending for this scenario:** the Color-page capture, and the variant with the Stereo 3D palette Out mode armed (Side by Side) — the last hope for forcing right-eye renders on the Edit page. A longer playback stretch (≥15 s) would also firm up the cadence numbers; `dt` here includes the plugin's own ~full-frame processing at 4096², so treat ~230 ms as an upper bound on host cadence, not a measurement of it.
+(That first capture ran with the Stereo 3D palette at **Vision: Mono**. The follow-up below flips it. Throughout, `dt` includes the plugin's own full-frame processing at 4096², so treat ~230 ms as an upper bound on host cadence, not a measurement of it.)
+
+**Findings — Stereo 3D palette Vision: Stereo (captured 2026-08-28, [Edit page](captures/2026-08-28-stereo-timeline-edit-page-vision-stereo.log), [Color page](captures/2026-08-28-stereo-timeline-color-page.log)):**
+
+Flipping the Color-page **Stereo 3D palette from Vision: Mono to Vision: Stereo** — with **Out left at None** — changes the seam completely, and answers the key unknown in the affirmative:
+
+- **Both eyes render, every frame, on the Edit page and the Color page alike.** 26/26 (Edit) and 24/24 (Color) perfectly paired L/R calls, with clean monotonic playback stretches in both captures (7717→7739, 7765→7787). Still never a packed frame — each call is a single eye at 4096×4096.
+- **Each eye renders through its own plugin instance.** The probe counters expose two instances: the original one (left eye — its counter continued #110+ from the first capture) and a second, right-eye instance Resolve created when Vision went Stereo (counter from ~#1). Both persist across page switches. **Instance-local state can never pair eyes — the pairer must be process-global.**
+- **Pairing key confirmed:** the two calls of a pair share `time` (and `src`) exactly; R renders first, L follows by 28–71 ms (avg 32 ms); zero unpaired frames across all 50 pairs.
+- Combined with the Vision: Mono capture: the stereo tap's operating requirement is just "set the project to Stereo vision" — no mux Out mode needed.
+
+**Casualty discovered — the NDI feed went black in stereo mode.** The unified log at the time shows both instances in a failure loop, in R/L pair cadence: `NDIlib_send_create` failing on every render attempt ("Failed to create NDI sender…"; the name itself logs as `<private>` — os_log redaction). Reading the code against the log: both instances create senders with the **identical default source name** (duplicate-name registration is the prime suspect for the second create failing), and `initializeNDI`'s failure path calls **`NDIlib_destroy()`** — tearing the process-wide NDI library out from under the other instance's healthy sender. The failing instance retries every frame, so the healthy one can never recover. First hard requirement for the stereo work (issue #6): process-shared NDI lifecycle — single sender ownership (or eye-suffixed names) and no global `NDIlib_destroy()` while another instance is live.
 
 ### Scenario 3 — Resolve 21 "Standard Immersive" VR180 project
 
@@ -103,10 +114,11 @@ With **Log Render Calls off**, the probe costs one boolean parameter read and on
 
 | Question | Answer | Evidence |
 |---|---|---|
-| Second eye during Edit-page playback? | **No — left eye only**, incl. a 16-frame monotonic playback stretch (pending confirmation with palette armed) | [stereo-timeline-edit-page](captures/2026-08-28-stereo-timeline-edit-page.log), scenario 2 findings |
-| Second eye on Color page / with palette armed? | _pending_ | |
-| Pairing key for L/R (same `time`? same `src`?) | _pending R sightings_ — `src` tracks `time` exactly (constant clip offset), so it's the candidate | same capture |
+| Second eye during Edit-page playback? | **Depends on Stereo 3D palette Vision.** Vision: Mono → left only, always. Vision: Stereo (Out: None suffices) → **both eyes, every frame**, via a second per-eye plugin instance | [mono-vision](captures/2026-08-28-stereo-timeline-edit-page.log), [stereo-vision](captures/2026-08-28-stereo-timeline-edit-page-vision-stereo.log) |
+| Second eye on Color page / with palette armed? | **Identical to Edit page** — same instances, same pairing, same cadence | [color-page](captures/2026-08-28-stereo-timeline-color-page.log) |
+| Pairing key for L/R (same `time`? same `src`?) | **Both** — pairs share `time` and `src` exactly; R first, L +32 ms avg (28–71 ms); 50/50 pairs matched, zero unpaired. Arrives on **separate instances** → pairing must be process-global | stereo-vision captures |
 | VR180 Standard Immersive: per-eye or packed? | _pending_ | |
 | Proxy mode: `scale=` vs `dim=`? | _pending_ | |
-| Page property actually delivered at createInstance? | **No** (instance created at project load) — `page=?` on all calls; retest with effect freshly added per page | same capture |
-| Thumbnail renders observed (`thumb=1`)? | **Yes** — 184×92 filmstrip renders, correctly flagged | same capture |
+| Page property actually delivered at createInstance? | **No** — `page=?` on all 192 calls, including the freshly created right-eye instance; don't build on this property | all captures |
+| Thumbnail renders observed (`thumb=1`)? | **Yes** — 184×92 filmstrip renders, correctly flagged | mono-vision capture |
+| NDI output usable in stereo mode today? | **No — feed goes black**: second instance's sender create fails (duplicate default name suspected) and its failure path `NDIlib_destroy()`s the library under the healthy sender | unified log 12:08, scenario 2 findings |

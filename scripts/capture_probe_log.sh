@@ -15,6 +15,12 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="$REPO_ROOT/docs/captures"
 mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/$(date +%F)-$SLUG.log"
+# Never overwrite an earlier run of the same scenario: suffix -2, -3, …
+N=2
+while [ -e "$OUT" ]; do
+    OUT="$OUT_DIR/$(date +%F)-$SLUG-$N.log"
+    N=$((N + 1))
+done
 
 echo "Capturing 'NDI Plugin: probe' lines to:"
 echo "  $OUT"

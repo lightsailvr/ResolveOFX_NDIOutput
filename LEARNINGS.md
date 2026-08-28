@@ -76,7 +76,7 @@ From the feasibility research in [docs/2026-08-28-resolve-stereo-program-tap-fea
 | Smart/Render Cache caches OFX node output | NDI feed **freezes** mid-session | Resolve stopped calling the render action; it's not a plugin bug. Keep Render Cache **off** in the test project |
 | Background caching | "Phantom" frames while playback is stopped | Resolve fires renders while parked |
 | Timeline Proxy Mode | Stream resolution silently halves/quarters | The plugin receives proxy-sized frames |
-| Stereo timelines | Only ever single-eye frames | Each eye is a separate render call tagged `kOfxImageEffectPropEyeToRender`; a packed L+R frame never reaches OFX. Central to the upcoming stereo work |
+| Stereo timelines | Only ever single-eye frames | Probe-verified 2026-08-28: a packed L+R frame never reaches OFX. With Stereo 3D palette **Vision: Mono**, only the left eye ever renders; with **Vision: Stereo** (Out: None suffices), both eyes render every frame — **each through its own plugin instance** (R first, L ~32 ms later, same `time`/`src`). Pairing must be cross-instance. See docs/2026-08-28-render-call-probe-findings.md |
 
 **Rule: when the feed misbehaves, check these four before suspecting the plugin.**
 
@@ -128,10 +128,20 @@ Seeded from release notes and the 2026-08-28 cleanup. Newest entries at the bott
 
 ### 2026-08-28 — Unified-log visibility gotchas found while building the render probe (v1.3.0)
 **Symptom:** two ways diagnostic log lines can silently become unreadable: (1) os_log can redact dynamic `%s` arguments as `<private>` in `log stream`/`log show` depending on system logging config; (2) on this machine's interactive zsh, bare `log` invokes a shell profile function, not `/usr/bin/log` — it fails with "too many arguments".
-**Root cause:** (1) unified logging treats dynamic strings as private by default unless the format says `%{public}s` (P — Apple unified-logging docs; L — on this machine plain `%s` currently *does* show, so the risk is config-dependent, not constant); (2) a `log` function in the user's shell profile shadows the binary (L).
+**Root cause:** (1) unified logging treats dynamic strings as private by default unless the format says `%{public}s` (P — Apple unified-logging docs; L — **confirmed inside Resolve**: the plugin's existing `%s` sender-name log shows `'<private>'` in `log show`, while the same code in an unsigned scratch binary printed plainly — redaction is per-process, so never trust a scratch-binary test for it); (2) a `log` function in the user's shell profile shadows the binary (L).
 **Fix:** probe lines and other must-read dynamic strings go through the `NDI_LOG_TEXT` macro (`%{public}s`); `scripts/capture_probe_log.sh` calls `/usr/bin/log` by absolute path.
 **Validated by:** Tier 0 + a scratch os_log binary checked with `/usr/bin/log show` (both `%s` and `%{public}s` visible here today).
 **Rule:** any log line a human must read for diagnostics uses `%{public}s` (via `NDI_LOG_TEXT`), and scripts/sessions invoke `/usr/bin/log`, never bare `log`.
+
+### 2026-08-28 — Capture script silently overwrote a same-day re-run
+**Symptom:** re-running `./scripts/capture_probe_log.sh <slug>` on the same day replaced the previous capture file; the first stereo capture survived only because it was already committed.
+**Root cause:** output filename was date+slug only, and `tee` truncates.
+**Fix:** the script now suffixes `-2`, `-3`, … when the file exists.
+**Validated by:** re-run produces a new file; original untouched.
+**Rule:** any evidence-producing script must never overwrite prior evidence — suffix, don't truncate.
+
+### OPEN — Stereo vision mode blacks out the NDI feed (found 2026-08-28, probe session)
+With the Stereo 3D palette at Vision: Stereo, Resolve creates a **second plugin instance for the right eye**. Both instances create NDI senders with the same default source name; the unified log shows `NDIlib_send_create` failing every render in R/L pair cadence, and `initializeNDI`'s failure path calls **`NDIlib_destroy()`** — killing the process-wide NDI library under the other instance's healthy sender, so the feed goes black and never recovers (L). Duplicate-name registration is the suspected trigger for the first failure (T — confirm once sender names log publicly). Fix belongs to issue #6: process-shared NDI lifecycle, single sender ownership or eye-suffixed names, and never `NDIlib_destroy()` while another instance is live.
 
 ### OPEN — Windows/CUDA build failing (as of 2026-08-28)
 Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
