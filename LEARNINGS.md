@@ -126,6 +126,13 @@ Seeded from release notes and the 2026-08-28 cleanup. Newest entries at the bott
 - **Docs had drifted badly:** README pointed at v1.1.4 as latest (actual: 1.2.4), required a `/Library/NDI_Advanced_SDK` symlink no build file references, and claimed `make` auto-increments versions (it doesn't); QUICKSTART referenced build scripts deleted in `50eacc1`. **Rule:** [BUILD.md](BUILD.md) is the single source of truth for build/install and gets updated in the same PR as any build change.
 - **Bundle layout quirk (T):** we build to `Contents/macOS/` (lowercase) while Resolve's cache records the conventional `Contents/MacOS/`. Works because APFS is case-insensitive here; would break on a case-sensitive volume. Candidate one-line fix in the Makefile — retest plugin load after changing.
 
+### 2026-08-28 — Unified-log visibility gotchas found while building the render probe (v1.3.0)
+**Symptom:** two ways diagnostic log lines can silently become unreadable: (1) os_log can redact dynamic `%s` arguments as `<private>` in `log stream`/`log show` depending on system logging config; (2) on this machine's interactive zsh, bare `log` invokes a shell profile function, not `/usr/bin/log` — it fails with "too many arguments".
+**Root cause:** (1) unified logging treats dynamic strings as private by default unless the format says `%{public}s` (P — Apple unified-logging docs; L — on this machine plain `%s` currently *does* show, so the risk is config-dependent, not constant); (2) a `log` function in the user's shell profile shadows the binary (L).
+**Fix:** probe lines and other must-read dynamic strings go through the `NDI_LOG_TEXT` macro (`%{public}s`); `scripts/capture_probe_log.sh` calls `/usr/bin/log` by absolute path.
+**Validated by:** Tier 0 + a scratch os_log binary checked with `/usr/bin/log show` (both `%s` and `%{public}s` visible here today).
+**Rule:** any log line a human must read for diagnostics uses `%{public}s` (via `NDI_LOG_TEXT`), and scripts/sessions invoke `/usr/bin/log`, never bare `log`.
+
 ### OPEN — Windows/CUDA build failing (as of 2026-08-28)
 Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
 
