@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.5.0] - 2026-08-28
 
-> Unit-tested and Tier 0-verified; Tier 1–2 (Resolve + VR.NDI on Quest) validation pending per the LEARNINGS.md testing loop.
+> Validated 2026-08-28 through the LEARNINGS.md testing loop: unit tests, Tier 0, and Tier 1–2 in Resolve (stereo timeline streams packed stereo; mono unchanged).
 
 ### Added
 - **Stereo eye pairing** (issue #6): on a native stereo timeline with the Stereo 3D palette at Vision: Stereo, Resolve renders each eye through its own plugin instance; the plugin now pairs the L/R renders for the same frame time — process-globally, across instances — and sends exactly **one packed NDI frame per pair**. Pairing follows the probe findings: keyed on frame time (never arrival order), tolerant of either eye leading by hundreds of ms and of in-eye time reversal, duplicate parked re-renders replace the held frame, and unmated frames age out bounded (`src/StereoPair.h`, unit-tested host-free via `make test`).
