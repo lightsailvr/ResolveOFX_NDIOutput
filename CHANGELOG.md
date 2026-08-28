@@ -5,6 +5,18 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-28
+
+### Added
+- **Stereo eye pairing** (issue #6): on a native stereo timeline with the Stereo 3D palette at Vision: Stereo, Resolve renders each eye through its own plugin instance; the plugin now pairs the L/R renders for the same frame time — process-globally, across instances — and sends exactly **one packed NDI frame per pair**. Pairing follows the probe findings: keyed on frame time (never arrival order), tolerant of either eye leading by hundreds of ms and of in-eye time reversal, duplicate parked re-renders replace the held frame, and unmated frames age out bounded (`src/StereoPair.h`, unit-tested host-free via `make test`).
+- **Stereo Packing** parameter (new Stereo group): Side-by-Side (left eye left) or Top-Bottom (left eye top), matching VR.NDI's projection modes on Quest.
+- **Stream Status** parameter: live display of what the stream carries — Mono, Stereo (SbS/TB), a labeled single-eye fallback ("right eye missing — sending left eye only") when the partner eye starves (~1.5 s), or the sender-creation failure. Starvation never freezes or deadlocks the stream; the partner returning restores stereo automatically.
+- Filmstrip thumbnail renders are dropped while stereo is active (a 184×92 frame must not hijack the packed stream); mono behavior is unchanged.
+
+### Fixed
+- **Stereo mode blacked out the NDI feed, then locked the source name machine-wide** (found in the issue #3 probe session; root-caused in LEARNINGS.md): both per-eye instances created senders under the same name — NDI 6.2 fails a duplicate same-machine name outright — and the failure path's `NDIlib_destroy()` tore the process-wide NDI library out from under the healthy sender, leaking its Bonjour advertisement until Resolve exited. Senders are now **process-shared and refcounted** (one sender per source name, which stereo requires anyway), `NDIlib_destroy()` is never called, and sender-create retries are throttled to every 3 s with the failure surfaced in Stream Status.
+- A saved project's NDI Source Name is honored at project load: parameter values are read at createInstance, so the first sender no longer briefly registers under the default name.
+
 ## [1.4.0] - 2026-08-28
 
 ### Added

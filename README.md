@@ -13,6 +13,7 @@ A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Netw
   - Rec.2020, DCI-P3, and Rec.709 color spaces
   - Configurable Max Content Light Level (CLL) and Max Frame Average Light Level (FALL)
   - HDR metadata embedding for proper downstream handling
+- **Stereo Timelines**: On a native stereo timeline (Stereo 3D palette at **Vision: Stereo**), the plugin pairs the left/right eye renders per frame and streams **one packed frame** — Side-by-Side or Top-Bottom (Stereo group) — for VR receivers such as VR.NDI on Quest. If one eye stops rendering, the stream degrades to labeled single-eye mono (see the **Stream Status** parameter) instead of freezing. Mono timelines are unaffected.
 - **NDI Advanced SDK**: Uses NDI Advanced SDK v6.1.1 for enhanced features and performance
 - **Real-time Streaming**: Low-latency video streaming over network
 - **Pass-through Design**: Maintains original video quality while streaming
@@ -127,9 +128,10 @@ The project uses a modern, streamlined build system:
 ### No NDI Source Visible
 
 1. **Check Plugin Parameters**: Ensure "Enable NDI Output" is checked
-2. **Verify Network**: Ensure devices are on the same network
-3. **Check NDI Tools**: Use NDI Video Monitor to verify source availability
-4. **Restart DaVinci Resolve**: Sometimes required after parameter changes
+2. **Check Stream Status** (Stereo group): "No NDI sender — name unavailable" means the source name is already advertised on this machine (another app, or a leaked registration from a crashed session — `dns-sd -B _ndi._tcp local.` shows it). Change the NDI Source Name, or quit the process holding it
+3. **Verify Network**: Ensure devices are on the same network
+4. **Check NDI Tools**: Use NDI Video Monitor to verify source availability
+5. **Restart DaVinci Resolve**: Sometimes required after parameter changes
 
 ### HDR Issues
 

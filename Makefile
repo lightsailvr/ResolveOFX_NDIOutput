@@ -38,6 +38,8 @@ test:
 	./build/test_render_probe
 	$(CXX) -Isrc tests/test_stream_resolution.cpp -o build/test_stream_resolution
 	./build/test_stream_resolution
+	$(CXX) -Isrc tests/test_stereo_pair.cpp -o build/test_stereo_pair
+	./build/test_stereo_pair
 
 # GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
 test-metal: src/MetalGPUAcceleration.o
