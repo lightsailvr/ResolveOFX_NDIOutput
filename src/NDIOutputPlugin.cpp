@@ -527,6 +527,24 @@ static std::string hubComposeStatusLocked(SenderHub* hub, NDIInstanceData* data)
     }
 }
 
+// Caller holds hub->mutex. Recompose the stream status; log hub-level
+// changes once, and mark the SUBMITTING instance's param dirty whenever ITS
+// last-pushed value differs — change detection is per instance, so both
+// per-eye instances (which back the same node param) converge on the live
+// status regardless of which one noticed the transition.
+static void hubUpdateStatusLocked(SenderHub* hub, NDIInstanceData* data)
+{
+    std::string status = hubComposeStatusLocked(hub, data);
+    if (status != hub->status) {
+        hub->status = status;
+        NDI_LOG_TEXT(("Stream status: " + status).c_str());
+    }
+    if (status != data->statusParamValue) {
+        data->statusParamValue = status;
+        data->statusParamDirty = true;
+    }
+}
+
 // The single entry point every converted frame goes through. Consults the
 // process-global pairer: mono frames stream unchanged (zero extra copies),
 // stereo frames wait for their partner and go out as ONE packed frame.
@@ -541,15 +559,10 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
 
     std::lock_guard<std::mutex> lock(hub->mutex);
     if (!hubEnsureSenderLocked(hub)) {
-        // Still surface the failure in the status param — this is the
-        // user-visible symptom of the sender-name lockout.
-        std::string status = hubComposeStatusLocked(hub, data);
-        if (status != hub->status) {
-            hub->status = status;
-            data->statusParamValue = status;
-            data->statusParamDirty = true;
-            NDI_LOG_TEXT(("Stream status: " + status).c_str());
-        }
+        // Surface the failure — this is the user-visible symptom of the
+        // sender-name lockout. (Defensive: the send paths normally bail in
+        // ensureNDIReady before reaching here, which also updates status.)
+        hubUpdateStatusLocked(hub, data);
         return;
     }
 
@@ -597,6 +610,12 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
         case ndi_stereo::SubmitAction::Hold:
         case ndi_stereo::SubmitAction::Drop:
         default:
+            // No send this call: complete any in-flight async send now. Its
+            // buffer belongs to an instance that will overwrite it on its
+            // next conversion, and with Hold the next real send could be
+            // arbitrarily far away — the async-buffer rule (LEARNINGS
+            // 2026-08-28) demands a send or NULL flush closes every window.
+            hubFlushAsyncLocked(hub);
             break;
     }
 
@@ -606,13 +625,7 @@ static void hubSubmitFrame(NDIInstanceData* data, ndi_stereo::WireFormat format,
         hub->lastLoggedDrops = hub->pairer.droppedFrames();
     }
 
-    std::string status = hubComposeStatusLocked(hub, data);
-    if (status != hub->status) {
-        hub->status = status;
-        data->statusParamValue = status;
-        data->statusParamDirty = true;
-        NDI_LOG_TEXT(("Stream status: " + status).c_str());
-    }
+    hubUpdateStatusLocked(hub, data);
 }
 
 // GPU Acceleration Functions
@@ -963,7 +976,7 @@ static bool initializeNDI(NDIInstanceData* data)
     }
 
     data->ndiInitialized = true;
-    NDI_LOG("NDI attached with source name '%s'", data->sourceName.c_str());
+    NDI_LOG_TEXT(("NDI attached with source name '" + data->sourceName + "'").c_str());
     NDI_LOG("GPU Acceleration: %s, Async Sending: %s, Optimal Format: %s",
            data->gpuAcceleration ? "Enabled" : "Disabled",
            data->asyncSending ? "Enabled" : "Disabled",
@@ -1260,7 +1273,13 @@ static bool ensureNDIReady(NDIInstanceData* data)
     // A missing sender (name locked elsewhere) skips the conversion work too;
     // creation retries are throttled inside the hub.
     std::lock_guard<std::mutex> lock(data->hub->mutex);
-    return hubEnsureSenderLocked(data->hub);
+    const bool ready = hubEnsureSenderLocked(data->hub);
+    if (!ready) {
+        // No frame will be submitted this render, so surface the lockout in
+        // Stream Status from here — hubSubmitFrame won't get the chance.
+        hubUpdateStatusLocked(data->hub, data);
+    }
+    return ready;
 }
 
 static void sendNDIFrame(NDIInstanceData* data, void* imageData, int width, int height)

@@ -36,7 +36,7 @@ Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (de
 make test
 ```
 
-Host-independent tests in [tests/](tests/) (render-probe log-line formatter, stream-resolution divisor/dims/box-downscale) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
+Host-independent tests in [tests/](tests/) (render-probe log-line formatter, stream-resolution divisor/dims/box-downscale, and the stereo eye-pairer/packers — pairing decisions, reorder window, starvation fallback, SbS/TB byte layout) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
 
 ```bash
 make test-metal
