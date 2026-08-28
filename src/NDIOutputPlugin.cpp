@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <map>
 #include <memory>
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -27,13 +29,22 @@
 #ifdef __APPLE__
 #include <os/log.h>
 #define NDI_LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "NDI Plugin: " fmt, ##__VA_ARGS__)
+// For dynamic strings a human must be able to read in `log stream`/`log show`:
+// os_log can redact plain %s arguments as <private> depending on system config.
+#define NDI_LOG_TEXT(str) os_log(OS_LOG_DEFAULT, "NDI Plugin: %{public}s", str)
 #else
 #define NDI_LOG(fmt, ...) printf("NDI Plugin: " fmt "\n", ##__VA_ARGS__)
+#define NDI_LOG_TEXT(str) printf("NDI Plugin: %s\n", str)
 #endif
 
 #include "ofxImageEffect.h"
+#include "ofxImageEffectExt.h"
 #include "ofxMemory.h"
 #include "ofxMultiThread.h"
+
+#include "RenderProbe.h"
+#include "StereoPair.h"
+#include "StreamResolution.h"
 
 #ifdef __APPLE__
 #include "MetalGPUAcceleration.h"
@@ -86,9 +97,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 2
-#define kPluginVersionPatch 4
-#define kPluginVersionString "1.2.4"
+#define kPluginVersionMinor 6
+#define kPluginVersionPatch 1
+#define kPluginVersionString "1.6.1"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -102,6 +113,19 @@
 #define kParamFrameRate "frameRate"
 #define kParamFrameRateLabel "Frame Rate"
 #define kParamFrameRateHint "Frame rate for NDI output"
+
+#define kParamResolution "resolution"
+#define kParamResolutionLabel "Resolution"
+#define kParamResolutionHint "NDI stream resolution as a fraction of the incoming frame: Full, Half, or Quarter. When the host provides GPU frames, the downscale runs on the GPU before any readback."
+
+// Stereo Parameters (issue #6)
+#define kParamStereoPacking "stereoPacking"
+#define kParamStereoPackingLabel "Stereo Packing"
+#define kParamStereoPackingHint "How a stereo pair is arranged in the single outgoing NDI frame when the timeline renders both eyes (Stereo 3D palette at Vision: Stereo): Side-by-Side (left eye left) or Top-Bottom (left eye top). Mono timelines are unaffected."
+
+#define kParamStereoStatus "stereoStatus"
+#define kParamStereoStatusLabel "Stream Status"
+#define kParamStereoStatusHint "What the stream is currently carrying: Mono, a packed stereo pair, a labeled single-eye fallback when the partner eye stops rendering, or the sender-creation failure (e.g. the NDI name is already in use on this machine)."
 
 // GPU Acceleration Parameters
 #define kParamGPUAcceleration "gpuAcceleration"
@@ -120,6 +144,11 @@
 #define kParamVersionLabel "versionLabel"
 #define kParamVersionLabelLabel "Plugin Version"
 #define kParamVersionLabelHint "Current version of the NDI Output plugin"
+
+// Diagnostics Parameters
+#define kParamDebugLogging "debugLogging"
+#define kParamDebugLoggingLabel "Log Render Calls"
+#define kParamDebugLoggingHint "Log one 'NDI Plugin: probe' line per render call (page, eye, thumbnail flag, frame time, dimensions, inter-call spacing) to the system log. Capture with scripts/capture_probe_log.sh. Leave off unless diagnosing host behavior."
 
 // HDR Parameters
 #define kParamHDREnabled "hdrEnabled"
@@ -190,6 +219,11 @@ struct AsyncFrameData {
     std::chrono::high_resolution_clock::time_point timestamp;
 };
 
+struct SenderHub; // process-shared NDI sender + eye pairer (defined below)
+#ifdef __APPLE__
+struct AsyncPump; // per-instance off-render-thread NDI worker (defined below)
+#endif
+
 // Private instance data
 struct NDIInstanceData {
     // Clip handles
@@ -200,23 +234,59 @@ struct NDIInstanceData {
     OfxParamHandle sourceNameParam;
     OfxParamHandle enabledParam;
     OfxParamHandle frameRateParam;
+    OfxParamHandle resolutionParam;
     OfxParamHandle gpuAccelerationParam;
     OfxParamHandle asyncSendingParam;
     OfxParamHandle optimalFormatParam;
     OfxParamHandle versionLabelParam;
+    OfxParamHandle debugLoggingParam;
+    OfxParamHandle stereoPackingParam;
+    OfxParamHandle stereoStatusParam;
     OfxParamHandle hdrEnabledParam;
     OfxParamHandle colorSpaceParam;
     OfxParamHandle transferFunctionParam;
     OfxParamHandle maxCLLParam;
     OfxParamHandle maxFALLParam;
-    
-    // NDI variables
-    NDIlib_send_instance_t ndiSend;
+
+    // Diagnostic render-call probe
+    std::string resolvePage;   // page that instantiated this effect (host provides it only at createInstance)
+    std::mutex probeMutex;     // renders are declared fully thread-safe, so probe state needs its own guard
+    long long probeCallCount;
+    std::chrono::steady_clock::time_point probeLastCallTime;
+    bool probeHasLastCallTime;
+
+    // In-render stage timers ("mtimer" log line, issue #5 diagnosis). Written
+    // only when Log Render Calls is on; fields are per-instance, and the hub
+    // writes the submit splits into the SUBMITTING instance's fields.
+    bool timersEnabled;
+    double timerBlitMs, timerConvMs, timerFlushMs, timerPackMs, timerSendMs;
+
+    // NDI variables. The sender lives in a process-shared hub — Resolve
+    // renders each stereo eye through its own plugin instance, so senders and
+    // pairing can never be instance state (see the SenderHub comment below).
+    SenderHub* hub;
+#ifdef __APPLE__
+    AsyncPump* pump;           // created on first async submit; drained in shutdownNDI
+#endif
     bool ndiInitialized;
     std::string sourceName;
     bool enabled;
     double frameRate;
-    
+
+    // Per-render-call context for the stereo pairer, stashed by render()
+    // exactly like resolutionDivisor (per-instance renders are serialized —
+    // every conversion buffer below already relies on that).
+    int renderEye;             // ndi_stereo::kEyeLeft / kEyeRight
+    double renderTime;         // kOfxPropTime — the pairing key
+    bool renderIsThumbnail;
+    int stereoPacking;         // 0 = Side-by-Side, 1 = Top-Bottom
+    // Stream status handoff: the pump worker composes status off-thread while
+    // render threads flush it to the UI param, so both fields live behind
+    // their own small mutex (taken after hub->mutex, never the reverse).
+    std::mutex statusMutex;
+    bool statusParamDirty;     // stream status changed; push to the UI param
+    std::string statusParamValue;
+
     // GPU acceleration settings
     bool gpuAcceleration;
     bool asyncSending;
@@ -230,10 +300,15 @@ struct NDIInstanceData {
     double maxCLL;
     double maxFALL;
     
+    // Stream resolution (issue #5): divisor 1/2/4, read fresh each render
+    int resolutionDivisor;
+
     // Frame buffers
     std::vector<uint8_t> frameBuffer;
     std::vector<uint16_t> hdrFrameBuffer;
     std::vector<uint8_t> uyvyFrameBuffer; // UYVY format for optimal performance
+    std::vector<float> downscaleBuffer;   // CPU-path box-downscale output
+    std::vector<float> readbackBuffer;    // full-frame readback when a Metal frame needs the CPU path
     std::string hdrMetadataXML;
     
     // Asynchronous processing
@@ -253,6 +328,540 @@ struct NDIInstanceData {
 static void convertRGBAToUYVY_CPU(NDIInstanceData* data, void* rgbaData, int width, int height);
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height);
 static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int height);
+
+// ---------------------------------------------------------------------------
+// Process-shared NDI sender hub (issue #6).
+//
+// Why this exists (probe findings, docs/2026-08-28-render-call-probe-findings.md,
+// and the LEARNINGS.md entries of 2026-08-28): with the Stereo 3D palette at
+// Vision: Stereo, Resolve creates a SECOND plugin instance for the right eye.
+// Per-instance senders then fight — both instances create a sender under the
+// same source name, NDI 6.2 fails the duplicate create outright, and the old
+// failure path's NDIlib_destroy() tore the process-wide NDI library out from
+// under the healthy sender, leaking its Bonjour advertisement and locking the
+// name machine-wide until Resolve exited. So:
+//   - NDIlib_initialize() runs once per process and NDIlib_destroy() is never
+//     called — destroying under live senders is what leaked the names, and the
+//     library is reclaimed at process exit anyway;
+//   - instances sharing a source name share ONE sender (refcounted), which is
+//     also exactly what stereo needs: one packed frame per eye pair, sent once;
+//   - the eye pairer lives here, keyed process-globally, because L and R
+//     frames for the same timeline frame arrive on different instances.
+// ---------------------------------------------------------------------------
+
+struct SenderHub {
+    std::string name;
+    std::mutex mutex;                 // serializes pairer state and sends
+    // Lock-free mirror of `sender != nullptr` for the per-render hot path:
+    // the pump workers hold `mutex` for tens of ms (pairer copy + sync send),
+    // and a render action must never queue behind that just to learn the
+    // sender exists (v1.6.1 — this wait was the residual 8K playback drag).
+    std::atomic<bool> senderReady{false};
+    int refCount = 0;
+    NDIlib_send_instance_t sender = nullptr;
+    bool createAttempted = false;
+    std::chrono::steady_clock::time_point lastCreateAttempt;
+    bool asyncInFlight = false;       // an async send may still be reading its buffer
+    ndi_stereo::EyePairer pairer;
+    // Packed-pair output, double-buffered: an async send keeps reading the
+    // submitted buffer until the next send, and alternating buffers means the
+    // next pair never packs into the one still in flight.
+    std::vector<uint8_t> packedBuffer[2];
+    int packedIndex = 0;
+    std::string status;               // last stream-status string, for change detection
+    unsigned long long lastLoggedDrops = 0;
+};
+
+static std::mutex gHubRegistryMutex;
+static std::map<std::string, SenderHub*> gHubRegistry;
+
+// NDIlib_initialize is refcounted inside the SDK and safe to call once and
+// keep; see the hub comment for why NDIlib_destroy must never be called.
+static bool ensureNDILibInitialized()
+{
+    static std::mutex initMutex;
+    static bool initialized = false;
+    std::lock_guard<std::mutex> lock(initMutex);
+    if (!initialized) {
+        initialized = NDIlib_initialize();
+        if (initialized) {
+            NDI_LOG("NDI library initialized (process-wide, kept for process lifetime)");
+        } else {
+            NDI_LOG("Failed to initialize NDI library");
+        }
+    }
+    return initialized;
+}
+
+// Create the sender if it doesn't exist yet, throttled: a name collision (the
+// classic leaked-advertisement lockout, or another app holding the name) must
+// not retry-and-log on every render call. Caller holds hub->mutex.
+static bool hubEnsureSenderLocked(SenderHub* hub)
+{
+    if (hub->sender) {
+        return true;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (hub->createAttempted &&
+        std::chrono::duration_cast<std::chrono::seconds>(now - hub->lastCreateAttempt).count() < 3) {
+        return false;
+    }
+    hub->createAttempted = true;
+    hub->lastCreateAttempt = now;
+
+    NDIlib_send_create_t desc;
+    desc.p_ndi_name = hub->name.c_str();
+    desc.p_groups = nullptr;
+    desc.clock_video = true;
+    desc.clock_audio = false;
+    hub->sender = NDIlib_send_create(&desc);
+    if (!hub->sender) {
+        NDI_LOG_TEXT(("Failed to create NDI sender '" + hub->name +
+                      "' — the name may already be advertised on this machine "
+                      "(dns-sd -B _ndi._tcp local.) or the NDI runtime is missing; retrying every 3s").c_str());
+        return false;
+    }
+    hub->senderReady.store(true, std::memory_order_release);
+    NDI_LOG_TEXT(("NDI sender created: '" + hub->name + "'").c_str());
+    return true;
+}
+
+// Caller holds hub->mutex. Completes an in-flight async send (a NULL frame
+// finishes the previous submission) so a buffer can be reallocated safely.
+static void hubFlushAsyncLocked(SenderHub* hub)
+{
+    if (hub->asyncInFlight && hub->sender) {
+        NDIlib_send_send_video_async_v2(hub->sender, nullptr);
+    }
+    hub->asyncInFlight = false;
+}
+
+static SenderHub* hubAcquire(const std::string& name)
+{
+    std::lock_guard<std::mutex> lock(gHubRegistryMutex);
+    SenderHub*& slot = gHubRegistry[name];
+    if (!slot) {
+        slot = new SenderHub();
+        slot->name = name;
+    }
+    ++slot->refCount;
+    return slot;
+}
+
+static void hubRelease(SenderHub* hub)
+{
+    if (!hub) {
+        return;
+    }
+    std::lock_guard<std::mutex> registryLock(gHubRegistryMutex);
+    bool destroy = false;
+    {
+        std::lock_guard<std::mutex> lock(hub->mutex);
+        // The departing instance's buffer may be the one in flight; complete
+        // it before the buffer's owner goes away.
+        hubFlushAsyncLocked(hub);
+        destroy = (--hub->refCount == 0);
+        if (destroy && hub->sender) {
+            hub->senderReady.store(false, std::memory_order_release);
+            NDIlib_send_destroy(hub->sender); // blocks until any in-flight send completes
+            hub->sender = nullptr;
+            NDI_LOG_TEXT(("NDI sender destroyed: '" + hub->name + "'").c_str());
+        }
+    }
+    if (destroy) {
+        gHubRegistry.erase(hub->name);
+        delete hub;
+    }
+}
+
+// An NDI async send keeps reading the previously submitted buffer until the
+// next send call. Call this before any per-instance send buffer reallocates
+// (e.g. the Resolution divisor changed mid-stream) so NDI never reads freed
+// memory. Keyed on the hub's in-flight flag, not the live Async Sending
+// param — toggling the param off must not skip the flush for a frame already
+// submitted.
+static void flushAsyncSend(NDIInstanceData* data)
+{
+    if (data->hub) {
+        std::lock_guard<std::mutex> lock(data->hub->mutex);
+        hubFlushAsyncLocked(data->hub);
+    }
+}
+
+// Milliseconds since t0 — for the mtimer diagnostic stage timers (issue #5).
+static inline double msSince(const std::chrono::steady_clock::time_point& t0)
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Caller holds hub->mutex. Builds and sends one NDI frame of the given wire
+// format. `allowAsync` is false for P216 (HDR sends have always been
+// synchronous here) and for any buffer that can't outlive the call.
+// hdrMetadataXML arrives by reference from the submission (never read off the
+// instance here — the pump worker calls this while render threads own the
+// instance's HDR strings).
+static void hubSendFrameLocked(SenderHub* hub, NDIInstanceData* data,
+                               const ndi_stereo::FrameMeta& meta,
+                               const uint8_t* bytes, bool allowAsync,
+                               const std::string& hdrMetadataXML)
+{
+    NDIlib_video_frame_v2_t frame;
+    frame.xres = meta.width;
+    frame.yres = meta.height;
+    frame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
+    frame.frame_rate_D = 1000;
+    frame.picture_aspect_ratio = static_cast<float>(meta.width) / static_cast<float>(meta.height);
+    frame.frame_format_type = NDIlib_frame_format_type_progressive;
+    frame.timecode = NDIlib_send_timecode_synthesize;
+    frame.p_data = const_cast<uint8_t*>(bytes);
+    frame.p_metadata = nullptr;
+
+    switch (meta.format) {
+        case ndi_stereo::WireFormat::P216:
+            frame.FourCC = NDIlib_FourCC_video_type_P216;
+            frame.line_stride_in_bytes = meta.width * static_cast<int>(sizeof(uint16_t));
+            frame.p_metadata = hdrMetadataXML.empty() ? nullptr : hdrMetadataXML.c_str();
+            break;
+        case ndi_stereo::WireFormat::RGBA8:
+            frame.FourCC = NDIlib_FourCC_type_RGBA;
+            frame.line_stride_in_bytes = meta.width * 4;
+            break;
+        case ndi_stereo::WireFormat::UYVY8:
+        default:
+            frame.FourCC = NDIlib_FourCC_type_UYVY;
+            frame.line_stride_in_bytes = meta.width * 2;
+            break;
+    }
+
+    if (allowAsync && data->asyncSending) {
+        NDIlib_send_send_video_async_v2(hub->sender, &frame);
+        hub->asyncInFlight = true;
+    } else {
+        NDIlib_send_send_video_v2(hub->sender, &frame);
+        hub->asyncInFlight = false;
+    }
+}
+
+// Caller holds hub->mutex. Human-readable stream status for the UI param.
+static std::string hubComposeStatusLocked(SenderHub* hub, NDIInstanceData* data)
+{
+    if (!hub->sender) {
+        return "No NDI sender — name '" + hub->name + "' unavailable (in use?)";
+    }
+    switch (hub->pairer.mode()) {
+        case ndi_stereo::StreamMode::Stereo:
+            return data->stereoPacking == 1 ? "Stereo (Top-Bottom)" : "Stereo (Side-by-Side)";
+        case ndi_stereo::StreamMode::LeftOnly:
+            return "Stereo degraded: right eye missing — sending left eye only";
+        case ndi_stereo::StreamMode::RightOnly:
+            return "Stereo degraded: left eye missing — sending right eye only";
+        case ndi_stereo::StreamMode::Mono:
+        default:
+            return "Mono";
+    }
+}
+
+// Caller holds hub->mutex. Recompose the stream status; log hub-level
+// changes once, and mark the SUBMITTING instance's param dirty whenever ITS
+// last-pushed value differs — change detection is per instance, so both
+// per-eye instances (which back the same node param) converge on the live
+// status regardless of which one noticed the transition.
+static void hubUpdateStatusLocked(SenderHub* hub, NDIInstanceData* data)
+{
+    std::string status = hubComposeStatusLocked(hub, data);
+    if (status != hub->status) {
+        hub->status = status;
+        NDI_LOG_TEXT(("Stream status: " + status).c_str());
+    }
+    std::lock_guard<std::mutex> statusLock(data->statusMutex); // after hub->mutex, never reversed
+    if (status != data->statusParamValue) {
+        data->statusParamValue = status;
+        data->statusParamDirty = true;
+    }
+}
+
+// One frame handed to the hub: everything the pairer and sender need,
+// captured at the PRODUCING call site. The async pump submits after the
+// originating render call has returned, so nothing here may be read off the
+// instance's render*/HDR fields at consume time — they belong to a later
+// render by then.
+struct HubSubmit {
+    ndi_stereo::WireFormat format = ndi_stereo::WireFormat::UYVY8;
+    int width = 0;
+    int height = 0;
+    const uint8_t* bytes = nullptr;
+    size_t byteCount = 0;
+    bool allowAsync = false;
+    int eye = ndi_stereo::kEyeLeft;
+    double time = 0.0;
+    bool isThumbnail = false;
+    std::string hdrMetadataXML; // P216 only
+};
+
+// Stage timings for one hub submission. Out-param rather than instance fields
+// because render threads and the pump worker submit concurrently — each
+// caller owns its own copy (the render path copies into the mtimer fields,
+// the worker logs a wtimer line).
+struct SubmitTimers {
+    double flushMs = 0.0, packMs = 0.0, sendMs = 0.0;
+};
+
+// The single entry point every converted frame goes through. Consults the
+// process-global pairer: mono frames stream unchanged (zero extra copies),
+// stereo frames wait for their partner and go out as ONE packed frame.
+static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTimers* timers)
+{
+    SenderHub* hub = data->hub;
+    if (!hub) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(hub->mutex);
+    if (!hubEnsureSenderLocked(hub)) {
+        // Surface the failure — this is the user-visible symptom of the
+        // sender-name lockout. (Defensive: the send paths normally bail in
+        // ensureNDIReady before reaching here, which also updates status.)
+        hubUpdateStatusLocked(hub, data);
+        return;
+    }
+
+    ndi_stereo::FrameMeta meta;
+    meta.width = s.width;
+    meta.height = s.height;
+    meta.format = s.format;
+
+    const uint64_t nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    ndi_stereo::SubmitResult result = hub->pairer.submit(
+        s.eye, s.time, meta, s.bytes, s.byteCount, nowMs, s.isThumbnail);
+
+    switch (result.action) {
+        case ndi_stereo::SubmitAction::SendMono: {
+            const auto sendT0 = std::chrono::steady_clock::now();
+            hubSendFrameLocked(hub, data, meta, s.bytes, s.allowAsync, s.hdrMetadataXML);
+            if (timers) timers->sendMs = msSince(sendT0);
+            break;
+        }
+
+        case ndi_stereo::SubmitAction::SendPair: {
+            const uint8_t* left = (s.eye == ndi_stereo::kEyeLeft)
+                                      ? s.bytes : result.matePayload.data();
+            const uint8_t* right = (s.eye == ndi_stereo::kEyeLeft)
+                                       ? result.matePayload.data() : s.bytes;
+            const ndi_stereo::StereoLayout layout = (data->stereoPacking == 1)
+                                                        ? ndi_stereo::StereoLayout::TopBottom
+                                                        : ndi_stereo::StereoLayout::SideBySide;
+            // Pack into the buffer NOT submitted last; if it needs resizing it
+            // could still be read by a send before last, so flush first.
+            std::vector<uint8_t>& packed = hub->packedBuffer[hub->packedIndex ^= 1];
+            const size_t packedBytes = ndi_stereo::wireFrameBytes(meta) * 2;
+            if (packed.size() != packedBytes) {
+                const auto flushT0 = std::chrono::steady_clock::now();
+                hubFlushAsyncLocked(hub);
+                if (timers) timers->flushMs = msSince(flushT0);
+                packed.resize(packedBytes);
+            }
+            const auto packT0 = std::chrono::steady_clock::now();
+            ndi_stereo::packStereoFrame(meta, layout, left, right, packed.data());
+            if (timers) timers->packMs = msSince(packT0);
+            // Return the consumed mate buffer to the pairer's pool — its warm
+            // pages make the next hold a plain memcpy instead of a page-fault
+            // storm inside this mutex.
+            hub->pairer.recycle(std::move(result.matePayload));
+
+            ndi_stereo::FrameMeta packedMeta = meta;
+            ndi_stereo::packedDims(meta, layout, &packedMeta.width, &packedMeta.height);
+            const auto sendT0 = std::chrono::steady_clock::now();
+            hubSendFrameLocked(hub, data, packedMeta, packed.data(), s.allowAsync, s.hdrMetadataXML);
+            if (timers) timers->sendMs = msSince(sendT0);
+            break;
+        }
+
+        case ndi_stereo::SubmitAction::Hold:
+        case ndi_stereo::SubmitAction::Drop:
+        default: {
+            // No send this call: complete any in-flight async send now. Its
+            // buffer belongs to an instance that will overwrite it on its
+            // next conversion, and with Hold the next real send could be
+            // arbitrarily far away — the async-buffer rule (LEARNINGS
+            // 2026-08-28) demands a send or NULL flush closes every window.
+            const auto flushT0 = std::chrono::steady_clock::now();
+            hubFlushAsyncLocked(hub);
+            if (timers) timers->flushMs = msSince(flushT0);
+            break;
+        }
+    }
+
+    if (hub->pairer.droppedFrames() != hub->lastLoggedDrops) {
+        NDI_LOG("Stereo pairer dropped %llu unmated frame(s) total",
+                hub->pairer.droppedFrames());
+        hub->lastLoggedDrops = hub->pairer.droppedFrames();
+    }
+
+    hubUpdateStatusLocked(hub, data);
+}
+
+#ifdef __APPLE__
+// ---------------------------------------------------------------------------
+// Async NDI pump (issue #5, v1.6.0). Diagnosis showed the 8K stereo playback
+// collapse (30fps -> 5fps) was ~90ms of blocking inside each render action —
+// the GPU wait plus the CPU-side NDI work. Now the render action only ENCODES
+// the fused downscale+convert kernel (microseconds); Metal's completion
+// callback queues the finished staging slot here, and this per-instance
+// worker does everything else — pairing, packing, the NDI send — off the
+// render thread. Every worker send is synchronous, so no NDI in-flight buffer
+// ever aliases a staging slot; the async-send flush rules stay confined to
+// the legacy blocking paths. Backpressure anywhere (slot ring, this queue)
+// DROPS the frame — an NDI preview must never block the host.
+// ---------------------------------------------------------------------------
+struct AsyncPumpItem {
+    void* slot = nullptr;
+    MetalGPUContextRef metalContext = nullptr;
+    HubSubmit submit;  // bytes/byteCount are filled by the completion callback
+    double gpuMs = 0.0;
+    bool ok = false;
+};
+
+struct AsyncPump {
+    NDIInstanceData* data = nullptr; // owner; outlives the pump (shutdownNDI drains first)
+    std::mutex m;
+    std::condition_variable cv;
+    std::queue<AsyncPumpItem> queue; // bounded by kAsyncPumpQueueCap
+    std::atomic<int> pendingSubmits{0}; // Metal callbacks not yet finished with this pump
+    bool stop = false;
+    std::thread worker;
+    std::atomic<uint64_t> drops{0};  // incremented from render threads AND the callback
+    std::chrono::steady_clock::time_point lastDropLog{}; // render threads only
+};
+
+static const size_t kAsyncPumpQueueCap = 4;
+
+// The per-render values the pairer needs, captured at ENQUEUE time — the
+// instance's render* fields belong to a later call by completion time.
+struct AsyncSubmitCtx {
+    AsyncPump* pump = nullptr;
+    AsyncPumpItem item;
+};
+
+static void pumpWorkerLoop(AsyncPump* pump)
+{
+    NDIInstanceData* data = pump->data;
+    for (;;) {
+        AsyncPumpItem item;
+        size_t depth = 0;
+        {
+            std::unique_lock<std::mutex> lock(pump->m);
+            pump->cv.wait(lock, [pump] { return pump->stop || !pump->queue.empty(); });
+            if (pump->stop) {
+                return; // leftovers are released by pumpShutdown
+            }
+            item = pump->queue.front();
+            pump->queue.pop();
+            depth = pump->queue.size();
+        }
+        if (item.ok) {
+            // HDR metadata was captured into item.submit at ENQUEUE time on
+            // the render thread — this worker never reads the instance's
+            // colorSpace/transfer strings (they race with instanceChanged).
+            // Status changes are only FLAGGED inside the hub (statusParamDirty)
+            // — paramSetValue is a host call and stays on render threads.
+            const auto t0 = std::chrono::steady_clock::now();
+            SubmitTimers timers;
+            hubSubmitFrame(data, item.submit, &timers);
+            if (data->timersEnabled) {
+                NDI_LOG("wtimer eye=%d gpu=%.2f pack=%.1f send=%.1f total=%.1f qdepth=%zu",
+                        item.submit.eye, item.gpuMs, timers.packMs, timers.sendMs,
+                        msSince(t0), depth);
+            }
+        }
+        metal_gpu_downscale_release(item.metalContext, item.slot);
+    }
+}
+
+static AsyncPump* pumpEnsure(NDIInstanceData* data)
+{
+    if (!data->pump) {
+        data->pump = new AsyncPump();
+        data->pump->data = data;
+        data->pump->worker = std::thread(pumpWorkerLoop, data->pump);
+    }
+    return data->pump;
+}
+
+// Metal completion callback. Runs on the queue's completion thread — anything
+// slow here stalls the host's own completion handlers, so it only queues the
+// slot and wakes the worker.
+static void pumpOnConvertDone(void* user, void* slot, const void* outPtr,
+                              size_t outBytes, double gpuMs, bool ok)
+{
+    AsyncSubmitCtx* ctx = static_cast<AsyncSubmitCtx*>(user);
+    AsyncPump* pump = ctx->pump;
+    ctx->item.slot = slot;
+    ctx->item.submit.bytes = static_cast<const uint8_t*>(outPtr);
+    ctx->item.submit.byteCount = outBytes;
+    ctx->item.gpuMs = gpuMs;
+    ctx->item.ok = ok;
+
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(pump->m);
+        // Queue-full is belt-and-braces: the cap equals the slot-ring size and
+        // every queued item pins a distinct busy slot, so today it can't hit.
+        if (!pump->stop && pump->queue.size() < kAsyncPumpQueueCap) {
+            pump->queue.push(std::move(ctx->item));
+            queued = true;
+        } else if (!pump->stop) {
+            ++pump->drops;
+        }
+    }
+    if (queued) {
+        pump->cv.notify_one();
+    } else {
+        metal_gpu_downscale_release(ctx->item.metalContext, slot);
+    }
+    delete ctx;
+    --pump->pendingSubmits; // last touch: pumpShutdown waits on this before freeing
+}
+
+static void pumpShutdown(NDIInstanceData* data)
+{
+    AsyncPump* pump = data->pump;
+    if (!pump) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pump->m);
+        pump->stop = true;
+    }
+    pump->cv.notify_all();
+    if (pump->worker.joinable()) {
+        pump->worker.join();
+    }
+    // Callbacks for still-executing command buffers release their own slots
+    // once stop is set; wait them out so none touches a freed pump.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (pump->pendingSubmits.load() > 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    {
+        // Worker exits on stop with items possibly still queued — release them.
+        std::lock_guard<std::mutex> lock(pump->m);
+        while (!pump->queue.empty()) {
+            metal_gpu_downscale_release(pump->queue.front().metalContext, pump->queue.front().slot);
+            pump->queue.pop();
+        }
+    }
+    if (pump->pendingSubmits.load() > 0) {
+        NDI_LOG("Async pump: %d Metal callback(s) never arrived — leaking pump to stay safe",
+                pump->pendingSubmits.load());
+        data->pump = nullptr;
+        return;
+    }
+    delete pump;
+    data->pump = nullptr;
+}
+#endif // __APPLE__
 
 // GPU Acceleration Functions
 static bool initializeGPUContext(NDIInstanceData* data)
@@ -374,6 +983,7 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
 
     const size_t uyvySize = width * height * 2; // UYVY is 2 bytes per pixel
     if (data->uyvyFrameBuffer.size() != uyvySize) {
+        flushAsyncSend(data);
         data->uyvyFrameBuffer.resize(uyvySize);
     }
 
@@ -451,9 +1061,10 @@ static void convertRGBAToUYVY_CPU(NDIInstanceData* data, void* rgbaData, int wid
     auto startTime = std::chrono::high_resolution_clock::now();
     
     NDI_LOG("Starting CPU RGBA->UYVY conversion (%dx%d)\n", width, height);
-    
+
     const size_t uyvySize = width * height * 2; // UYVY is 2 bytes per pixel
     if (data->uyvyFrameBuffer.size() != uyvySize) {
+        flushAsyncSend(data);
         data->uyvyFrameBuffer.resize(uyvySize);
     }
 
@@ -564,47 +1175,26 @@ static bool initializeNDI(NDIInstanceData* data)
     }
 
     NDI_LOG("Initializing NDI Advanced SDK...");
-    
-    // Initialize NDI
-    if (!NDIlib_initialize()) {
-        NDI_LOG("Failed to initialize NDI library");
+
+    if (!ensureNDILibInitialized()) {
         return false;
     }
-    
-    NDI_LOG("NDI library initialized successfully");
 
-    // Create NDI source description with advanced settings
-    NDIlib_send_create_t NDI_send_create_desc;
-    NDI_send_create_desc.p_ndi_name = data->sourceName.c_str();
-    NDI_send_create_desc.p_groups = nullptr;
-    NDI_send_create_desc.clock_video = true;
-    NDI_send_create_desc.clock_audio = false;
-
-    NDI_LOG("Creating NDI sender with name: '%s'", data->sourceName.c_str());
-
-    // Create the NDI sender
-    data->ndiSend = NDIlib_send_create(&NDI_send_create_desc);
-    if (!data->ndiSend) {
-        NDI_LOG("Failed to create NDI sender - this might be due to NDI runtime not being available");
-        NDI_LOG("Please ensure NDI Tools or NDI Runtime is installed on this system");
-        NDIlib_destroy();
-        return false;
-    }
-    
-    NDI_LOG("NDI sender created successfully");
-
-    // Enable hardware acceleration if GPU acceleration is enabled
-    if (data->gpuAcceleration) {
-        NDI_LOG("Enabling hardware acceleration hints");
-        
-        // Send hardware acceleration metadata hint
-        const char* hwAccelMetadata = "<ndi_video_codec type=\"hardware\"/>";
-        NDIlib_metadata_frame_t metadataFrame;
-        metadataFrame.length = strlen(hwAccelMetadata);
-        metadataFrame.timecode = NDIlib_send_timecode_synthesize;
-        metadataFrame.p_data = const_cast<char*>(hwAccelMetadata);
-        
-        NDIlib_send_send_metadata(data->ndiSend, &metadataFrame);
+    // Attach to the process-shared sender for this source name. Sender
+    // creation itself is attempted lazily (and throttled) inside the hub so a
+    // locked name never spams create attempts per render call.
+    data->hub = hubAcquire(data->sourceName);
+    {
+        std::lock_guard<std::mutex> lock(data->hub->mutex);
+        if (hubEnsureSenderLocked(data->hub) && data->gpuAcceleration) {
+            // Hardware acceleration metadata hint, once per sender creation.
+            const char* hwAccelMetadata = "<ndi_video_codec type=\"hardware\"/>";
+            NDIlib_metadata_frame_t metadataFrame;
+            metadataFrame.length = strlen(hwAccelMetadata);
+            metadataFrame.timecode = NDIlib_send_timecode_synthesize;
+            metadataFrame.p_data = const_cast<char*>(hwAccelMetadata);
+            NDIlib_send_send_metadata(data->hub->sender, &metadataFrame);
+        }
     }
 
     // Initialize GPU context if enabled
@@ -621,12 +1211,12 @@ static bool initializeNDI(NDIInstanceData* data)
     }
 
     data->ndiInitialized = true;
-    NDI_LOG("NDI Advanced SDK initialized successfully with source name '%s'", data->sourceName.c_str());
+    NDI_LOG_TEXT(("NDI attached with source name '" + data->sourceName + "'").c_str());
     NDI_LOG("GPU Acceleration: %s, Async Sending: %s, Optimal Format: %s",
            data->gpuAcceleration ? "Enabled" : "Disabled",
            data->asyncSending ? "Enabled" : "Disabled",
            data->optimalFormat ? "Enabled" : "Disabled");
-    
+
     return true;
 }
 
@@ -637,7 +1227,14 @@ static void shutdownNDI(NDIInstanceData* data)
     }
 
     NDI_LOG("Shutting down NDI SDK...");
-    
+
+#ifdef __APPLE__
+    // Drain the async pump FIRST: its worker submits into the hub and its
+    // Metal callbacks write staging slots — both must be quiet before the
+    // GPU context and the hub go away.
+    pumpShutdown(data);
+#endif
+
     // Stop async processing thread
     if (data->asyncSending && data->asyncThread.joinable()) {
         data->stopAsyncThread = true;
@@ -645,7 +1242,7 @@ static void shutdownNDI(NDIInstanceData* data)
         data->asyncThread.join();
         NDI_LOG("Async processing thread stopped");
     }
-    
+
     // Clear any remaining frames in queue
     {
         std::lock_guard<std::mutex> lock(data->queueMutex);
@@ -653,24 +1250,27 @@ static void shutdownNDI(NDIInstanceData* data)
             data->frameQueue.pop();
         }
     }
-    
+
     // Shutdown GPU context
     shutdownGPUContext(data);
-    
-    if (data->ndiSend) {
-        NDIlib_send_destroy(data->ndiSend);
-        data->ndiSend = nullptr;
-    }
-    
-    NDIlib_destroy();
+
+    // Detach from the shared sender; it is destroyed only when the last
+    // instance lets go. NDIlib_destroy() is deliberately NEVER called — see
+    // the SenderHub comment (it leaked sender-name advertisements machine-wide).
+    hubRelease(data->hub);
+    data->hub = nullptr;
     data->ndiInitialized = false;
 }
 
-static void createHDRMetadata(NDIInstanceData* data)
+// Build the ndi_color_info XML from the instance's color settings. RENDER
+// THREADS ONLY — it reads the colorSpace/transferFunction strings that
+// instanceChanged rewrites; the async pump captures the RESULT into its item
+// at enqueue time instead of calling this from the worker.
+static std::string composeHDRMetadataXML(NDIInstanceData* data)
 {
     // Create HDR metadata XML according to NDI SDK v6 specifications
     // Reference: https://docs.ndi.video/all/developing-with-ndi/sdk/hdr#hdr-metadata
-    
+
     std::string primaries, transfer, matrix;
     
     // Map our color space to NDI primaries
@@ -695,11 +1295,64 @@ static void createHDRMetadata(NDIInstanceData* data)
     }
     
     // Create proper NDI color info metadata
-    data->hdrMetadataXML = "<ndi_color_info primaries=\"" + primaries + 
-                          "\" transfer=\"" + transfer + 
-                          "\" matrix=\"" + matrix + "\" />";
-    
+    return "<ndi_color_info primaries=\"" + primaries +
+           "\" transfer=\"" + transfer +
+           "\" matrix=\"" + matrix + "\" />";
+}
+
+static void createHDRMetadata(NDIInstanceData* data)
+{
+    data->hdrMetadataXML = composeHDRMetadataXML(data);
     NDI_LOG("HDR Metadata: %s", data->hdrMetadataXML.c_str());
+}
+
+// Submit the already-packed UYVY frame in data->uyvyFrameBuffer to the hub
+// (which streams it as mono, or pairs and packs it in stereo). Used by both
+// conversion paths: CPU/upload-convert (sendSDRFrame) and the GPU-native
+// fused downscale+convert (renderMetalFrame).
+// Shared tail of the legacy blocking paths — these run on the render thread,
+// so data->render* is current and the stage timings land in the mtimer fields.
+static void hubSubmitFromRenderThread(NDIInstanceData* data, const HubSubmit& s)
+{
+    SubmitTimers timers;
+    hubSubmitFrame(data, s, &timers);
+    data->timerFlushMs = timers.flushMs;
+    data->timerPackMs = timers.packMs;
+    data->timerSendMs = timers.sendMs;
+}
+
+static void sendUYVYToNDI(NDIInstanceData* data, int width, int height)
+{
+    HubSubmit s;
+    s.format = ndi_stereo::WireFormat::UYVY8;
+    s.width = width;
+    s.height = height;
+    s.bytes = data->uyvyFrameBuffer.data();
+    s.byteCount = static_cast<size_t>(width) * height * 2;
+    s.allowAsync = true;
+    s.eye = data->renderEye;
+    s.time = data->renderTime;
+    s.isThumbnail = data->renderIsThumbnail;
+    hubSubmitFromRenderThread(data, s);
+}
+
+// Submit the already-packed P216 frame in data->hdrFrameBuffer with HDR
+// metadata. HDR sends stay synchronous (as they always were here).
+static void sendP216ToNDI(NDIInstanceData* data, int width, int height)
+{
+    createHDRMetadata(data);
+    HubSubmit s;
+    s.format = ndi_stereo::WireFormat::P216;
+    s.width = width;
+    s.height = height;
+    s.bytes = reinterpret_cast<const uint8_t*>(data->hdrFrameBuffer.data());
+    s.byteCount = static_cast<size_t>(width) * height * 2 * sizeof(uint16_t);
+    s.allowAsync = false;
+    s.eye = data->renderEye;
+    s.time = data->renderTime;
+    s.isThumbnail = data->renderIsThumbnail;
+    s.hdrMetadataXML = data->hdrMetadataXML; // same thread — safe to copy here
+    hubSubmitFromRenderThread(data, s);
 }
 
 static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -826,25 +1479,8 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
         }
     }
 
-    // Create HDR metadata
-    createHDRMetadata(data);
-
-    // Setup NDI HDR video frame with proper P216 format
-    NDIlib_video_frame_v2_t ndiVideoFrame;
-    ndiVideoFrame.xres = width;
-    ndiVideoFrame.yres = height;
-    ndiVideoFrame.FourCC = NDIlib_FourCC_video_type_P216; // Proper HDR format
-    ndiVideoFrame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
-    ndiVideoFrame.frame_rate_D = 1000;
-    ndiVideoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
-    ndiVideoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
-    ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
-    ndiVideoFrame.p_data = reinterpret_cast<uint8_t*>(dstData);
-    ndiVideoFrame.line_stride_in_bytes = width * sizeof(uint16_t); // Y plane stride
-    ndiVideoFrame.p_metadata = data->hdrMetadataXML.empty() ? nullptr : data->hdrMetadataXML.c_str();
-
     // Send the HDR frame
-    NDIlib_send_send_video_v2(data->ndiSend, &ndiVideoFrame);
+    sendP216ToNDI(data, width, height);
 }
 
 static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int height)
@@ -858,16 +1494,6 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
            data->gpuAcceleration ? "Yes" : "No",
            data->optimalFormat ? "UYVY" : "RGBA");
 
-    NDIlib_video_frame_v2_t ndiVideoFrame;
-    ndiVideoFrame.xres = width;
-    ndiVideoFrame.yres = height;
-    ndiVideoFrame.frame_rate_N = static_cast<int>(data->frameRate * 1000);
-    ndiVideoFrame.frame_rate_D = 1000;
-    ndiVideoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
-    ndiVideoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
-    ndiVideoFrame.timecode = NDIlib_send_timecode_synthesize;
-    ndiVideoFrame.p_metadata = nullptr;
-
     if (data->optimalFormat) {
         // Use UYVY format for optimal NDI performance
         if (data->gpuAcceleration) {
@@ -875,65 +1501,267 @@ static void sendSDRFrame(NDIInstanceData* data, void* imageData, int width, int 
         } else {
             convertRGBAToUYVY_CPU(data, imageData, width, height);
         }
-        
-        ndiVideoFrame.FourCC = NDIlib_FourCC_type_UYVY;
-        ndiVideoFrame.p_data = data->uyvyFrameBuffer.data();
-        ndiVideoFrame.line_stride_in_bytes = width * 2; // UYVY is 2 bytes per pixel
-    } else {
-        // Use RGBA format (legacy compatibility)
-        const size_t frameSize = width * height * 4 * sizeof(uint8_t);
-        if (data->frameBuffer.size() != frameSize) {
-            data->frameBuffer.resize(frameSize);
-        }
-
-        // Convert float RGBA to uint8_t RGBA for NDI with vertical flip
-        float* srcData = static_cast<float*>(imageData);
-        uint8_t* dstData = data->frameBuffer.data();
-        
-        // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
-        for (int y = 0; y < height; ++y) {
-            int srcRow = height - 1 - y; // Flip vertically
-            for (int x = 0; x < width; ++x) {
-                int srcIdx = (srcRow * width + x) * 4;
-                int dstIdx = (y * width + x) * 4;
-                
-                dstData[dstIdx + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 0])) * 255.0f); // R
-                dstData[dstIdx + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 1])) * 255.0f); // G
-                dstData[dstIdx + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 2])) * 255.0f); // B
-                dstData[dstIdx + 3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 3])) * 255.0f); // A
-            }
-        }
-
-        ndiVideoFrame.FourCC = NDIlib_FourCC_type_RGBA;
-        ndiVideoFrame.p_data = dstData;
-        ndiVideoFrame.line_stride_in_bytes = width * 4;
+        sendUYVYToNDI(data, width, height);
+        return;
     }
 
-    // Send the frame (asynchronously if enabled)
-    if (data->asyncSending) {
-        NDIlib_send_send_video_async_v2(data->ndiSend, &ndiVideoFrame);
-    } else {
-        NDIlib_send_send_video_v2(data->ndiSend, &ndiVideoFrame);
+    // Use RGBA format (legacy compatibility)
+    const size_t frameSize = width * height * 4 * sizeof(uint8_t);
+    if (data->frameBuffer.size() != frameSize) {
+        flushAsyncSend(data);
+        data->frameBuffer.resize(frameSize);
     }
+
+    // Convert float RGBA to uint8_t RGBA for NDI with vertical flip
+    float* srcData = static_cast<float*>(imageData);
+    uint8_t* dstData = data->frameBuffer.data();
+
+    // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
+    for (int y = 0; y < height; ++y) {
+        int srcRow = height - 1 - y; // Flip vertically
+        for (int x = 0; x < width; ++x) {
+            int srcIdx = (srcRow * width + x) * 4;
+            int dstIdx = (y * width + x) * 4;
+
+            dstData[dstIdx + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 0])) * 255.0f); // R
+            dstData[dstIdx + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 1])) * 255.0f); // G
+            dstData[dstIdx + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 2])) * 255.0f); // B
+            dstData[dstIdx + 3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, srcData[srcIdx + 3])) * 255.0f); // A
+        }
+    }
+
+    HubSubmit s;
+    s.format = ndi_stereo::WireFormat::RGBA8;
+    s.width = width;
+    s.height = height;
+    s.bytes = dstData;
+    s.byteCount = frameSize;
+    s.allowAsync = true;
+    s.eye = data->renderEye;
+    s.time = data->renderTime;
+    s.isThumbnail = data->renderIsThumbnail;
+    hubSubmitFromRenderThread(data, s);
+}
+
+static bool ensureNDIReady(NDIInstanceData* data)
+{
+    if (!data->enabled) {
+        return false;
+    }
+    if (!data->ndiInitialized) {
+        NDI_LOG("NDI not initialized, attempting to initialize...");
+        if (!initializeNDI(data)) {
+            NDI_LOG("Failed to initialize NDI, skipping frame");
+            return false;
+        }
+    }
+    // Hot path: a healthy sender answers without touching hub->mutex — the
+    // pump workers hold that lock for tens of ms per frame, and a render
+    // action queueing behind them was the residual 8K playback drag (v1.6.1).
+    // hubSubmitFrame re-verifies under the lock, so a sender dying between
+    // this check and the submit is still caught.
+    if (data->hub->senderReady.load(std::memory_order_acquire)) {
+        return true;
+    }
+    // Slow path — a missing sender (name locked elsewhere) skips the
+    // conversion work too; creation retries are throttled inside the hub.
+    std::lock_guard<std::mutex> lock(data->hub->mutex);
+    const bool ready = hubEnsureSenderLocked(data->hub);
+    if (!ready) {
+        // No frame will be submitted this render, so surface the lockout in
+        // Stream Status from here — hubSubmitFrame won't get the chance.
+        hubUpdateStatusLocked(data->hub, data);
+    }
+    return ready;
 }
 
 static void sendNDIFrame(NDIInstanceData* data, void* imageData, int width, int height)
 {
-    // Ensure NDI is initialized before sending frames
-    if (!data->ndiInitialized && data->enabled) {
-        NDI_LOG("NDI not initialized, attempting to initialize...");
-        if (!initializeNDI(data)) {
-            NDI_LOG("Failed to initialize NDI, skipping frame");
-            return;
-        }
+    if (!ensureNDIReady(data)) {
+        return;
     }
-    
+
     if (data->hdrEnabled) {
         sendHDRFrame(data, imageData, width, height);
     } else {
         sendSDRFrame(data, imageData, width, height);
     }
 }
+
+// Push a changed stream-status string to the informational UI param, at the
+// end of the render action and only when it actually changed (rare). Kept as
+// one isolated helper: hosts differ on tolerating paramSetValue during
+// render, so this is trivially removable if a host objects — the same status
+// always goes to the log too.
+static void flushStatusParam(NDIInstanceData* data)
+{
+    std::string statusCopy;
+    {
+        std::lock_guard<std::mutex> lock(data->statusMutex);
+        if (!data->statusParamDirty) {
+            return;
+        }
+        data->statusParamDirty = false;
+        statusCopy = data->statusParamValue; // the worker mutates the original
+    }
+    if (data->stereoStatusParam) {
+        gParamHost->paramSetValue(data->stereoStatusParam, statusCopy.c_str());
+    }
+}
+
+// Frame arrived in CPU memory: apply the Resolution downscale (box filter)
+// before the conversion+send path. Also repacks a padded row stride — the
+// converters assume tight rows.
+static void sendCPUFrameToNDI(NDIInstanceData* data, void* imageData, int width, int height, int rowBytes)
+{
+    int rowFloats = rowBytes / static_cast<int>(sizeof(float));
+    if (rowFloats < width * 4) {
+        rowFloats = width * 4; // defensive: hosts hand tight positive strides here
+    }
+
+    const int divisor = data->resolutionDivisor;
+    if (divisor <= 1 && rowFloats == width * 4) {
+        sendNDIFrame(data, imageData, width, height);
+        return;
+    }
+
+    int outWidth = 0, outHeight = 0;
+    ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
+
+    const size_t outFloats = static_cast<size_t>(outWidth) * outHeight * 4;
+    if (data->downscaleBuffer.size() < outFloats) {
+        data->downscaleBuffer.resize(outFloats);
+    }
+    ndi_stream::downscaleRGBABox(static_cast<const float*>(imageData), width, height, rowFloats,
+                                 divisor, data->downscaleBuffer.data(), outWidth, outHeight);
+    NDI_LOG("CPU downscale: %dx%d -> %dx%d (divisor %d)", width, height, outWidth, outHeight, divisor);
+    sendNDIFrame(data, data->downscaleBuffer.data(), outWidth, outHeight);
+}
+
+#ifdef __APPLE__
+// Metal render action (issue #5): the host handed src/dst as id<MTLBuffer>
+// device buffers. Passthrough-copy src→dst on the host's queue for the effect
+// output, then feed NDI through the fused GPU downscale+convert kernels — the
+// downscale happens before any readback, so only the small converted frame
+// crosses to the CPU. Any GPU-convert gap (legacy RGBA format, GPU
+// Acceleration off, kernel failure) falls back to a full-frame readback plus
+// the CPU path, so the stream survives every combination.
+static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* dstBuffer,
+                                  int width, int height, int srcRowBytes, int dstRowBytes,
+                                  void* metalQueue)
+{
+    if (!srcBuffer || !dstBuffer) {
+        NDI_LOG("Metal render: missing device buffer, skipping frame");
+        return kOfxStatOK; // matches the CPU path's leniency for absent images
+    }
+
+    // GPU Acceleration may have been enabled after NDI init skipped the context.
+    if (data->gpuAcceleration && !data->gpuContext) {
+        initializeGPUContext(data);
+    }
+    MetalGPUContextRef metalContext =
+        (data->gpuContext && data->gpuContext->initialized) ? data->gpuContext->metalContext : nullptr;
+
+    // Host output first: the effect is a passthrough. No wait — the host
+    // orders its downstream reads on the same queue (cf. the Resolve
+    // GainPlugin sample).
+    const size_t frameBytes = static_cast<size_t>(height) * static_cast<size_t>(dstRowBytes);
+    const auto blitT0 = std::chrono::steady_clock::now();
+    const bool blitOk = metal_gpu_copy_buffer(metalContext, metalQueue, srcBuffer, dstBuffer, frameBytes, false);
+    data->timerBlitMs = msSince(blitT0);
+    if (!blitOk) {
+        NDI_LOG("Metal render: passthrough copy failed");
+        return kOfxStatFailed;
+    }
+
+    if (!ensureNDIReady(data)) {
+        return kOfxStatOK;
+    }
+
+    const int divisor = data->resolutionDivisor;
+    int outWidth = 0, outHeight = 0;
+    ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
+    const int rowFloats = srcRowBytes / static_cast<int>(sizeof(float));
+
+    bool handledByFastPath = false;
+    if (data->gpuAcceleration && metalContext &&
+        (data->hdrEnabled || data->optimalFormat)) {
+        // Non-blocking fast path (v1.6.0): ENCODE the fused kernel and return.
+        // No waitUntilCompleted here — that wait (plus the CPU-side NDI work
+        // that followed it) was ~90ms of render-thread blocking per eye and
+        // the whole 8K playback collapse (#5). The pump worker pairs and
+        // sends when the GPU finishes. The submit validates geometry itself:
+        // BUSY = ring full (drop this frame, transient); INVALID = this
+        // source can't fuse (fall through to the blocking readback so the
+        // stream survives, every frame).
+        std::lock_guard<std::mutex> lock(data->gpuContext->gpuMutex);
+        AsyncPump* pump = pumpEnsure(data);
+        const bool wantP216 = data->hdrEnabled;
+        AsyncSubmitCtx* ctx = new AsyncSubmitCtx();
+        ctx->pump = pump;
+        ctx->item.metalContext = metalContext;
+        ctx->item.submit.format = wantP216 ? ndi_stereo::WireFormat::P216
+                                           : ndi_stereo::WireFormat::UYVY8;
+        ctx->item.submit.width = outWidth;
+        ctx->item.submit.height = outHeight;
+        ctx->item.submit.allowAsync = false; // worker sends are synchronous by design
+        ctx->item.submit.eye = data->renderEye;
+        ctx->item.submit.time = data->renderTime;
+        ctx->item.submit.isThumbnail = data->renderIsThumbnail;
+        if (wantP216) {
+            // Captured here, on the render thread — the worker must never
+            // read the instance's color strings (they race instanceChanged).
+            ctx->item.submit.hdrMetadataXML = composeHDRMetadataXML(data);
+        }
+        ++pump->pendingSubmits;
+        const auto convT0 = std::chrono::steady_clock::now();
+        const metal_submit_status st = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
+                                                                  width, height, rowFloats, divisor,
+                                                                  outWidth, outHeight, wantP216,
+                                                                  pumpOnConvertDone, ctx);
+        data->timerConvMs = msSince(convT0);
+        if (st == METAL_SUBMIT_OK) {
+            handledByFastPath = true;
+            NDI_LOG("GPU-native async: %dx%d Metal frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216)",
+                    width, height, outWidth, outHeight, wantP216 ? 1 : 0, divisor);
+        } else {
+            --pump->pendingSubmits;
+            delete ctx;
+            if (st == METAL_SUBMIT_BUSY) {
+                handledByFastPath = true; // deliberate drop — backpressure, not failure
+                const uint64_t drops = ++pump->drops;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - pump->lastDropLog > std::chrono::seconds(1)) {
+                    pump->lastDropLog = now;
+                    NDI_LOG("Async pump: frame dropped, %llu total (GPU or NDI worker behind)",
+                            static_cast<unsigned long long>(drops));
+                }
+            }
+            // METAL_SUBMIT_INVALID falls through to the readback path below.
+        }
+    }
+
+    if (!handledByFastPath) {
+        const size_t srcBytes = static_cast<size_t>(height) * static_cast<size_t>(srcRowBytes);
+        if (data->readbackBuffer.size() * sizeof(float) < srcBytes) {
+            data->readbackBuffer.resize(srcBytes / sizeof(float));
+        }
+        const auto convT0 = std::chrono::steady_clock::now();
+        const bool readOk = metal_gpu_read_buffer(metalContext, metalQueue, srcBuffer,
+                                                  data->readbackBuffer.data(), srcBytes);
+        data->timerConvMs = msSince(convT0);
+        if (readOk) {
+            NDI_LOG("Metal frame full readback -> CPU fallback path (%dx%d, gpu=%d)",
+                    width, height, data->gpuAcceleration ? 1 : 0);
+            sendCPUFrameToNDI(data, data->readbackBuffer.data(), width, height, srcRowBytes);
+        } else {
+            NDI_LOG("Metal frame readback failed — NDI frame skipped");
+        }
+    }
+
+    return kOfxStatOK;
+}
+#endif // __APPLE__
 
 // Plugin functions
 static OfxStatus onLoad(void)
@@ -946,7 +1774,63 @@ static OfxStatus onUnLoad(void)
     return kOfxStatOK;
 }
 
-static OfxStatus createInstance(OfxImageEffectHandle effect)
+// Read every persisted parameter into the instance fields. Used at
+// createInstance — so a saved project's values (source name above all) are
+// honored BEFORE the first NDI attach, not only after the user touches a
+// param — and at instanceChanged.
+static void readInstanceParams(NDIInstanceData* myData)
+{
+    char* sourceName;
+    gParamHost->paramGetValue(myData->sourceNameParam, &sourceName);
+    myData->sourceName = sourceName;
+
+    int enabled;
+    gParamHost->paramGetValue(myData->enabledParam, &enabled);
+    myData->enabled = (enabled != 0);
+
+    double frameRate;
+    gParamHost->paramGetValue(myData->frameRateParam, &frameRate);
+    myData->frameRate = frameRate;
+
+    // GPU acceleration parameters
+    int gpuAcceleration;
+    gParamHost->paramGetValue(myData->gpuAccelerationParam, &gpuAcceleration);
+    myData->gpuAcceleration = (gpuAcceleration != 0);
+
+    int asyncSending;
+    gParamHost->paramGetValue(myData->asyncSendingParam, &asyncSending);
+    myData->asyncSending = (asyncSending != 0);
+
+    int optimalFormat;
+    gParamHost->paramGetValue(myData->optimalFormatParam, &optimalFormat);
+    myData->optimalFormat = (optimalFormat != 0);
+
+    gParamHost->paramGetValue(myData->stereoPackingParam, &myData->stereoPacking);
+
+    int hdrEnabled;
+    gParamHost->paramGetValue(myData->hdrEnabledParam, &hdrEnabled);
+    myData->hdrEnabled = (hdrEnabled != 0);
+
+    int colorSpaceIndex;
+    gParamHost->paramGetValue(myData->colorSpaceParam, &colorSpaceIndex);
+    myData->colorSpace = (colorSpaceIndex == 0) ? kColorSpaceRec709 :
+                        (colorSpaceIndex == 1) ? kColorSpaceRec2020 : kColorSpaceP3;
+
+    int transferFunctionIndex;
+    gParamHost->paramGetValue(myData->transferFunctionParam, &transferFunctionIndex);
+    myData->transferFunction = (transferFunctionIndex == 0) ? kTransferFunctionSDR :
+                              (transferFunctionIndex == 1) ? kTransferFunctionPQ : kTransferFunctionHLG;
+
+    double maxCLL;
+    gParamHost->paramGetValue(myData->maxCLLParam, &maxCLL);
+    myData->maxCLL = maxCLL;
+
+    double maxFALL;
+    gParamHost->paramGetValue(myData->maxFALLParam, &maxFALL);
+    myData->maxFALL = maxFALL;
+}
+
+static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs)
 {
     NDI_LOG("Creating instance");
     
@@ -960,12 +1844,20 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
 
     // Create instance data
     NDIInstanceData *myData = new NDIInstanceData;
-    myData->ndiSend = nullptr;
+    myData->hub = nullptr;
     myData->ndiInitialized = false;
     myData->sourceName = "DaVinci Resolve NDI Output";
     myData->enabled = true;
     myData->frameRate = 25.0;
-    
+    myData->resolutionDivisor = 1;
+
+    // Stereo pairing context (issue #6)
+    myData->renderEye = ndi_stereo::kEyeLeft;
+    myData->renderTime = 0.0;
+    myData->renderIsThumbnail = false;
+    myData->stereoPacking = 0;
+    myData->statusParamDirty = false;
+
     // GPU acceleration settings (default enabled for better performance)
     myData->gpuAcceleration = true;
     myData->asyncSending = true;
@@ -979,6 +1871,23 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     myData->maxCLL = 1000.0;
     myData->maxFALL = 400.0;
 
+    // Diagnostic probe state; the page is only handed over here, never at render time
+    myData->resolvePage = "";
+    myData->probeCallCount = 0;
+    myData->probeHasLastCallTime = false;
+    myData->timersEnabled = false;
+    myData->timerBlitMs = myData->timerConvMs = 0.0;
+    myData->timerFlushMs = myData->timerPackMs = myData->timerSendMs = 0.0;
+#ifdef __APPLE__
+    myData->pump = nullptr;
+#endif
+    if (inArgs) {
+        char* page = nullptr;
+        if (gPropHost->propGetString(inArgs, kOfxImageEffectPropResolvePage, 0, &page) == kOfxStatOK && page) {
+            myData->resolvePage = page;
+        }
+    }
+
     // Cache clip handles
     gEffectHost->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &myData->sourceClip, 0);
     gEffectHost->clipGetHandle(effect, kOfxImageEffectOutputClipName, &myData->outputClip, 0);
@@ -987,10 +1896,14 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     gParamHost->paramGetHandle(paramSet, kParamSourceName, &myData->sourceNameParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamEnabled, &myData->enabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamFrameRate, &myData->frameRateParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamResolution, &myData->resolutionParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamGPUAcceleration, &myData->gpuAccelerationParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamAsyncSending, &myData->asyncSendingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamOptimalFormat, &myData->optimalFormatParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamVersionLabel, &myData->versionLabelParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamDebugLogging, &myData->debugLoggingParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamStereoPacking, &myData->stereoPackingParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamStereoStatus, &myData->stereoStatusParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamColorSpace, &myData->colorSpaceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamTransferFunction, &myData->transferFunctionParam, 0);
@@ -1000,12 +1913,17 @@ static OfxStatus createInstance(OfxImageEffectHandle effect)
     // Set instance data
     gPropHost->propSetPointer(effectProps, kOfxPropInstanceData, 0, (void *) myData);
 
-    // Initialize NDI if enabled by default
+    // Honor the project's saved parameter values (source name above all)
+    // before the first NDI attach.
+    readInstanceParams(myData);
+
+    // Initialize NDI if enabled
     if (myData->enabled) {
         initializeNDI(myData);
     }
 
-    NDI_LOG("Instance created successfully");
+    NDI_LOG_TEXT(("Instance created successfully on page '" +
+                  (myData->resolvePage.empty() ? std::string("?") : myData->resolvePage) + "'").c_str());
     return kOfxStatOK;
 }
 
@@ -1035,56 +1953,10 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         gPropHost->propGetString(inArgs, kOfxPropName, 0, &paramName);
         
         NDI_LOG("Parameter changed: %s", paramName);
-        
-        // Update parameter values
-        char* sourceName;
-        gParamHost->paramGetValue(myData->sourceNameParam, &sourceName);
-        myData->sourceName = sourceName;
-        
-        int enabled;
-        gParamHost->paramGetValue(myData->enabledParam, &enabled);
-        myData->enabled = (enabled != 0);
-        
-        double frameRate;
-        gParamHost->paramGetValue(myData->frameRateParam, &frameRate);
-        myData->frameRate = frameRate;
-        
-        // GPU acceleration parameters
-        int gpuAcceleration;
-        gParamHost->paramGetValue(myData->gpuAccelerationParam, &gpuAcceleration);
-        myData->gpuAcceleration = (gpuAcceleration != 0);
-        
-        int asyncSending;
-        gParamHost->paramGetValue(myData->asyncSendingParam, &asyncSending);
-        myData->asyncSending = (asyncSending != 0);
-        
-        int optimalFormat;
-        gParamHost->paramGetValue(myData->optimalFormatParam, &optimalFormat);
-        myData->optimalFormat = (optimalFormat != 0);
-        
-        int hdrEnabled;
-        gParamHost->paramGetValue(myData->hdrEnabledParam, &hdrEnabled);
-        myData->hdrEnabled = (hdrEnabled != 0);
-        
-        int colorSpaceIndex;
-        gParamHost->paramGetValue(myData->colorSpaceParam, &colorSpaceIndex);
-        myData->colorSpace = (colorSpaceIndex == 0) ? kColorSpaceRec709 : 
-                            (colorSpaceIndex == 1) ? kColorSpaceRec2020 : kColorSpaceP3;
-        
-        int transferFunctionIndex;
-        gParamHost->paramGetValue(myData->transferFunctionParam, &transferFunctionIndex);
-        myData->transferFunction = (transferFunctionIndex == 0) ? kTransferFunctionSDR :
-                                  (transferFunctionIndex == 1) ? kTransferFunctionPQ : kTransferFunctionHLG;
-        
-        double maxCLL;
-        gParamHost->paramGetValue(myData->maxCLLParam, &maxCLL);
-        myData->maxCLL = maxCLL;
-        
-        double maxFALL;
-        gParamHost->paramGetValue(myData->maxFALLParam, &maxFALL);
-        myData->maxFALL = maxFALL;
-        
-        NDI_LOG("Updated params - sourceName='%s', enabled=%d, frameRate=%.2f, hdr=%d, colorSpace='%s', transferFunc='%s'", 
+
+        readInstanceParams(myData);
+
+        NDI_LOG("Updated params - sourceName='%s', enabled=%d, frameRate=%.2f, hdr=%d, colorSpace='%s', transferFunc='%s'",
                myData->sourceName.c_str(), myData->enabled, myData->frameRate, myData->hdrEnabled, 
                myData->colorSpace.c_str(), myData->transferFunction.c_str());
         
@@ -1127,10 +1999,24 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     int enabled;
     gParamHost->paramGetValue(myData->enabledParam, &enabled);
     myData->enabled = (enabled != 0);
-    
+
+    int optimalFormat;
+    gParamHost->paramGetValue(myData->optimalFormatParam, &optimalFormat);
+    myData->optimalFormat = (optimalFormat != 0);
+
+    int asyncSending;
+    gParamHost->paramGetValue(myData->asyncSendingParam, &asyncSending);
+    myData->asyncSending = (asyncSending != 0);
+
+    int resolutionChoice = 0;
+    gParamHost->paramGetValue(myData->resolutionParam, &resolutionChoice);
+    myData->resolutionDivisor = ndi_stream::divisorForResolutionChoice(resolutionChoice);
+
+    gParamHost->paramGetValue(myData->stereoPackingParam, &myData->stereoPacking);
+
     // Log current parameter state for debugging
-    NDI_LOG("Render params - enabled=%d, hdr=%d, gpu=%d", 
-           myData->enabled, myData->hdrEnabled, myData->gpuAcceleration);
+    NDI_LOG("Render params - enabled=%d, hdr=%d, gpu=%d, divisor=%d",
+           myData->enabled, myData->hdrEnabled, myData->gpuAcceleration, myData->resolutionDivisor);
 
     // Get time
     double time;
@@ -1139,6 +2025,72 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     // Get render window
     OfxRectI renderWindow;
     gPropHost->propGetIntN(inArgs, kOfxImageEffectPropRenderWindow, 4, &renderWindow.x1);
+
+    // Stereo pairing context (issue #6): which eye this call renders, at what
+    // frame time, and whether it's a filmstrip thumbnail. Read every call —
+    // the pairer keys on these.
+    int eyeValue = 0;
+    const bool hasEye =
+        (gPropHost->propGetInt(inArgs, kOfxImageEffectPropEyeToRender, 0, &eyeValue) == kOfxStatOK);
+    myData->renderEye = (hasEye && eyeValue == kOfxImageEyeRight) ? ndi_stereo::kEyeRight
+                                                                  : ndi_stereo::kEyeLeft;
+    myData->renderTime = time;
+
+    OfxPropertySetHandle srcClipProps = NULL;
+    int thumbnailValue = 0;
+    bool hasThumbnail = false;
+    if (gEffectHost->clipGetPropertySet(myData->sourceClip, &srcClipProps) == kOfxStatOK && srcClipProps) {
+        hasThumbnail =
+            (gPropHost->propGetInt(srcClipProps, kOfxImageClipPropThumbnail, 0, &thumbnailValue) == kOfxStatOK);
+    }
+    myData->renderIsThumbnail = (hasThumbnail && thumbnailValue != 0);
+
+    // Diagnostic render-call probe: when enabled, log exactly what the host feeds
+    // this render call — before any image fetch, so calls that fail later still show.
+    int debugLogging = 0;
+    gParamHost->paramGetValue(myData->debugLoggingParam, &debugLogging);
+    if (debugLogging) {
+        ndi_probe::ProbeRenderInfo info;
+        info.page = myData->resolvePage.c_str();
+        info.time = time;
+        info.width = renderWindow.x2 - renderWindow.x1;
+        info.height = renderWindow.y2 - renderWindow.y1;
+
+        info.hasEye = hasEye;
+        info.eye = eyeValue;
+
+        int srcFrame = 0;
+        info.hasSrcFrame = (gPropHost->propGetInt(inArgs, kOfxImageEffectPropSrcFrame, 0, &srcFrame) == kOfxStatOK);
+        info.srcFrame = srcFrame;
+
+        double scale[2] = {0.0, 0.0};
+        info.hasScale = (gPropHost->propGetDoubleN(inArgs, kOfxImageEffectPropRenderScale, 2, scale) == kOfxStatOK);
+        info.scaleX = scale[0];
+        info.scaleY = scale[1];
+
+        info.hasThumbnail = hasThumbnail;
+        info.thumbnail = thumbnailValue;
+
+        {
+            std::lock_guard<std::mutex> lock(myData->probeMutex);
+            auto now = std::chrono::steady_clock::now();
+            info.callIndex = ++myData->probeCallCount;
+            if (myData->probeHasLastCallTime) {
+                info.hasDt = true;
+                info.dtMs = std::chrono::duration<double, std::milli>(now - myData->probeLastCallTime).count();
+            }
+            myData->probeLastCallTime = now;
+            myData->probeHasLastCallTime = true;
+        }
+
+        NDI_LOG_TEXT(ndi_probe::formatProbeLine(info).c_str());
+    }
+
+    // Stage timers for the mtimer diagnostic line (issue #5): reset per render.
+    myData->timersEnabled = (debugLogging != 0);
+    myData->timerBlitMs = myData->timerConvMs = 0.0;
+    myData->timerFlushMs = myData->timerPackMs = myData->timerSendMs = 0.0;
+    const auto renderT0 = std::chrono::steady_clock::now();
 
     // Get source image
     OfxPropertySetHandle sourceImg = NULL;
@@ -1156,6 +2108,7 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
         gEffectHost->clipReleaseImage(sourceImg);
         return kOfxStatFailed;
     }
+    const double imagesMs = msSince(renderT0);
 
     // Get image properties
     void *srcData, *dstData;
@@ -1173,19 +2126,47 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     // Copy source to output (pass-through)
     int width = dstRect.x2 - dstRect.x1;
     int height = dstRect.y2 - dstRect.y1;
-    
+
+#ifdef __APPLE__
+    // Metal render: describe() declared kOfxImageEffectPropMetalRenderSupported,
+    // so when the host sets MetalEnabled the image data pointers are
+    // id<MTLBuffer> device buffers, not CPU memory.
+    int metalEnabled = 0;
+    gPropHost->propGetInt(inArgs, kOfxImageEffectPropMetalEnabled, 0, &metalEnabled);
+    if (metalEnabled) {
+        void* metalQueue = nullptr;
+        gPropHost->propGetPointer(inArgs, kOfxImageEffectPropMetalCommandQueue, 0, &metalQueue);
+        OfxStatus metalStatus = renderMetalFrame(myData, srcData, dstData, width, height,
+                                                 srcRowBytes, dstRowBytes, metalQueue);
+        gEffectHost->clipReleaseImage(sourceImg);
+        gEffectHost->clipReleaseImage(outputImg);
+        flushStatusParam(myData);
+        if (myData->timersEnabled) {
+            // All-numeric on purpose — dynamic %s strings get redacted to
+            // <private> by unified logging (LEARNINGS 2026-08-28). eye: 0=L 1=R.
+            NDI_LOG("mtimer eye=%d total=%.1f images=%.1f blit=%.1f conv=%.1f flush=%.1f pack=%.1f send=%.1f",
+                    myData->renderEye == ndi_stereo::kEyeRight ? 1 : 0,
+                    msSince(renderT0), imagesMs, myData->timerBlitMs, myData->timerConvMs,
+                    myData->timerFlushMs, myData->timerPackMs, myData->timerSendMs);
+        }
+        NDI_LOG("Render completed (Metal)");
+        return metalStatus;
+    }
+#endif
+
     if (srcData && dstData) {
         // Simple copy for float RGBA
         memcpy(dstData, srcData, height * dstRowBytes);
-        
-        // Send to NDI with vertical flip correction
-        sendNDIFrame(myData, srcData, width, height);
+
+        // Send to NDI (downscale + vertical flip handled inside)
+        sendCPUFrameToNDI(myData, srcData, width, height, srcRowBytes);
     }
 
     // Release images
     gEffectHost->clipReleaseImage(sourceImg);
     gEffectHost->clipReleaseImage(outputImg);
 
+    flushStatusParam(myData);
     NDI_LOG("Render completed");
     return kOfxStatOK;
 }
@@ -1213,6 +2194,13 @@ static OfxStatus describe(OfxImageEffectHandle effect)
     gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultiResolution, 0, 0);
     gPropHost->propSetInt(props, kOfxImageEffectPropSupportsMultipleClipPARs, 0, 0);
     gPropHost->propSetString(props, kOfxImageEffectPluginRenderThreadSafety, 0, kOfxImageEffectRenderFullySafe);
+
+#ifdef __APPLE__
+    // GPU fast path (issue #5): accept frames as Metal buffers so the
+    // downscale+convert runs before any readback. CPU rendering stays
+    // supported — the host chooses per render via kOfxImageEffectPropMetalEnabled.
+    gPropHost->propSetString(props, kOfxImageEffectPropMetalRenderSupported, 0, "true");
+#endif
 
     return kOfxStatOK;
 }
@@ -1249,6 +2237,11 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(basicGroupProps, kOfxPropLabel, 0, "Basic Settings");
     gPropHost->propSetInt(basicGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
 
+    OfxPropertySetHandle stereoGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "stereoGroup", &stereoGroupProps);
+    gPropHost->propSetString(stereoGroupProps, kOfxPropLabel, 0, "Stereo");
+    gPropHost->propSetInt(stereoGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
+
     OfxPropertySetHandle performanceGroupProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "performanceGroup", &performanceGroupProps);
     gPropHost->propSetString(performanceGroupProps, kOfxPropLabel, 0, "Performance Settings");
@@ -1258,6 +2251,11 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "hdrGroup", &hdrGroupProps);
     gPropHost->propSetString(hdrGroupProps, kOfxPropLabel, 0, "HDR Settings");
     gPropHost->propSetInt(hdrGroupProps, kOfxParamPropGroupOpen, 0, 0); // Closed by default
+
+    OfxPropertySetHandle diagnosticsGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "diagnosticsGroup", &diagnosticsGroupProps);
+    gPropHost->propSetString(diagnosticsGroupProps, kOfxPropLabel, 0, "Diagnostics");
+    gPropHost->propSetInt(diagnosticsGroupProps, kOfxParamPropGroupOpen, 0, 0); // Closed by default
 
     // Define version label parameter (visible read-only display) - in Info group
     OfxPropertySetHandle versionLabelProps = NULL;
@@ -1302,6 +2300,42 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropDisplayMax, 0, 60.0);
     gPropHost->propSetInt(frameRateProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(frameRateProps, kOfxParamPropParent, 0, "basicGroup");
+
+    // Define stream resolution parameter - in Basic group
+    OfxPropertySetHandle resolutionProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamResolution, &resolutionProps);
+    gPropHost->propSetString(resolutionProps, kOfxPropLabel, 0, kParamResolutionLabel);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropScriptName, 0, kParamResolution);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropHint, 0, kParamResolutionHint);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 0, "Full");
+    gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 1, "Half");
+    gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 2, "Quarter");
+    gPropHost->propSetInt(resolutionProps, kOfxParamPropDefault, 0, 0); // Full
+    gPropHost->propSetInt(resolutionProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(resolutionProps, kOfxParamPropParent, 0, "basicGroup");
+
+    // Define stereo packing parameter - in Stereo group (issue #6)
+    OfxPropertySetHandle stereoPackingProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamStereoPacking, &stereoPackingProps);
+    gPropHost->propSetString(stereoPackingProps, kOfxPropLabel, 0, kParamStereoPackingLabel);
+    gPropHost->propSetString(stereoPackingProps, kOfxParamPropScriptName, 0, kParamStereoPacking);
+    gPropHost->propSetString(stereoPackingProps, kOfxParamPropHint, 0, kParamStereoPackingHint);
+    gPropHost->propSetString(stereoPackingProps, kOfxParamPropChoiceOption, 0, "Side-by-Side");
+    gPropHost->propSetString(stereoPackingProps, kOfxParamPropChoiceOption, 1, "Top-Bottom");
+    gPropHost->propSetInt(stereoPackingProps, kOfxParamPropDefault, 0, 0); // Side-by-Side
+    gPropHost->propSetInt(stereoPackingProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(stereoPackingProps, kOfxParamPropParent, 0, "stereoGroup");
+
+    // Define stream status parameter (informational display) - in Stereo group
+    OfxPropertySetHandle stereoStatusProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamStereoStatus, &stereoStatusProps);
+    gPropHost->propSetString(stereoStatusProps, kOfxPropLabel, 0, kParamStereoStatusLabel);
+    gPropHost->propSetString(stereoStatusProps, kOfxParamPropScriptName, 0, kParamStereoStatus);
+    gPropHost->propSetString(stereoStatusProps, kOfxParamPropHint, 0, kParamStereoStatusHint);
+    gPropHost->propSetString(stereoStatusProps, kOfxParamPropDefault, 0, "Mono");
+    gPropHost->propSetInt(stereoStatusProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetInt(stereoStatusProps, kOfxParamPropPersistant, 0, 0); // live status, not a setting
+    gPropHost->propSetString(stereoStatusProps, kOfxParamPropParent, 0, "stereoGroup");
 
     // Define GPU acceleration parameter - in Performance group
     OfxPropertySetHandle gpuAccelerationProps = NULL;
@@ -1397,6 +2431,16 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(maxFALLProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(maxFALLProps, kOfxParamPropParent, 0, "hdrGroup");
 
+    // Define debug logging parameter - in Diagnostics group
+    OfxPropertySetHandle debugLoggingProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeBoolean, kParamDebugLogging, &debugLoggingProps);
+    gPropHost->propSetString(debugLoggingProps, kOfxPropLabel, 0, kParamDebugLoggingLabel);
+    gPropHost->propSetString(debugLoggingProps, kOfxParamPropScriptName, 0, kParamDebugLogging);
+    gPropHost->propSetString(debugLoggingProps, kOfxParamPropHint, 0, kParamDebugLoggingHint);
+    gPropHost->propSetInt(debugLoggingProps, kOfxParamPropDefault, 0, 0); // Default to disabled
+    gPropHost->propSetInt(debugLoggingProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(debugLoggingProps, kOfxParamPropParent, 0, "diagnosticsGroup");
+
     return kOfxStatOK;
 }
 
@@ -1416,7 +2460,7 @@ static OfxStatus pluginMain(const char *action, const void *handle, OfxPropertyS
             return describeInContext((OfxImageEffectHandle) handle, inArgs);
         }
         else if (strcmp(action, kOfxActionCreateInstance) == 0) {
-            return createInstance((OfxImageEffectHandle) handle);
+            return createInstance((OfxImageEffectHandle) handle, inArgs);
         }
         else if (strcmp(action, kOfxActionDestroyInstance) == 0) {
             return destroyInstance((OfxImageEffectHandle) handle);

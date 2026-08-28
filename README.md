@@ -2,8 +2,8 @@
 
 A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Network Device Interface) for streaming over network with comprehensive HDR support.
 
-> **Latest Release**: v1.1.4 - Fixed vertical flip issue, GPU acceleration framework ready  
-> **Quick Install**: `cd Releases/v1.1.4/ && ./install.sh`
+> **Latest Release**: see [`VERSION`](VERSION) and [`Releases/`](Releases/) for the newest build and its release notes.  
+> **Build & Install**: [BUILD.md](BUILD.md) · **Dev workflow & testing loop**: [LEARNINGS.md](LEARNINGS.md)
 
 ## Features
 
@@ -13,6 +13,7 @@ A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Netw
   - Rec.2020, DCI-P3, and Rec.709 color spaces
   - Configurable Max Content Light Level (CLL) and Max Frame Average Light Level (FALL)
   - HDR metadata embedding for proper downstream handling
+- **Stereo Timelines**: On a native stereo timeline (Stereo 3D palette at **Vision: Stereo**), the plugin pairs the left/right eye renders per frame and streams **one packed frame** — Side-by-Side or Top-Bottom (Stereo group) — for VR receivers such as VR.NDI on Quest. If one eye stops rendering, the stream degrades to labeled single-eye mono (see the **Stream Status** parameter) instead of freezing. Mono timelines are unaffected.
 - **NDI Advanced SDK**: Uses NDI Advanced SDK v6.1.1 for enhanced features and performance
 - **Real-time Streaming**: Low-latency video streaming over network
 - **Pass-through Design**: Maintains original video quality while streaming
@@ -22,47 +23,18 @@ A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Netw
 
 - macOS 10.15+ (Catalina or later)
 - DaVinci Resolve 17+ (tested with DaVinci Resolve 20)
-- NDI Advanced SDK v6.1.1 (automatically installed)
+- NDI Advanced SDK 6.x installed at `/Library/NDI Advanced SDK for Apple/` ([download](https://ndi.video/for-developers/))
 
 ## Installation
 
-### Quick Install from Release (Recommended)
+Full instructions (prerequisites, build, install, verification, troubleshooting, Windows status) live in **[BUILD.md](BUILD.md)**. The short version for macOS:
 
-1. **Download the latest release** from `Releases/v1.1.4/`
-2. **Run the installer**:
-   ```bash
-   cd Releases/v1.1.4/
-   ./install.sh
-   ```
-3. **Restart DaVinci Resolve**
+```bash
+make dev            # build
+sudo make install   # install to /Library/OFX/Plugins
+```
 
-### Prerequisites
-
-1. **Install NDI Advanced SDK** (if not already installed):
-   ```bash
-   # The SDK should be installed at:
-   /Library/NDI Advanced SDK for Apple/
-   ```
-
-2. **Create symbolic link** (required for build system):
-   ```bash
-   sudo ln -sf "/Library/NDI Advanced SDK for Apple" "/Library/NDI_Advanced_SDK"
-   ```
-
-### Development Build and Install
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/your-repo/LSVR_ResolveOFX_NDIOutput.git
-   cd LSVR_ResolveOFX_NDIOutput
-   ```
-
-2. **Build and install**:
-   ```bash
-   make install
-   ```
-
-3. **Restart DaVinci Resolve** to load the new plugin.
+Then restart DaVinci Resolve — OFX plugins are only scanned at startup. Prebuilt bundles for shipped versions are in [`Releases/`](Releases/).
 
 ## Usage
 
@@ -111,52 +83,10 @@ The project uses a modern, streamlined build system:
 
 ## Development
 
-### Building from Source
-
-```bash
-# Clean build
-make clean
-
-# Build with automatic version increment (production)
-make
-
-# Development build without version increment
-make dev
-
-# Install the plugin
-make install
-```
-
-### Version Management
-
-The project uses semantic versioning (MAJOR.MINOR.PATCH):
-
-```bash
-# Show current version
-make show-version
-
-# Automatic patch increment (done on 'make')
-./scripts/increment_version.sh
-
-# Manual version setting
-./scripts/set_version.sh major 2.0.0    # Set major version
-./scripts/set_version.sh minor 1.1.0    # Set minor version  
-./scripts/set_version.sh patch 1.0.5    # Set patch version
-./scripts/set_version.sh 1.2.3          # Set specific version
-
-# Development builds (no version increment)
-make dev
-```
-
-**Version Strategy**:
-- **MAJOR**: Breaking changes or major feature releases
-- **MINOR**: New features, backward compatible
-- **PATCH**: Bug fixes, small improvements (auto-incremented on each build)
-
-**Build Commands**:
-- `make` - Production build with automatic patch increment
-- `make dev` - Development build without version increment
-- `make show-version` - Display current version
+- **Branching:** `master` is stable; all work happens on `dev` (or `feature/*` off `dev`) and merges to `master` by PR once validated. See [LEARNINGS.md](LEARNINGS.md) §1.
+- **Building:** `make dev` / `make clean` — details in [BUILD.md](BUILD.md). No make target changes the version.
+- **Versioning:** semantic versioning; bump only via `./scripts/increment_version.sh` (patch) or `./scripts/set_version.sh X.Y.Z`, which keep `VERSION` and the source `#define`s in sync.
+- **Testing:** every change goes through the tiered testing loop in [LEARNINGS.md](LEARNINGS.md) §2 (compile → load in Resolve → verify stream in an NDI receiver → feature-specific checks) before it's considered done.
 
 ### Project Structure
 
@@ -183,7 +113,6 @@ make dev
 1. **Check NDI SDK Installation**:
    ```bash
    ls -la "/Library/NDI Advanced SDK for Apple/"
-   ls -la "/Library/NDI_Advanced_SDK"  # Symbolic link
    ```
 
 2. **Verify Plugin Installation**:
@@ -199,9 +128,10 @@ make dev
 ### No NDI Source Visible
 
 1. **Check Plugin Parameters**: Ensure "Enable NDI Output" is checked
-2. **Verify Network**: Ensure devices are on the same network
-3. **Check NDI Tools**: Use NDI Video Monitor to verify source availability
-4. **Restart DaVinci Resolve**: Sometimes required after parameter changes
+2. **Check Stream Status** (Stereo group): "No NDI sender — name unavailable" means the source name is already advertised on this machine (another app, or a leaked registration from a crashed session — `dns-sd -B _ndi._tcp local.` shows it). Change the NDI Source Name, or quit the process holding it
+3. **Verify Network**: Ensure devices are on the same network
+4. **Check NDI Tools**: Use NDI Video Monitor to verify source availability
+5. **Restart DaVinci Resolve**: Sometimes required after parameter changes
 
 ### HDR Issues
 
@@ -211,20 +141,7 @@ make dev
 
 ## Version History
 
-### v1.0.x (Current)
-- **v1.0.2**: Added semantic versioning system with automatic patch increment
-- **v1.0.1**: Version system implementation
-- **v1.0.0**: Modern OFX C API implementation with full HDR support
-  - Modern OFX C API implementation
-  - Full HDR support with PQ/HLG transfer functions
-  - NDI Advanced SDK v6.1.1 integration
-  - Improved compatibility with DaVinci Resolve 20+
-  - Enhanced parameter controls and metadata handling
-
-### v0.x (Legacy)
-- Original implementation using OFX wrapper classes
-- Basic NDI streaming functionality
-- Limited HDR support
+The current version is in [`VERSION`](VERSION). Per-release details live in [CHANGELOG.md](CHANGELOG.md) and the `RELEASE_NOTES` files under [`Releases/`](Releases/). Notable fixes and the rules they taught us are logged in [LEARNINGS.md](LEARNINGS.md) §3.
 
 ## License
 
@@ -232,11 +149,11 @@ This project is licensed under the BSD 3-Clause License - see the LICENSE file f
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly with DaVinci Resolve
-5. Submit a pull request
+1. Branch off `dev` (never work on `master`)
+2. Make your changes; build with `make dev`
+3. Validate through the testing loop in [LEARNINGS.md](LEARNINGS.md) §2
+4. If you fixed a bug, add an entry to the log in [LEARNINGS.md](LEARNINGS.md) §3
+5. Open a pull request into `master`
 
 ## Support
 

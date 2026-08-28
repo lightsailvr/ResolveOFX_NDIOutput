@@ -25,11 +25,37 @@ BUNDLE_NAME = NDIOutput.ofx.bundle
 BUNDLE_EXECUTABLE = $(BUNDLE_NAME)/Contents/macOS/NDIOutput.ofx
 
 # Build targets
-.PHONY: all clean dev install
+.PHONY: all clean dev install test test-metal
 
 all: $(BUNDLE_EXECUTABLE)
 
 dev: $(BUNDLE_EXECUTABLE)
+
+# Host-independent unit tests (no Resolve or NDI SDK needed)
+test:
+	mkdir -p build
+	$(CXX) -Isrc tests/test_render_probe.cpp -o build/test_render_probe
+	./build/test_render_probe
+	$(CXX) -Isrc tests/test_stream_resolution.cpp -o build/test_stream_resolution
+	./build/test_stream_resolution
+	$(CXX) -Isrc tests/test_stereo_pair.cpp -o build/test_stereo_pair
+	./build/test_stereo_pair
+
+# GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
+test-metal: src/MetalGPUAcceleration.o
+	mkdir -p build
+	$(CXX) -Isrc tests/test_metal_downscale.mm src/MetalGPUAcceleration.o \
+		-o build/test_metal_downscale -framework Metal -framework Foundation
+	./build/test_metal_downscale
+
+# Pipeline timing harness at production 8K dims (needs Metal + NDI SDK, no
+# Resolve). Reproduces the plugin's per-pair send pattern; see the file header.
+bench: src/MetalGPUAcceleration.o
+	mkdir -p build
+	$(CXX) -Isrc -I$(NDI_INCLUDE) tests/bench_pipeline.mm src/MetalGPUAcceleration.o \
+		-o build/bench_pipeline -framework Metal -framework Foundation $(NDI_LIB)
+	install_name_tool -change "@rpath/libndi_advanced.dylib" $(NDI_LIB) build/bench_pipeline
+	./build/bench_pipeline
 
 $(BUNDLE_EXECUTABLE): $(OBJECTS) | bundle_structure
 	@echo "Building NDI Output Plugin v$(VERSION)"
@@ -58,7 +84,8 @@ install: $(BUNDLE_EXECUTABLE)
 # Clean
 clean:
 	rm -rf $(BUNDLE_NAME)
-	rm -f *.o
+	rm -f *.o src/*.o
+	rm -rf build
 
 # Version increment (for development)
 bump-patch:

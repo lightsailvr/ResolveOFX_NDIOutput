@@ -171,6 +171,39 @@ it will be bypassed during LUT generation.
  */
 #define kOfxImageEffectPropNoSpatialAwareness "OfxImageEffectPropNoSpatialAwareness"
 
+/* The properties below were merged in from the Resolve 21.0.4 shipped copy of this
+   header (/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/
+   OpenFX/OpenFX-1.4/include/ofxImageEffectExt.h). That copy drops the GPU-render
+   properties above; they are kept here so both sets stay available. */
+
+/** @brief Indicates the source file path. This source file image will be used as input to the created plugin.
+   - Type - string X 1
+   - Property Set - image effect instance (read only)
+   - Default - ""
+ */
+#define kOfxImageEffectPropSrcFilePath "OfxImageEffectPropSrcFilePath"
+
+/** @brief Indicates the source frame that is being rendered
+   - Type - int X 1
+   - Property Set - inArgs property set of the kOfxImageEffectActionRender action
+ */
+#define kOfxImageEffectPropSrcFrame "OfxImageEffectPropSrcFrame"
+
+/** @brief Indicates which eye is being rendered
+    - Type - int X 1
+    - Property Set - a read only in argument property to ::kOfxImageEffectActionRender
+    - Valid Values - This must be one of
+      - ::kOfxImageEyeLeft  - the image rendered is meant for the mono or left stereo frame of output
+      - ::kOfxImageEyeRight - the image rendered is meant for the right stereo frame of output
+ */
+#define kOfxImageEffectPropEyeToRender "OfxImageEffectPropEyeToRender"
+
+typedef enum OfxImageEye
+{
+   kOfxImageEyeLeft,  // mono or left stereo frame
+   kOfxImageEyeRight, // right stereo frame
+} OfxImageEye;
+
 #ifdef __cplusplus
 }
 #endif
