@@ -3,7 +3,7 @@
 **Date started:** 2026-08-28 · **Plugin:** NDIOutput ≥ v1.3.0 · **Host:** DaVinci Resolve Studio 21.0.4, macOS 26.x
 **Issue:** [#3](https://github.com/lightsailvr/ResolveOFX_NDIOutput/issues/3) — instrument every render call (eye, page, thumbnail, cadence) so host behavior is observed, not guessed.
 
-**Status: instrumentation shipped (v1.3.0); all four captures PENDING.** Each scenario needs a human at the Resolve machine — playback cannot be scripted (the Resolve API has no transport control, see [LEARNINGS.md](../LEARNINGS.md) §2). Fill in each *Findings* section from the capture files and flip this line to **complete**.
+**Status: instrumentation shipped (v1.3.0); scenario 2 Edit-page captured — headline: the right eye never renders on the Edit page.** Remaining: scenario 2 Color page + palette-armed variant, scenarios 1, 3, 4. Each capture needs a human at the Resolve machine — playback cannot be scripted (the Resolve API has no transport control, see [LEARNINGS.md](../LEARNINGS.md) §2). Fill in each *Findings* section from the capture files and flip this line to **complete** when all four are in.
 
 ---
 
@@ -62,7 +62,22 @@ Answering cadence questions directly from a capture:
 - **Questions:** **Does the right eye render at all during Edit-page playback — and at what cadence?** (Every frame? Only the displayed eye? Only on pause?) Same for the Color page. Do `eye=L`/`eye=R` calls for one frame share `time`/`src` (→ pairing key for the stereo tap)? What order and spacing?
 - **Why it matters:** architecture A in the [feasibility study](2026-08-28-resolve-stereo-program-tap-feasibility.md) §4 stands on pairing per-eye render calls; if the second eye never renders during Edit-page playback, the Edit-page stereo tap needs the palette armed, or falls back to architecture B.
 
-**Findings:** _pending capture_
+**Findings — Edit page (captured 2026-08-28, [capture file](captures/2026-08-28-stereo-timeline-edit-page.log)):**
+
+**The right eye never rendered. All 92 render calls in the session were `eye=L`** — across scrubbing, parked re-renders, and true playback. The capture decodes into three phases:
+
+- Scrub/background activity (`#11–39`, `#52–72`): times oscillating non-monotonically over ~7700–10100 at ~300 ms spacing.
+- Parked (`#40–51`): frame 8310 re-rendered 12× (param edits re-render the parked frame), with multi-second idle gaps.
+- **Linear playback (`#77–92`): `time` strictly monotonic +1 (7665→7680) at ~230 ms/frame.** Resolve rendered every timeline frame sequentially — render-rate-limited well below real time at 4096×4096, no frame drops — and still only ever the left eye.
+
+Supporting observations from the same capture:
+
+- `dim=4096x4096` throughout — single-eye-sized frames; no packed/double-width frame ever reached the seam (consistent with the feasibility study §1.2).
+- Two `dim=184x92 thumb=1` lines — filmstrip thumbnail renders hit the render action and the thumbnail flag correctly identifies them (the later "skip thumbnails" work is both needed and possible).
+- `page=?` on all calls — **Resolve 21.0.4 did not deliver `OfxImageEffectPropResolvePage` at createInstance** for this instance (created at project load), contradicting the shipped header's stated delivery point. Needs a re-test with the effect freshly added from the UI on a known page.
+- `src − time = 215400` constant on every line — `src` tracks the timeline frame exactly (clip offset), so it remains the candidate L/R pairing key if per-eye calls ever appear.
+
+**Still pending for this scenario:** the Color-page capture, and the variant with the Stereo 3D palette Out mode armed (Side by Side) — the last hope for forcing right-eye renders on the Edit page. A longer playback stretch (≥15 s) would also firm up the cadence numbers; `dt` here includes the plugin's own ~full-frame processing at 4096², so treat ~230 ms as an upper bound on host cadence, not a measurement of it.
 
 ### Scenario 3 — Resolve 21 "Standard Immersive" VR180 project
 
@@ -88,10 +103,10 @@ With **Log Render Calls off**, the probe costs one boolean parameter read and on
 
 | Question | Answer | Evidence |
 |---|---|---|
-| Second eye during Edit-page playback? | _pending_ | |
+| Second eye during Edit-page playback? | **No — left eye only**, incl. a 16-frame monotonic playback stretch (pending confirmation with palette armed) | [stereo-timeline-edit-page](captures/2026-08-28-stereo-timeline-edit-page.log), scenario 2 findings |
 | Second eye on Color page / with palette armed? | _pending_ | |
-| Pairing key for L/R (same `time`? same `src`?) | _pending_ | |
+| Pairing key for L/R (same `time`? same `src`?) | _pending R sightings_ — `src` tracks `time` exactly (constant clip offset), so it's the candidate | same capture |
 | VR180 Standard Immersive: per-eye or packed? | _pending_ | |
 | Proxy mode: `scale=` vs `dim=`? | _pending_ | |
-| Page property actually delivered at createInstance? | _pending_ | |
-| Thumbnail renders observed (`thumb=1`)? | _pending_ | |
+| Page property actually delivered at createInstance? | **No** (instance created at project load) — `page=?` on all calls; retest with effect freshly added per page | same capture |
+| Thumbnail renders observed (`thumb=1`)? | **Yes** — 184×92 filmstrip renders, correctly flagged | same capture |
