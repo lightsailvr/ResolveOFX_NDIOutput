@@ -409,6 +409,123 @@ inline bool loadSTMapEXR(const char* path, STMapImage* out, std::string* error)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Packed side-by-side STMap split (Canon VR-style authoring): one EXR whose
+// left half is the left eye's map and right half the right eye's. Each half's
+// U values can follow either convention — per-eye (spanning [0,1] against a
+// single eye's frame) or packed-frame (the left source half is u∈[0,0.5], the
+// right u∈[0.5,1]) — and the two are unambiguous in real maps: a fisheye→
+// equirect per-eye map spans nearly the full U range, a packed-frame half
+// sits inside half of it. So the split classifies each half from its VALID
+// texels and rescales packed-frame U to per-eye ((u - offset) * 2). Detection
+// is per half, which also absorbs maps that bake in the Canon eye swap (a
+// destination half sampling the OTHER source half just gets the other
+// offset). V is never touched — the packing is horizontal.
+// ---------------------------------------------------------------------------
+
+enum class PackedHalfCoords {
+    PerEye,           // U already spans a single eye's frame — plain crop
+    PackedLeftHalf,   // U referenced the packed frame's left half — rescaled
+    PackedRightHalf,  // U referenced the packed frame's right half — rescaled
+    NoValidTexels,    // nothing to classify — copied verbatim
+};
+
+// Classification thresholds: valid U confined below/above these marks means
+// packed-frame coords. Real per-eye maps span far past both.
+constexpr float kPackedDetectLow = 0.45f;
+constexpr float kPackedDetectHigh = 0.55f;
+
+inline const char* packedHalfCoordsName(PackedHalfCoords c)
+{
+    switch (c) {
+        case PackedHalfCoords::PackedLeftHalf: return "packed-frame coords (left half, U rescaled)";
+        case PackedHalfCoords::PackedRightHalf: return "packed-frame coords (right half, U rescaled)";
+        case PackedHalfCoords::NoValidTexels: return "no valid texels (copied verbatim)";
+        case PackedHalfCoords::PerEye:
+        default: return "per-eye coords (copied)";
+    }
+}
+
+namespace detail {
+
+// Copy columns [x0, x0+outWidth) of `packed` into `out`, classifying the
+// half's U convention and rescaling packed-frame U to per-eye. Invalid texels
+// (NaN / outside [0,1]) are excluded from classification; the rescale keeps
+// them invalid (NaN stays NaN, out-of-range values move further out).
+inline PackedHalfCoords extractPackedHalf(const STMapImage& packed, int x0, STMapImage* out)
+{
+    const int outWidth = packed.width / 2;
+    out->width = outWidth;
+    out->height = packed.height;
+    out->uv.assign(static_cast<size_t>(outWidth) * packed.height * 2, 0.0f);
+
+    float uMin = 1.0f, uMax = 0.0f;
+    bool anyValid = false;
+    for (int row = 0; row < packed.height; ++row) {
+        const float* srcRow = packed.uv.data() +
+                              (static_cast<size_t>(row) * packed.width + x0) * 2;
+        for (int x = 0; x < outWidth; ++x) {
+            const float u = srcRow[static_cast<size_t>(x) * 2];
+            const float v = srcRow[static_cast<size_t>(x) * 2 + 1];
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                anyValid = true;
+                uMin = std::min(uMin, u);
+                uMax = std::max(uMax, u);
+            }
+        }
+    }
+
+    PackedHalfCoords coords = PackedHalfCoords::PerEye;
+    float offset = 0.0f;
+    if (!anyValid) {
+        coords = PackedHalfCoords::NoValidTexels;
+    } else if (uMax <= kPackedDetectHigh) {
+        coords = PackedHalfCoords::PackedLeftHalf;
+        offset = 0.0f;
+    } else if (uMin >= kPackedDetectLow) {
+        coords = PackedHalfCoords::PackedRightHalf;
+        offset = 0.5f;
+    }
+
+    const bool rescale = (coords == PackedHalfCoords::PackedLeftHalf ||
+                          coords == PackedHalfCoords::PackedRightHalf);
+    for (int row = 0; row < packed.height; ++row) {
+        const float* srcRow = packed.uv.data() +
+                              (static_cast<size_t>(row) * packed.width + x0) * 2;
+        float* dstRow = out->uv.data() + static_cast<size_t>(row) * outWidth * 2;
+        for (int x = 0; x < outWidth; ++x) {
+            const float u = srcRow[static_cast<size_t>(x) * 2];
+            dstRow[static_cast<size_t>(x) * 2] = rescale ? (u - offset) * 2.0f : u;
+            dstRow[static_cast<size_t>(x) * 2 + 1] = srcRow[static_cast<size_t>(x) * 2 + 1];
+        }
+    }
+    return coords;
+}
+
+} // namespace detail
+
+// Split a side-by-side packed STMap into per-eye maps (left half → left eye).
+// Returns false with *error on an unsplittable map; *leftCoords/*rightCoords
+// report what each half's U convention was detected as (for the log — the
+// caller should surface the decision).
+inline bool splitPackedSTMap(const STMapImage& packed,
+                             STMapImage* leftEye, STMapImage* rightEye,
+                             PackedHalfCoords* leftCoords, PackedHalfCoords* rightCoords,
+                             std::string* error)
+{
+    if (packed.width < 2 || (packed.width % 2) != 0 || packed.height < 1 ||
+        packed.uv.size() != static_cast<size_t>(packed.width) * packed.height * 2) {
+        if (error) {
+            *error = "packed side-by-side STMap needs an even width (got " +
+                     std::to_string(packed.width) + "x" + std::to_string(packed.height) + ")";
+        }
+        return false;
+    }
+    *leftCoords = detail::extractPackedHalf(packed, 0, leftEye);
+    *rightCoords = detail::extractPackedHalf(packed, packed.width / 2, rightEye);
+    return true;
+}
+
 namespace detail {
 
 // Bilinear source fetch with integer clamps on every index, so even a

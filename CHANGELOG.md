@@ -5,6 +5,18 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-08-30
+
+> Tier 0 + `make test` (179 assertions; 21 new for the packed-map split) + `make test-metal` pass. Tier 1–3 pending alongside 1.7.0.
+
+### Added
+- **STMap Layout** parameter (Projection group): **Per-Eye Files** (as in 1.7.0) or **Packed Side-by-Side** — one EXR whose left half maps the left eye and right half the right eye (Canon VR-style authoring). In packed layout the single file goes in the left-eye slot and the plugin splits it into per-eye maps; the right-eye slot is ignored. Split halves are cached process-wide like whole files, and the full packed image is only held while splitting.
+- Each half's U-coordinate convention is **auto-detected** (per-eye [0,1] vs packed-frame [0,0.5]/[0.5,1]) and rescaled when needed; the decision is logged per half. Detection is per half, so maps that bake in the Canon eye swap (a destination half sampling the other source half) rescale correctly too. Eye assignment always comes from the timeline's stereo tracks — the map halves define geometry only.
+- Note: for a packed-frame source on a **mono** timeline (e.g. a dual-fisheye clip), keep **Per-Eye Files** and load the one packed map in the left slot — it warps the whole frame and streams packed SbS equirect (this worked in 1.7.0 already; now documented in the hints).
+
+### Changed
+- The STMap path params leave `FilePathExists` at its spec default, so a host that renders a picker for filePath strings shows an open-existing dialog. Whether Resolve draws a browse button is still the pending Tier-1 check; pasting a path works regardless.
+
 ## [1.7.0] - 2026-08-30
 
 > Tier 0 + `make test` (158 assertions incl. the 41 new STMap-seam checks) + `make test-metal` (25 checks incl. the warp kernels) pass. Tier 1–3 (Resolve install, stream check, fisheye timeline verified in the Quest stereo-180 player against a Fusion-authored STMap) pending.

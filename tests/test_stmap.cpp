@@ -662,6 +662,167 @@ int main()
               "source row stride honored (padding never leaks in)");
     }
 
+    // ---- splitPackedSTMap: one side-by-side packed map -> per-eye maps ----
+    {
+        using ndi_stmap::PackedHalfCoords;
+        const int W = 8, H = 2, halfW = 4;
+
+        // Build a packed map: per-column u values, v = column-independent
+        // per-row values (must survive the split untouched).
+        auto makePacked = [&](const float uCols[8]) {
+            std::vector<float> uv(static_cast<size_t>(W) * H * 2);
+            for (int row = 0; row < H; ++row) {
+                for (int x = 0; x < W; ++x) {
+                    uv[(static_cast<size_t>(row) * W + x) * 2 + 0] = uCols[x];
+                    uv[(static_cast<size_t>(row) * W + x) * 2 + 1] = row == 0 ? 0.75f : 0.25f;
+                }
+            }
+            return uv;
+        };
+        auto uAt = [&](const ndi_stmap::STMapImage& m, int x, int row) {
+            return m.uv[(static_cast<size_t>(row) * m.width + x) * 2 + 0];
+        };
+        auto vAt = [&](const ndi_stmap::STMapImage& m, int x, int row) {
+            return m.uv[(static_cast<size_t>(row) * m.width + x) * 2 + 1];
+        };
+
+        // Per-eye coords: both halves span nearly the full [0,1] u range.
+        {
+            const float uCols[8] = {0.125f, 0.375f, 0.625f, 0.875f,   // left half
+                                    0.875f, 0.625f, 0.375f, 0.125f};  // right half
+            ndi_stmap::STMapImage packed;
+            packed.width = W; packed.height = H; packed.uv = makePacked(uCols);
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            check(ok && left.width == halfW && right.width == halfW &&
+                      left.height == H && right.height == H,
+                  "per-eye-coords split: halves have half width, same height");
+            check(cl == PackedHalfCoords::PerEye && cr == PackedHalfCoords::PerEye,
+                  "per-eye-coords split: both halves detected as per-eye");
+            expectFloat(uAt(left, 1, 0), 0.375f, "per-eye-coords split copies left u verbatim");
+            expectFloat(uAt(right, 3, 1), 0.125f, "per-eye-coords split copies right u verbatim");
+            expectFloat(vAt(left, 2, 0), 0.75f, "split leaves v untouched (row 0)");
+            expectFloat(vAt(right, 0, 1), 0.25f, "split leaves v untouched (row 1)");
+        }
+
+        // Packed-frame coords: left half samples u in [0,0.5], right in
+        // [0.5,1]; the split rescales each half to per-eye [0,1].
+        {
+            const float uCols[8] = {0.0625f, 0.1875f, 0.3125f, 0.4375f,
+                                    0.5625f, 0.6875f, 0.8125f, 0.9375f};
+            ndi_stmap::STMapImage packed;
+            packed.width = W; packed.height = H; packed.uv = makePacked(uCols);
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            check(ok && cl == PackedHalfCoords::PackedLeftHalf &&
+                      cr == PackedHalfCoords::PackedRightHalf,
+                  "packed-frame coords detected on both halves");
+            expectFloat(uAt(left, 0, 0), 0.125f, "left half u rescaled x2");
+            expectFloat(uAt(left, 3, 0), 0.875f, "left half u rescaled x2 (last column)");
+            expectFloat(uAt(right, 0, 0), 0.125f, "right half u rescaled (-0.5)*2");
+            expectFloat(uAt(right, 3, 1), 0.875f, "right half u rescaled (-0.5)*2 (last column)");
+            expectFloat(vAt(left, 1, 0), 0.75f, "packed-frame split leaves v untouched");
+        }
+
+        // Canon-style swap baked into the map: the left DESTINATION half
+        // samples the RIGHT source half. Detection is per half, so the
+        // rescale offset follows where the values sit.
+        {
+            const float uCols[8] = {0.5625f, 0.6875f, 0.8125f, 0.9375f,
+                                    0.0625f, 0.1875f, 0.3125f, 0.4375f};
+            ndi_stmap::STMapImage packed;
+            packed.width = W; packed.height = H; packed.uv = makePacked(uCols);
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            check(ok && cl == PackedHalfCoords::PackedRightHalf &&
+                      cr == PackedHalfCoords::PackedLeftHalf,
+                  "swapped packed-frame halves each detect their own offset");
+            expectFloat(uAt(left, 0, 0), 0.125f, "swapped left half rescales from [0.5,1]");
+            expectFloat(uAt(right, 0, 0), 0.125f, "swapped right half rescales from [0,0.5]");
+        }
+
+        // Invalid texels (NaN / out-of-range) are excluded from detection and
+        // stay invalid after the split — they must never become valid samples.
+        {
+            float uCols[8] = {0.0625f, 0.1875f, 0.3125f, 0.4375f,
+                              0.5625f, 0.6875f, 0.8125f, 0.9375f};
+            ndi_stmap::STMapImage packed;
+            packed.width = W; packed.height = H; packed.uv = makePacked(uCols);
+            packed.uv[0] = std::nanf("");   // (0,0) u = NaN
+            packed.uv[2 * 2] = 1.5f;        // (2,0) u out of range
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            const float nanU = uAt(left, 0, 0);
+            const float bigU = uAt(left, 2, 0);
+            check(ok && cl == PackedHalfCoords::PackedLeftHalf,
+                  "invalid texels don't disturb packed-frame detection");
+            check(!(nanU >= 0.0f && nanU <= 1.0f) && !(bigU >= 0.0f && bigU <= 1.0f),
+                  "invalid texels stay invalid after the rescale");
+        }
+
+        // A half with no valid texels at all: copied verbatim, labeled so.
+        {
+            const float uCols[8] = {2.0f, -1.0f, 3.0f, 2.5f,
+                                    0.125f, 0.375f, 0.625f, 0.875f};
+            ndi_stmap::STMapImage packed;
+            packed.width = W; packed.height = H; packed.uv = makePacked(uCols);
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            check(ok && cl == PackedHalfCoords::NoValidTexels && cr == PackedHalfCoords::PerEye,
+                  "all-invalid half labeled NoValidTexels, copied verbatim");
+            expectFloat(uAt(left, 3, 0), 2.5f, "all-invalid half values unchanged");
+        }
+
+        // A packed-frame identity map splits into two per-eye identity maps —
+        // the property that makes one Canon packed file equivalent to two
+        // per-eye files.
+        {
+            const int pw = 16, ph = 4;
+            std::vector<float> uv(static_cast<size_t>(pw) * ph * 2);
+            for (int row = 0; row < ph; ++row) {
+                const float v = (ph - 1 - row + 0.5f) / ph;
+                for (int x = 0; x < pw; ++x) {
+                    uv[(static_cast<size_t>(row) * pw + x) * 2 + 0] = (x + 0.5f) / pw;
+                    uv[(static_cast<size_t>(row) * pw + x) * 2 + 1] = v;
+                }
+            }
+            ndi_stmap::STMapImage packed;
+            packed.width = pw; packed.height = ph; packed.uv = uv;
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            std::vector<float> ident = identityMapUV(pw / 2, ph);
+            check(ok &&
+                      std::memcmp(left.uv.data(), ident.data(), ident.size() * 4) == 0 &&
+                      std::memcmp(right.uv.data(), ident.data(), ident.size() * 4) == 0,
+                  "packed-frame identity map splits into two per-eye identity maps");
+        }
+
+        // Odd packed width can't split into two equal eyes.
+        {
+            ndi_stmap::STMapImage packed;
+            packed.width = 7; packed.height = 2;
+            packed.uv.assign(7 * 2 * 2, 0.5f);
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            check(!ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err) &&
+                      !err.empty(),
+                  "odd packed width fails soft with an error message");
+        }
+    }
+
     if (failures) {
         std::fprintf(stderr, "%d test(s) FAILED\n", failures);
         return 1;

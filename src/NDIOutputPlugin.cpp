@@ -100,9 +100,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 7
+#define kPluginVersionMinor 8
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.7.0"
+#define kPluginVersionString "1.8.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -134,6 +134,10 @@
 #define kParamProjection "projectionMode"
 #define kParamProjectionLabel "Projection"
 #define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player. The warped output resolution equals the STMap's resolution (the Resolution control then applies on top). A missing or invalid STMap falls back to Passthrough and says so in Stream Status."
+
+#define kParamSTMapLayout "stmapLayout"
+#define kParamSTMapLayoutLabel "STMap Layout"
+#define kParamSTMapLayoutHint "How the STMap file(s) carry the eyes. Per-Eye Files: each loaded EXR applies whole to each rendered frame — also the right choice for a packed-frame source on a mono timeline (e.g. a dual-fisheye clip: one map in the left slot warps the whole packed frame). Packed Side-by-Side: the left-eye slot holds ONE EXR whose left half maps the left eye and right half the right eye (Canon VR-style authoring), for Stereo 3D timelines; each half's U convention (per-eye vs packed-frame coordinates) is auto-detected and logged, and the right-eye slot is ignored. Eye assignment always comes from the timeline's stereo tracks — the map halves define geometry only."
 
 #define kParamSTMapLeft "stmapLeft"
 #define kParamSTMapLeftLabel "STMap (Left Eye)"
@@ -328,6 +332,70 @@ static std::shared_ptr<StmapEntry> stmapAcquire(const std::string& path)
     return entry;
 }
 
+// Fetch BOTH per-eye maps derived from one side-by-side packed STMap file
+// (Canon VR-style authoring — see ndi_stmap::splitPackedSTMap for the split
+// and U-convention auto-detection). The derived halves are cached process-
+// wide under pseudo-keys (a real path can't contain '\n', so no collision
+// with file entries) and staleness-checked against the SOURCE file like any
+// entry; the full packed image is only held while splitting — once both
+// halves exist, its cache slot expires and the memory frees.
+static void stmapAcquirePackedPair(const std::string& path,
+                                   std::shared_ptr<StmapEntry>* leftOut,
+                                   std::shared_ptr<StmapEntry>* rightOut)
+{
+    const std::string keyLeft = path + "\n#packedSbS:L";
+    const std::string keyRight = path + "\n#packedSbS:R";
+    long long mtime = 0, size = 0;
+    const bool statOk = stmapFileStat(path.c_str(), &mtime, &size);
+    {
+        std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+        auto itL = gStmapCache.find(keyLeft);
+        auto itR = gStmapCache.find(keyRight);
+        if (itL != gStmapCache.end() && itR != gStmapCache.end()) {
+            std::shared_ptr<StmapEntry> left = itL->second.lock();
+            std::shared_ptr<StmapEntry> right = itR->second.lock();
+            if (left && right && statOk &&
+                left->fileMtime == mtime && left->fileSize == size) {
+                *leftOut = left;
+                *rightOut = right;
+                return;
+            }
+        }
+    }
+
+    std::shared_ptr<StmapEntry> packed = stmapAcquire(path); // shared, cached, stat-keyed
+    std::shared_ptr<StmapEntry> left = std::make_shared<StmapEntry>();
+    std::shared_ptr<StmapEntry> right = std::make_shared<StmapEntry>();
+    left->path = keyLeft;
+    right->path = keyRight;
+    left->fileMtime = right->fileMtime = packed->fileMtime;
+    left->fileSize = right->fileSize = packed->fileSize;
+    if (!packed->valid) {
+        left->error = right->error = packed->error;
+    } else {
+        ndi_stmap::PackedHalfCoords leftCoords, rightCoords;
+        std::string splitError;
+        if (ndi_stmap::splitPackedSTMap(packed->map, &left->map, &right->map,
+                                        &leftCoords, &rightCoords, &splitError)) {
+            left->valid = right->valid = true;
+            NDI_LOG_TEXT(("STMap packed SbS split: '" + path + "' " +
+                          std::to_string(packed->map.width) + "x" + std::to_string(packed->map.height) +
+                          " -> 2x " + std::to_string(left->map.width) + "x" + std::to_string(left->map.height) +
+                          "; left half: " + ndi_stmap::packedHalfCoordsName(leftCoords) +
+                          "; right half: " + ndi_stmap::packedHalfCoordsName(rightCoords)).c_str());
+        } else {
+            left->error = right->error = splitError;
+            NDI_LOG_TEXT(("STMap packed SbS split failed: '" + path + "' — " + splitError).c_str());
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+    gStmapCache[keyLeft] = left;
+    gStmapCache[keyRight] = right;
+    *leftOut = left;
+    *rightOut = right;
+}
+
 #ifdef __APPLE__
 // Per-device Metal upload of an STMap's uv data, cached on the shared entry:
 // uploaded once, referenced by every subsequent frame's command buffer (which
@@ -405,6 +473,7 @@ struct NDIInstanceData {
     OfxParamHandle stereoPackingParam;
     OfxParamHandle stereoStatusParam;
     OfxParamHandle projectionParam;
+    OfxParamHandle stmapLayoutParam;
     OfxParamHandle stmapLeftParam;
     OfxParamHandle stmapRightParam;
     OfxParamHandle hdrEnabledParam;
@@ -452,6 +521,7 @@ struct NDIInstanceData {
     // render is reading. renderStmap is this render's selected map (null =
     // passthrough), stashed like renderEye.
     int projectionMode = 0;             // 0 = Passthrough, 1 = Equirect (STMap)
+    int stmapLayout = 0;                // 0 = Per-Eye Files, 1 = Packed Side-by-Side
     std::string stmapLeftPathWanted;    // parameter values as last read
     std::string stmapRightPathWanted;
     std::mutex stmapMutex;
@@ -2032,11 +2102,18 @@ static OfxStatus onUnLoad(void)
 static void refreshSTMaps(NDIInstanceData* data)
 {
     const bool want = (data->projectionMode == 1);
+    const bool packedLayout = (data->stmapLayout == 1);
     std::shared_ptr<StmapEntry> left, right;
     if (want && !data->stmapLeftPathWanted.empty()) {
-        left = stmapAcquire(data->stmapLeftPathWanted);
+        if (packedLayout) {
+            // One packed side-by-side file yields both eyes; the right-eye
+            // slot is ignored in this layout (the param hint says so).
+            stmapAcquirePackedPair(data->stmapLeftPathWanted, &left, &right);
+        } else {
+            left = stmapAcquire(data->stmapLeftPathWanted);
+        }
     }
-    if (want && !data->stmapRightPathWanted.empty()) {
+    if (want && !packedLayout && !data->stmapRightPathWanted.empty()) {
         right = stmapAcquire(data->stmapRightPathWanted);
     }
 
@@ -2123,6 +2200,7 @@ static void readInstanceParams(NDIInstanceData* myData)
     gParamHost->paramGetValue(myData->stereoPackingParam, &myData->stereoPacking);
 
     gParamHost->paramGetValue(myData->projectionParam, &myData->projectionMode);
+    gParamHost->paramGetValue(myData->stmapLayoutParam, &myData->stmapLayout);
     char* stmapLeftPath = nullptr;
     gParamHost->paramGetValue(myData->stmapLeftParam, &stmapLeftPath);
     myData->stmapLeftPathWanted = stmapLeftPath ? stmapLeftPath : "";
@@ -2228,6 +2306,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamStereoPacking, &myData->stereoPackingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamStereoStatus, &myData->stereoStatusParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamProjection, &myData->projectionParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapLayout, &myData->stmapLayoutParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLeft, &myData->stmapLeftParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
@@ -2706,6 +2785,18 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(projectionProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(projectionProps, kOfxParamPropParent, 0, "projectionGroup");
 
+    // Define STMap layout parameter - in Projection group
+    OfxPropertySetHandle stmapLayoutProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamSTMapLayout, &stmapLayoutProps);
+    gPropHost->propSetString(stmapLayoutProps, kOfxPropLabel, 0, kParamSTMapLayoutLabel);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropScriptName, 0, kParamSTMapLayout);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropHint, 0, kParamSTMapLayoutHint);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropChoiceOption, 0, "Per-Eye Files");
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropChoiceOption, 1, "Packed Side-by-Side");
+    gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropDefault, 0, 0); // Per-Eye Files
+    gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropParent, 0, "projectionGroup");
+
     // Define left-eye STMap path parameter - in Projection group
     OfxPropertySetHandle stmapLeftProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamSTMapLeft, &stmapLeftProps);
@@ -2713,8 +2804,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropScriptName, 0, kParamSTMapLeft);
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropHint, 0, kParamSTMapLeftHint);
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropDefault, 0, "");
+    // FilePathExists stays at its spec default (1): hosts that render a
+    // picker for filePath strings show an open-existing dialog.
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
-    gPropHost->propSetInt(stmapLeftProps, kOfxParamPropStringFilePathExists, 0, 0); // empty default must stay legal
     gPropHost->propSetInt(stmapLeftProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropParent, 0, "projectionGroup");
 
@@ -2726,7 +2818,6 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapRightProps, kOfxParamPropHint, 0, kParamSTMapRightHint);
     gPropHost->propSetString(stmapRightProps, kOfxParamPropDefault, 0, "");
     gPropHost->propSetString(stmapRightProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
-    gPropHost->propSetInt(stmapRightProps, kOfxParamPropStringFilePathExists, 0, 0);
     gPropHost->propSetInt(stmapRightProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapRightProps, kOfxParamPropParent, 0, "projectionGroup");
 
