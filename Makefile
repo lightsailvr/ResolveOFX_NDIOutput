@@ -13,11 +13,11 @@ NDI_LIB = $(NDI_SDK_PATH)/lib/macOS/libndi_advanced.dylib
 CXX = c++
 CXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE)
 OBJCXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -x objective-c++
-LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -lz
+LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -framework AppKit -framework UniformTypeIdentifiers -lz
 
 # Source files
 SOURCES = src/NDIOutputPlugin.cpp
-OBJCXX_SOURCES = src/MetalGPUAcceleration.mm
+OBJCXX_SOURCES = src/MetalGPUAcceleration.mm src/MacFileDialog.mm
 OBJECTS = $(SOURCES:.cpp=.o) $(OBJCXX_SOURCES:.mm=.o)
 
 # Bundle structure

@@ -50,6 +50,7 @@
 #include "StreamResolution.h"
 
 #ifdef __APPLE__
+#include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
 #endif
 
@@ -100,9 +101,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 8
-#define kPluginVersionPatch 1
-#define kPluginVersionString "1.8.1"
+#define kPluginVersionMinor 9
+#define kPluginVersionPatch 0
+#define kPluginVersionString "1.9.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -146,6 +147,16 @@
 #define kParamSTMapRight "stmapRight"
 #define kParamSTMapRightLabel "STMap (Right Eye)"
 #define kParamSTMapRightHint "Optional right-eye STMap EXR (same format and resolution as the left map). Leave empty to warp both eyes through the left map."
+
+// Native browse buttons: Resolve renders filePath string params as plain
+// text fields with no browse control (verified 2026-08-30), so the plugin
+// pops its own NSOpenPanel from push-button params (macOS only).
+#define kParamSTMapLeftBrowse "stmapLeftBrowse"
+#define kParamSTMapLeftBrowseLabel "Browse for Left-Eye STMap..."
+#define kParamSTMapLeftBrowseHint "Pick the left-eye (or packed side-by-side) STMap EXR with a file dialog and fill the path field above."
+#define kParamSTMapRightBrowse "stmapRightBrowse"
+#define kParamSTMapRightBrowseLabel "Browse for Right-Eye STMap..."
+#define kParamSTMapRightBrowseHint "Pick the right-eye STMap EXR with a file dialog and fill the path field above."
 
 // GPU Acceleration Parameters
 #define kParamGPUAcceleration "gpuAcceleration"
@@ -2363,6 +2374,27 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         
         NDI_LOG("Parameter changed: %s", paramName);
 
+#ifdef __APPLE__
+        // Browse buttons: pop the native open panel and write the picked path
+        // into the matching STMap field, then fall through — the reads below
+        // pick the new value up and refreshSTMaps loads the map. Cancel (or
+        // any dialog failure) changes nothing.
+        if (strcmp(paramName, kParamSTMapLeftBrowse) == 0 ||
+            strcmp(paramName, kParamSTMapRightBrowse) == 0) {
+            const bool isLeft = (strcmp(paramName, kParamSTMapLeftBrowse) == 0);
+            OfxParamHandle pathParam = isLeft ? myData->stmapLeftParam : myData->stmapRightParam;
+            char* currentPath = nullptr;
+            gParamHost->paramGetValue(pathParam, &currentPath);
+            char picked[4096];
+            if (mac_open_file_dialog(isLeft ? "Choose the left-eye (or packed side-by-side) STMap EXR"
+                                            : "Choose the right-eye STMap EXR",
+                                     "exr", currentPath, picked, sizeof(picked))) {
+                gParamHost->paramSetValue(pathParam, picked);
+                NDI_LOG_TEXT((std::string("STMap browse picked: '") + picked + "'").c_str());
+            }
+        }
+#endif
+
         readInstanceParams(myData);
         refreshSTMaps(myData);
 
@@ -2810,6 +2842,17 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapLeftProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropParent, 0, "projectionGroup");
 
+#ifdef __APPLE__
+    // Define the left-eye browse button - in Projection group (native panel;
+    // Resolve draws no browse control on filePath string params)
+    OfxPropertySetHandle stmapLeftBrowseProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapLeftBrowse, &stmapLeftBrowseProps);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxPropLabel, 0, kParamSTMapLeftBrowseLabel);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapLeftBrowse);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropHint, 0, kParamSTMapLeftBrowseHint);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
+#endif
+
     // Define right-eye STMap path parameter - in Projection group
     OfxPropertySetHandle stmapRightProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamSTMapRight, &stmapRightProps);
@@ -2820,6 +2863,16 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapRightProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
     gPropHost->propSetInt(stmapRightProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapRightProps, kOfxParamPropParent, 0, "projectionGroup");
+
+#ifdef __APPLE__
+    // Define the right-eye browse button - in Projection group
+    OfxPropertySetHandle stmapRightBrowseProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapRightBrowse, &stmapRightBrowseProps);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxPropLabel, 0, kParamSTMapRightBrowseLabel);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapRightBrowse);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropHint, 0, kParamSTMapRightBrowseHint);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
+#endif
 
     // Define GPU acceleration parameter - in Performance group
     OfxPropertySetHandle gpuAccelerationProps = NULL;

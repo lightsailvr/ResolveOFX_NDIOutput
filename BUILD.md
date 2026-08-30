@@ -30,7 +30,7 @@ make dev
 
 Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle, all object files, and the `build/` test-binary directory.
 
-The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks). zlib ships with the macOS SDK — no extra install. A future Windows build needs a zlib to match.
+The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks) and, on macOS, AppKit + UniformTypeIdentifiers (for the STMap Browse buttons' native open panel, `src/MacFileDialog.mm`). All ship with the macOS SDK — no extra install. A future Windows build needs a zlib to match; the browse buttons are macOS-only.
 
 ### Unit tests
 

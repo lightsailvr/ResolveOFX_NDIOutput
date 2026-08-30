@@ -5,6 +5,11 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-08-30
+
+### Added
+- **Browse buttons for the STMap paths** (macOS): Resolve draws no browse control on OFX filePath string params (confirmed in the first v1.8.0 session — plain text field), so the plugin now provides **Browse for Left/Right-Eye STMap…** push buttons that pop a native macOS open panel (filtered to .exr, starting in the current path's folder) and fill the field. Cancel changes nothing; pasting a path still works. The panel runs modally inside the parameter-change action — flagged for a stability check at the next Tier 1 pass.
+
 ## [1.8.1] - 2026-08-30
 
 ### Fixed
