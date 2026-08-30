@@ -5,6 +5,15 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-08-30
+
+### Changed
+- **New-instance defaults tuned for the common monitoring setup**: Frame Rate 30 (was 25), Resolution Half (was Full), STMap Layout Packed Side-by-Side (was Per-Eye Files). Saved projects keep their stored values.
+
+### Added
+- **Single "STMap" field with its own "Browse for STMap..." button** for the packed side-by-side layout — the per-eye left/right fields now appear only when the layout is Per-Eye Files. Projects that stored a packed map in the left-eye slot before this release keep streaming (the packed field falls back to it while empty).
+- **Mode-aware panel**: the Camera Clip (.braw) field and its browse button show only when Camera Clip Source is Manual Path; Timeline (Auto) hides them.
+
 ## [1.13.0] - 2026-08-30
 
 First public release.
