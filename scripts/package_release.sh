@@ -163,6 +163,13 @@ pkgbuild --analyze --root "$STAGE" "$COMPONENT_PLIST" >/dev/null
 # wherever Spotlight last saw a copy (e.g. a dev checkout).
 /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$COMPONENT_PLIST" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :0:BundleIsRelocatable bool false" "$COMPONENT_PLIST"
+# ...and always replace whatever is there. With the default version check,
+# PackageKit compares CFBundleShortVersionString and silently SKIPS the payload
+# (while still writing the receipt!) if the installed bundle claims a higher
+# version — which dev installs did for years via the old placeholder "2.0"
+# Info.plist. See LEARNINGS 2026-08-30.
+/usr/libexec/PlistBuddy -c "Set :0:BundleIsVersionChecked false" "$COMPONENT_PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :0:BundleIsVersionChecked bool false" "$COMPONENT_PLIST"
 
 COMPONENT_PKG="$DIST/NDIOutput-component.pkg"
 pkgbuild --root "$STAGE" \

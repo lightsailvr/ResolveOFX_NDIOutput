@@ -251,6 +251,13 @@ Facts the GPU fast path is built on, from `/Library/Application Support/Blackmag
 **Validated by:** Tier 0 + full `--unsigned-dev-build` pipeline run; Tier 1–2 with the pkg-installed plugin still pending (binary layout changed).
 **Rule:** run `codesign --verify --strict` against the bundle long before release day — it is the only tool that checks bundle layout, and layout mistakes are invisible until signing.
 
+### 2026-08-30 — Installer "succeeded" but silently skipped the plugin: stale Info.plist "2.0" outranked the 1.13.0 pkg
+**Symptom:** (U, Matt, first pkg Tier 1) after installing the signed `NDIOutput-1.13.0-macOS.pkg`, Resolve still showed v1.12.0. The pkg receipt (`pkgutil --pkg-info`) claimed 1.13.0 was installed.
+**Root cause:** `pkgbuild --analyze` defaults `BundleIsVersionChecked=true`, and the repo's `Info.plist` had carried a placeholder `CFBundleShortVersionString` of **2.0** for the project's whole life — every dev `make install` stamped that into `/Library/OFX/Plugins`. PackageKit compared installed (2.0) vs payload (1.13.0), decided the pkg was a downgrade, and skipped the component — `install.log`: *"Skipping component LSVR.NDIOutput (1.13.0-…) because the version 2.0.0-… is already installed"* — **while still writing the receipt**, so the install looked successful everywhere except the actual plugin.
+**Fix:** `package_release.sh` now sets `BundleIsVersionChecked=false` (a plugin installer must replace unconditionally — `BundleOverwriteAction=upgrade` then swaps the whole bundle atomically); repo `Info.plist` set to the real version; both version scripts (`set_version.sh`, `increment_version.sh`) now sync `Info.plist` as a third location so dev installs can never poison the comparison again.
+**Validated by:** the rebuilt pkg's PackageInfo carries the disabled version check; the deliberate regression case is re-installing over the untouched stale bundle (left in place on Matt's machine) — pending Matt's re-install + Resolve check showing v1.13.0.
+**Rule:** for plugin/bundle pkgs, always disable PackageKit's bundle version check, and after any pkg install trust `grep <bundle-id> /var/log/install.log` over the receipt — receipts get written even for skipped payloads.
+
 ### OPEN — Windows/CUDA build failing (as of 2026-08-28)
 Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
 

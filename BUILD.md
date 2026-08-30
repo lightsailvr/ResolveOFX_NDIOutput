@@ -82,7 +82,7 @@ Then **restart DaVinci Resolve** — OFX plugins are only scanned at startup; th
 
 ### Versioning
 
-The version lives in **two places that must stay in sync**: the `VERSION` file and the `#define kPluginVersion*` macros in [NDIOutputPlugin.cpp](src/NDIOutputPlugin.cpp). Always bump with the scripts, which update both:
+The version lives in **three places that must stay in sync**: the `VERSION` file, the `#define kPluginVersion*` macros in [NDIOutputPlugin.cpp](src/NDIOutputPlugin.cpp), and `Info.plist` (`CFBundleShortVersionString`/`CFBundleVersion` — a stale value here once made the pkg installer silently skip the bundle; see LEARNINGS 2026-08-30). Always bump with the scripts, which update all three:
 
 ```bash
 ./scripts/increment_version.sh        # bump patch

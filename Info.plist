@@ -15,12 +15,12 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.0</string>
+	<string>1.13.0</string>
 	<key>CFBundleSignature</key>
 	<string>LSVR</string>
 	<key>CFBundleVersion</key>
-	<string>2.0</string>
+	<string>1.13.0</string>
 	<key>CSResourcesFileMapped</key>
 	<true/>
 </dict>
-</plist> 
+</plist>
