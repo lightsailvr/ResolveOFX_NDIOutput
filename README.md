@@ -13,7 +13,7 @@ A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Netw
   - Rec.2020, DCI-P3, and Rec.709 color spaces
   - Configurable Max Content Light Level (CLL) and Max Frame Average Light Level (FALL)
   - HDR metadata embedding for proper downstream handling
-- **Stereo Timelines**: On a native stereo timeline (Stereo 3D palette at **Vision: Stereo**), the plugin pairs the left/right eye renders per frame and streams **one packed frame** — Side-by-Side or Top-Bottom (Stereo group) — for VR receivers such as VR.NDI on Quest. If one eye stops rendering, the stream degrades to labeled single-eye mono (see the **Stream Status** parameter) instead of freezing. Mono timelines are unaffected.
+- **Stereo Timelines**: On a native stereo timeline (Stereo 3D palette at **Vision: Stereo**), the plugin pairs the left/right eye renders per frame and streams **one packed frame** — Side-by-Side or Top-Bottom (Stereo group) — for VR receivers such as VR.NDI on Quest. The packed canvas is locked for the stream's lifetime: brief eye stalls re-send the last packed frame, and a sustained stall degrades to the flowing eye duplicated into both halves (labeled in the **Stream Status** parameter) — the frame dimensions never change mid-stream, so the geometry never pops in-headset. Mono timelines are unaffected.
 - **NDI Advanced SDK**: Uses NDI Advanced SDK v6.1.1 for enhanced features and performance
 - **Real-time Streaming**: Low-latency video streaming over network
 - **Pass-through Design**: Maintains original video quality while streaming

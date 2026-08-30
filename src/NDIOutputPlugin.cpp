@@ -106,9 +106,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 11
+#define kPluginVersionMinor 12
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.11.0"
+#define kPluginVersionString "1.12.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -753,6 +753,13 @@ struct SenderHub {
     // next pair never packs into the one still in flight.
     std::vector<uint8_t> packedBuffer[2];
     int packedIndex = 0;
+    // Last packed frame actually sent (pair or duplicate) — RepeatLast
+    // keepalives re-send it while an eye stalls (issue #12). The pairer
+    // pre-gates repeats on the EYE meta it saw; this records the PACKED dims
+    // actually sent, the layout-level double-check (the pairer never knows
+    // the SbS/TB param).
+    bool hasPackedFrame = false;
+    ndi_stereo::FrameMeta lastPackedMeta;
     std::string status;               // last stream-status string, for change detection
     unsigned long long lastLoggedDrops = 0;
 };
@@ -939,10 +946,10 @@ static std::string hubComposeStatusLocked(SenderHub* hub, NDIInstanceData* data)
             status = data->stereoPacking == 1 ? "Stereo (Top-Bottom)" : "Stereo (Side-by-Side)";
             break;
         case ndi_stereo::StreamMode::LeftOnly:
-            status = "Stereo degraded: right eye missing — sending left eye only";
+            status = "Stereo degraded: right eye stalled — left eye in both halves (canvas held)";
             break;
         case ndi_stereo::StreamMode::RightOnly:
-            status = "Stereo degraded: left eye missing — sending right eye only";
+            status = "Stereo degraded: left eye stalled — right eye in both halves (canvas held)";
             break;
         case ndi_stereo::StreamMode::Mono:
         default:
@@ -1012,6 +1019,40 @@ struct SubmitTimers {
     double flushMs = 0.0, packMs = 0.0, sendMs = 0.0;
 };
 
+// Caller holds hub->mutex. Packs two eye buffers into the hub's alternate
+// packed buffer and sends the result on the doubled canvas, remembering the
+// packed meta for RepeatLast keepalives. `left` and `right` may be the same
+// buffer — that is the degraded duplication path (issue #12).
+static void hubPackAndSendLocked(SenderHub* hub, NDIInstanceData* data,
+                                 const ndi_stereo::FrameMeta& meta,
+                                 ndi_stereo::StereoLayout layout,
+                                 const uint8_t* left, const uint8_t* right,
+                                 bool allowAsync, const std::string& hdrMetadataXML,
+                                 SubmitTimers* timers)
+{
+    // Pack into the buffer NOT submitted last; if it needs resizing it
+    // could still be read by a send before last, so flush first.
+    std::vector<uint8_t>& packed = hub->packedBuffer[hub->packedIndex ^= 1];
+    const size_t packedBytes = ndi_stereo::wireFrameBytes(meta) * 2;
+    if (packed.size() != packedBytes) {
+        const auto flushT0 = std::chrono::steady_clock::now();
+        hubFlushAsyncLocked(hub);
+        if (timers) timers->flushMs = msSince(flushT0);
+        packed.resize(packedBytes);
+    }
+    const auto packT0 = std::chrono::steady_clock::now();
+    ndi_stereo::packStereoFrame(meta, layout, left, right, packed.data());
+    if (timers) timers->packMs = msSince(packT0);
+
+    ndi_stereo::FrameMeta packedMeta = meta;
+    ndi_stereo::packedDims(meta, layout, &packedMeta.width, &packedMeta.height);
+    hub->lastPackedMeta = packedMeta;
+    hub->hasPackedFrame = true;
+    const auto sendT0 = std::chrono::steady_clock::now();
+    hubSendFrameLocked(hub, data, packedMeta, packed.data(), allowAsync, hdrMetadataXML);
+    if (timers) timers->sendMs = msSince(sendT0);
+}
+
 // The single entry point every converted frame goes through. Consults the
 // process-global pairer: mono frames stream unchanged (zero extra copies),
 // stereo frames wait for their partner and go out as ONE packed frame.
@@ -1042,6 +1083,10 @@ static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTime
     ndi_stereo::SubmitResult result = hub->pairer.submit(
         s.eye, s.time, meta, s.bytes, s.byteCount, nowMs, s.isThumbnail);
 
+    const ndi_stereo::StereoLayout layout = (data->stereoPacking == 1)
+                                                ? ndi_stereo::StereoLayout::TopBottom
+                                                : ndi_stereo::StereoLayout::SideBySide;
+
     switch (result.action) {
         case ndi_stereo::SubmitAction::SendMono: {
             const auto sendT0 = std::chrono::steady_clock::now();
@@ -1055,32 +1100,46 @@ static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTime
                                       ? s.bytes : result.matePayload.data();
             const uint8_t* right = (s.eye == ndi_stereo::kEyeLeft)
                                        ? result.matePayload.data() : s.bytes;
-            const ndi_stereo::StereoLayout layout = (data->stereoPacking == 1)
-                                                        ? ndi_stereo::StereoLayout::TopBottom
-                                                        : ndi_stereo::StereoLayout::SideBySide;
-            // Pack into the buffer NOT submitted last; if it needs resizing it
-            // could still be read by a send before last, so flush first.
-            std::vector<uint8_t>& packed = hub->packedBuffer[hub->packedIndex ^= 1];
-            const size_t packedBytes = ndi_stereo::wireFrameBytes(meta) * 2;
-            if (packed.size() != packedBytes) {
-                const auto flushT0 = std::chrono::steady_clock::now();
-                hubFlushAsyncLocked(hub);
-                if (timers) timers->flushMs = msSince(flushT0);
-                packed.resize(packedBytes);
-            }
-            const auto packT0 = std::chrono::steady_clock::now();
-            ndi_stereo::packStereoFrame(meta, layout, left, right, packed.data());
-            if (timers) timers->packMs = msSince(packT0);
+            hubPackAndSendLocked(hub, data, meta, layout, left, right,
+                                 s.allowAsync, s.hdrMetadataXML, timers);
             // Return the consumed mate buffer to the pairer's pool — its warm
             // pages make the next hold a plain memcpy instead of a page-fault
             // storm inside this mutex.
             hub->pairer.recycle(std::move(result.matePayload));
+            break;
+        }
 
+        case ndi_stereo::SubmitAction::SendDuplicate: {
+            // Degraded stereo (issue #12): the partner eye starved, but the
+            // canvas keeps its packed dimensions — the flowing eye goes into
+            // both halves. Viewers see 2D; the geometry never pops.
+            hubPackAndSendLocked(hub, data, meta, layout, s.bytes, s.bytes,
+                                 s.allowAsync, s.hdrMetadataXML, timers);
+            break;
+        }
+
+        case ndi_stereo::SubmitAction::RepeatLast: {
+            // Stall keepalive (issue #12): the submitted frame is held, and
+            // the last packed frame goes out again so receivers keep getting
+            // frames while the pairer waits out the degrade hysteresis. Only
+            // when that frame still matches the canvas this submit implies —
+            // a layout/resolution change mid-stall just holds instead.
             ndi_stereo::FrameMeta packedMeta = meta;
             ndi_stereo::packedDims(meta, layout, &packedMeta.width, &packedMeta.height);
-            const auto sendT0 = std::chrono::steady_clock::now();
-            hubSendFrameLocked(hub, data, packedMeta, packed.data(), s.allowAsync, s.hdrMetadataXML);
-            if (timers) timers->sendMs = msSince(sendT0);
+            std::vector<uint8_t>& packed = hub->packedBuffer[hub->packedIndex];
+            if (hub->hasPackedFrame && hub->lastPackedMeta == packedMeta &&
+                packed.size() == ndi_stereo::wireFrameBytes(packedMeta)) {
+                // Re-sending the buffer already designated live is safe under
+                // the async contract: it stays the one NDI may read from.
+                const auto sendT0 = std::chrono::steady_clock::now();
+                hubSendFrameLocked(hub, data, packedMeta, packed.data(),
+                                   s.allowAsync, s.hdrMetadataXML);
+                if (timers) timers->sendMs = msSince(sendT0);
+            } else {
+                const auto flushT0 = std::chrono::steady_clock::now();
+                hubFlushAsyncLocked(hub);
+                if (timers) timers->flushMs = msSince(flushT0);
+            }
             break;
         }
 
