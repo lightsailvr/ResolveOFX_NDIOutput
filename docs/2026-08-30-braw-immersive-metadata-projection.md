@@ -7,7 +7,8 @@ this doc's verified goldens), `src/BRAWImmersiveReader.cpp` (SDK extraction via 
 passed Tier 2 same day (U). v1.11.0 added the Timeline (Auto) camera-clip source — the
 "future: auto-pick" item below — via a scripting-API playhead watcher
 (`src/TimelineClipWatcher.cpp` + `src/ndi_timeline_watch.py`), with sticky per-camera map
-caching for multi-camera timelines. Auto-mode Tier 1–2 pending.
+caching for multi-camera timelines. Auto mode confirmed working by Matt same day (U) —
+feature complete; merged to master via PR.
 **Sample media:** `B001_10151156_C001.braw` (URSA Cine Immersive, 8160×7200 per eye, 59.94, 455 frames)
 
 ## Question
