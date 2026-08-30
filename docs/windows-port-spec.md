@@ -2,7 +2,7 @@
 
 **Status:** approved plan · **Branch:** `windows-port` (long-lived integration branch off `dev`) · **Date:** 2026-08-30
 **Source research:** [2026-08-30-windows-port-feasibility.md](2026-08-30-windows-port-feasibility.md) — every decision below traces to a verified finding there.
-**Tickets:** GitHub issues (labels `windows` + triage labels), each referencing this spec and the `windows-port` branch.
+**Tickets:** GitHub issues (labels `windows` + triage labels), each referencing this spec and the `windows-port` branch — spec issue #18; work tickets #19 (workstation, human), #20 (CI compile), #21 (first stream), #22 (CUDA pipeline), #23 (installer), #24–#26 (parity tail). Blocking edges are native GitHub dependencies; work the frontier (any open ticket whose blockers are all closed).
 
 ## Problem Statement
 
