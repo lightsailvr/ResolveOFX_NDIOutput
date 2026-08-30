@@ -88,14 +88,19 @@ sed -i '' "s/#define kPluginVersionMinor [0-9]*/#define kPluginVersionMinor $NEW
 sed -i '' "s/#define kPluginVersionPatch [0-9]*/#define kPluginVersionPatch $NEW_PATCH/" src/NDIOutputPlugin.cpp
 sed -i '' "s/#define kPluginVersionString \"[0-9]*\.[0-9]*\.[0-9]*\"/#define kPluginVersionString \"$NEW_VERSION\"/" src/NDIOutputPlugin.cpp
 
+# Update bundle Info.plist (a stale/higher version here makes the pkg
+# installer silently skip the bundle — see LEARNINGS 2026-08-30)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $NEW_VERSION" -c "Set :CFBundleVersion $NEW_VERSION" Info.plist
+
 echo "Version updated to: $NEW_VERSION"
 echo "Updated files:"
 echo "  - VERSION"
 echo "  - src/NDIOutputPlugin.cpp"
+echo "  - Info.plist"
 
 # Show git status if in a git repository
 if [ -d ".git" ]; then
     echo ""
     echo "Git status:"
-    git status --porcelain VERSION src/NDIOutputPlugin.cpp
+    git status --porcelain VERSION src/NDIOutputPlugin.cpp Info.plist
 fi 
