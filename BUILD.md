@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — CUDA port in progress, **does not build yet** (see [status](#windows-cuda--status-not-building-yet))
+- **Windows** — port restarting on branch `windows-port`, **does not build yet** (see [status](#windows-cuda--status-restarting-on-windows-port))
 
 ---
 
@@ -120,17 +120,15 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows (CUDA) — STATUS: not building yet
+## Windows (CUDA) — STATUS: restarting on `windows-port`
 
-The Windows port (CMake + CUDA acceleration) was started in commit `50eacc1` and does not yet produce a working build. Track progress and findings in [LEARNINGS.md](LEARNINGS.md).
+The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predates the plugin's modern architecture (sender hub, async pump, fused GPU pipeline, STMap warp) — the port is being **redone, not repaired**, on the long-lived `windows-port` branch. Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research behind them: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
-What exists so far:
-- [CMakeLists.txt](CMakeLists.txt) — cross-platform build (Windows/CUDA, macOS/Metal, Linux stub)
-- [scripts/build_windows.bat](scripts/build_windows.bat) (MSVC) and [scripts/build_windows_mingw.bat](scripts/build_windows_mingw.bat) (MinGW)
-- [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu) — CUDA kernels mirroring the Metal path
-- [README_WINDOWS_CUDA.md](README_WINDOWS_CUDA.md) — target requirements and intended workflow
+Toolchain (pinned by the spec): **Visual Studio 2022** (C++ workload) + **CUDA Toolkit 12.9** (nvcc requires MSVC as host compiler — the MinGW script is a dead end and gets deleted) + CMake + vcpkg (zlib) + the **Windows NDI Advanced SDK** (HDR needs Advanced; the download is access-gated, request early). Nothing can be cross-compiled from macOS: Windows builds happen on a Windows machine or on `windows-2022` CI (compile-only — Tiers 1–2 still need real hardware).
 
-Requirements when resuming: Visual Studio 2019/2022 (C++ workload), CUDA Toolkit 11+, NDI 6 Advanced SDK at `C:\Program Files\NDI\NDI 6 Advanced SDK`. Install target is `C:\Program Files\Common Files\OFX\Plugins\`, plus `Processing.NDI.Lib.x64.dll` copied alongside the `.ofx`.
+Packaging (per the OFX spec): `C:\Program Files\Common Files\OFX\Plugins\NDIOutput.ofx.bundle\Contents\Win64\NDIOutput.ofx`, with `Processing.NDI.Lib.x64.dll` bundled beside the binary and **delay-loaded** via a module-relative DLL-directory add — Windows' default search order never finds a DLL sitting next to the `.ofx`, so a plain import silently fails to load on machines without an NDI runtime. Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (same delete-to-rescan procedure as macOS). Stream check: **Studio Monitor** from the free NDI Tools for Windows.
+
+Same rule as macOS: any Windows build change updates this section in the same PR.
 
 ---
 
