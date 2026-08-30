@@ -101,8 +101,8 @@
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
 #define kPluginVersionMinor 8
-#define kPluginVersionPatch 0
-#define kPluginVersionString "1.8.0"
+#define kPluginVersionPatch 1
+#define kPluginVersionString "1.8.1"
 
 // Parameter names
 #define kParamSourceName "sourceName"

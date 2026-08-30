@@ -783,6 +783,42 @@ int main()
             expectFloat(uAt(left, 3, 0), 2.5f, "all-invalid half values unchanged");
         }
 
+        // Canon-style zero filler (found on the real EOS R5C RF5.2mm map,
+        // 2026-08-30): the unused corners of a packed-frame half are padded
+        // with (0,0) instead of out-of-range values. A small fraction of such
+        // filler must not defeat the packed-frame classification — detection
+        // keys on where the MASS of the distribution sits, not the extremes.
+        {
+            const int pw = 16, ph = 4, phalf = 8; // 32 texels per half
+            std::vector<float> uv(static_cast<size_t>(pw) * ph * 2);
+            for (int row = 0; row < ph; ++row) {
+                for (int x = 0; x < pw; ++x) {
+                    const bool rightHalf = (x >= phalf);
+                    // left dst half samples the packed RIGHT half (Canon
+                    // swap), right dst half the packed LEFT half. Steps are
+                    // powers of two so the rescale expectations are exact.
+                    const float u = rightHalf ? 0.0625f + 0.03125f * (x - phalf)
+                                              : 0.5625f + 0.03125f * x;
+                    uv[(static_cast<size_t>(row) * pw + x) * 2 + 0] = u;
+                    uv[(static_cast<size_t>(row) * pw + x) * 2 + 1] = 0.5f;
+                }
+            }
+            uv[0] = 0.0f; uv[1] = 0.0f; // one (0,0) filler texel in the left half (~3%)
+            ndi_stmap::STMapImage packed;
+            packed.width = pw; packed.height = ph; packed.uv = uv;
+            ndi_stmap::STMapImage left, right;
+            PackedHalfCoords cl, cr;
+            std::string err;
+            bool ok = ndi_stmap::splitPackedSTMap(packed, &left, &right, &cl, &cr, &err);
+            check(ok && cl == PackedHalfCoords::PackedRightHalf &&
+                      cr == PackedHalfCoords::PackedLeftHalf,
+                  "a few (0,0) filler texels don't defeat packed-frame detection");
+            const float fillerU = uAt(left, 0, 0);
+            check(!(fillerU >= 0.0f && fillerU <= 1.0f),
+                  "rescaled filler texels become invalid (black), not corner samples");
+            expectFloat(uAt(left, 1, 0), 0.1875f, "non-filler texels rescale normally around filler");
+        }
+
         // A packed-frame identity map splits into two per-eye identity maps —
         // the property that makes one Canon packed file equivalent to two
         // per-eye files.

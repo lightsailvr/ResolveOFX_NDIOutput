@@ -430,10 +430,16 @@ enum class PackedHalfCoords {
     NoValidTexels,    // nothing to classify — copied verbatim
 };
 
-// Classification thresholds: valid U confined below/above these marks means
-// packed-frame coords. Real per-eye maps span far past both.
+// Classification thresholds: the MASS of a half's valid U values confined
+// below kPackedDetectHigh (or above kPackedDetectLow) means packed-frame
+// coords; real per-eye maps put heavy mass on both sides. Classification
+// tolerates kPackedDetectMaxSpill of the valid texels on the wrong side —
+// real maps pad unused regions with (0,0) filler (seen on the Canon EOS R5C
+// RF5.2mm map, ~1% of a half), and a handful of zeros must not defeat the
+// detection the way absolute min/max bounds did (2026-08-30 blob bug).
 constexpr float kPackedDetectLow = 0.45f;
 constexpr float kPackedDetectHigh = 0.55f;
+constexpr float kPackedDetectMaxSpill = 0.05f;
 
 inline const char* packedHalfCoordsName(PackedHalfCoords c)
 {
@@ -459,8 +465,7 @@ inline PackedHalfCoords extractPackedHalf(const STMapImage& packed, int x0, STMa
     out->height = packed.height;
     out->uv.assign(static_cast<size_t>(outWidth) * packed.height * 2, 0.0f);
 
-    float uMin = 1.0f, uMax = 0.0f;
-    bool anyValid = false;
+    long long validCount = 0, belowLow = 0, aboveHigh = 0;
     for (int row = 0; row < packed.height; ++row) {
         const float* srcRow = packed.uv.data() +
                               (static_cast<size_t>(row) * packed.width + x0) * 2;
@@ -468,23 +473,27 @@ inline PackedHalfCoords extractPackedHalf(const STMapImage& packed, int x0, STMa
             const float u = srcRow[static_cast<size_t>(x) * 2];
             const float v = srcRow[static_cast<size_t>(x) * 2 + 1];
             if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
-                anyValid = true;
-                uMin = std::min(uMin, u);
-                uMax = std::max(uMax, u);
+                ++validCount;
+                if (u < kPackedDetectLow) ++belowLow;
+                if (u > kPackedDetectHigh) ++aboveHigh;
             }
         }
     }
 
     PackedHalfCoords coords = PackedHalfCoords::PerEye;
     float offset = 0.0f;
-    if (!anyValid) {
+    if (validCount == 0) {
         coords = PackedHalfCoords::NoValidTexels;
-    } else if (uMax <= kPackedDetectHigh) {
-        coords = PackedHalfCoords::PackedLeftHalf;
-        offset = 0.0f;
-    } else if (uMin >= kPackedDetectLow) {
-        coords = PackedHalfCoords::PackedRightHalf;
-        offset = 0.5f;
+    } else {
+        const long long spillCap =
+            static_cast<long long>(kPackedDetectMaxSpill * static_cast<double>(validCount));
+        if (aboveHigh <= spillCap) {
+            coords = PackedHalfCoords::PackedLeftHalf;
+            offset = 0.0f;
+        } else if (belowLow <= spillCap) {
+            coords = PackedHalfCoords::PackedRightHalf;
+            offset = 0.5f;
+        }
     }
 
     const bool rescale = (coords == PackedHalfCoords::PackedLeftHalf ||

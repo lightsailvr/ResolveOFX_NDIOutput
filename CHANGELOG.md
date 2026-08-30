@@ -5,6 +5,11 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-08-30
+
+### Fixed
+- **Packed side-by-side split misclassified the Canon EOS R5C RF5.2mm STMap's left half** (found in Matt's first Tier-2 session with v1.8.0): the left eye of the warped stream showed a large black disc. The map's left-eye half samples the packed frame's right half (Canon's eye swap) — but ~1% of its texels are (0,0) *filler* padding the unused corners, and the U-convention auto-detect used absolute min/max bounds, so those zeros defeated the packed-frame classification and the half went out un-rescaled. Detection now keys on where the **mass** of the valid values sits (up to 5% spill tolerated); filler texels rescale to out-of-range and render black, which is correct for content-free regions. Verified against the real Canon map: both halves classify as packed-frame and the left eye's black coverage drops to the healthy baseline.
+
 ## [1.8.0] - 2026-08-30
 
 > Tier 0 + `make test` (179 assertions; 21 new for the packed-map split) + `make test-metal` pass. Tier 1–3 pending alongside 1.7.0.
