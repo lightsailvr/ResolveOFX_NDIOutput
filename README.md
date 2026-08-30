@@ -2,8 +2,8 @@
 
 A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Network Device Interface) for streaming over network with comprehensive HDR support.
 
-> **Latest Release**: see [`VERSION`](VERSION) and [`Releases/`](Releases/) for the newest build and its release notes.  
-> **Build & Install**: [BUILD.md](BUILD.md) · **Dev workflow & testing loop**: [LEARNINGS.md](LEARNINGS.md)
+> **Download**: grab the signed installer from the [latest release](https://github.com/lightsailvr/ResolveOFX_NDIOutput/releases/latest) — no SDK or other software needed.  
+> **Build & Install from source**: [BUILD.md](BUILD.md) · **Dev workflow & testing loop**: [LEARNINGS.md](LEARNINGS.md)
 
 ## Features
 
@@ -21,20 +21,20 @@ A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Netw
 
 ## Requirements
 
-- macOS 10.15+ (Catalina or later)
+- macOS 13+ (Ventura or later), Apple Silicon or Intel
 - DaVinci Resolve 17+ (tested with DaVinci Resolve 20)
-- NDI Advanced SDK 6.x installed at `/Library/NDI Advanced SDK for Apple/` ([download](https://ndi.video/for-developers/))
+- Building from source additionally needs the NDI Advanced SDK 6.x at `/Library/NDI Advanced SDK for Apple/` ([download](https://ndi.video/for-developers/)) — the installer ships the NDI runtime inside the plugin, so end users need nothing else
 
 ## Installation
 
-Full instructions (prerequisites, build, install, verification, troubleshooting, Windows status) live in **[BUILD.md](BUILD.md)**. The short version for macOS:
+**Users**: download `NDIOutput-<version>-macOS.pkg` from the [latest release](https://github.com/lightsailvr/ResolveOFX_NDIOutput/releases/latest) and double-click it (signed and notarized; installs to `/Library/OFX/Plugins`). Then restart DaVinci Resolve — OFX plugins are only scanned at startup.
+
+**From source**: full instructions (prerequisites, build, install, verification, troubleshooting, Windows status) live in **[BUILD.md](BUILD.md)**. The short version for macOS:
 
 ```bash
 make dev            # build
 sudo make install   # install to /Library/OFX/Plugins
 ```
-
-Then restart DaVinci Resolve — OFX plugins are only scanned at startup. Prebuilt bundles for shipped versions are in [`Releases/`](Releases/).
 
 ## Usage
 
@@ -161,3 +161,7 @@ For issues and questions:
 - Check the troubleshooting section above
 - Review DaVinci Resolve console output for error messages
 - Verify NDI SDK installation and network configuration
+
+## Acknowledgments
+
+NDI® is a registered trademark of Vizrt NDI AB — learn more at [ndi.video](https://ndi.video/). Receive the stream with the free [NDI Tools](https://ndi.video/tools/). Third-party license notices ship inside the plugin at `Contents/Resources/libndi_licenses.txt`.
