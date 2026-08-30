@@ -19,7 +19,7 @@ OBJCXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -x object
 LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -framework AppKit -framework UniformTypeIdentifiers -lz
 
 # Source files
-SOURCES = src/NDIOutputPlugin.cpp src/BRAWImmersiveReader.cpp
+SOURCES = src/NDIOutputPlugin.cpp src/BRAWImmersiveReader.cpp src/TimelineClipWatcher.cpp
 OBJCXX_SOURCES = src/MetalGPUAcceleration.mm src/MacFileDialog.mm
 OBJECTS = $(SOURCES:.cpp=.o) $(OBJCXX_SOURCES:.mm=.o)
 
@@ -79,8 +79,10 @@ $(BUNDLE_EXECUTABLE): $(OBJECTS) | bundle_structure
 # Bundle structure
 bundle_structure:
 	mkdir -p $(BUNDLE_NAME)/Contents/macOS
+	mkdir -p $(BUNDLE_NAME)/Contents/Resources
 	cp BaldavengerOFX.NDIOutput.png $(BUNDLE_NAME)/Contents/
 	cp Info.plist $(BUNDLE_NAME)/Contents/
+	cp src/ndi_timeline_watch.py $(BUNDLE_NAME)/Contents/Resources/
 
 # Installation
 install: $(BUNDLE_EXECUTABLE)

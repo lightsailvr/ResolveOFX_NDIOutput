@@ -3,7 +3,11 @@
 **Date:** 2026-08-30 · **Status:** IMPLEMENTED in v1.10.0 (same day) as projection mode
 "Equirect (Camera Metadata)" — `src/BRAWLensMap.h` (parser + generator, unit-tested against
 this doc's verified goldens), `src/BRAWImmersiveReader.cpp` (SDK extraction via the vendored
-`third_party/braw/` dispatch shim), wiring in `src/NDIOutputPlugin.cpp`. Tier 1–2 pending.
+`third_party/braw/` dispatch shim), wiring in `src/NDIOutputPlugin.cpp`. Manual clip pick
+passed Tier 2 same day (U). v1.11.0 added the Timeline (Auto) camera-clip source — the
+"future: auto-pick" item below — via a scripting-API playhead watcher
+(`src/TimelineClipWatcher.cpp` + `src/ndi_timeline_watch.py`), with sticky per-camera map
+caching for multi-camera timelines. Auto-mode Tier 1–2 pending.
 **Sample media:** `B001_10151156_C001.braw` (URSA Cine Immersive, 8160×7200 per eye, 59.94, 455 frames)
 
 ## Question

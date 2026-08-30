@@ -44,6 +44,8 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
+
 #include "BRAWLensMap.h"
 #include "RenderProbe.h"
 #include "STMap.h"
@@ -54,6 +56,7 @@
 #include "BRAWImmersiveReader.h"
 #include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
+#include "TimelineClipWatcher.h"
 #endif
 
 #ifdef _WIN32
@@ -103,9 +106,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 10
+#define kPluginVersionMinor 11
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.10.0"
+#define kPluginVersionString "1.11.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -136,7 +139,7 @@
 // Projection Parameters (issue #7)
 #define kParamProjection "projectionMode"
 #define kParamProjectionLabel "Projection"
-#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player; the warped output resolution equals the STMap's resolution. Equirect (Camera Metadata) does the same warp but derives the per-eye maps from the lens calibration embedded in an URSA Cine Immersive BRAW clip (pick any clip shot on the camera below) — no STMap files needed; the output is a 180ºx180º equirect per eye at the Metadata Map Size. Either way the Resolution control applies on top, and a missing/invalid map source falls back to Passthrough and says so in Stream Status."
+#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player; the warped output resolution equals the STMap's resolution. Equirect (Camera Metadata) does the same warp but derives the per-eye maps from the lens calibration embedded in URSA Cine Immersive BRAW clips — by default following whichever clip is under the playhead (see Camera Clip Source), so multi-camera timelines just work; no STMap files needed. The output is a 180ºx180º equirect per eye at the Metadata Map Size. Either way the Resolution control applies on top, and a missing/invalid map source falls back to Passthrough and says so in Stream Status."
 
 #define kParamSTMapLayout "stmapLayout"
 #define kParamSTMapLayoutLabel "STMap Layout"
@@ -162,9 +165,12 @@
 
 // Camera-metadata projection (issue #11): per-eye warp maps generated from the
 // Apple Immersive lens calibration embedded in URSA Cine Immersive BRAW.
+#define kParamBRAWSource "brawClipSource"
+#define kParamBRAWSourceLabel "Camera Clip Source"
+#define kParamBRAWSourceHint "Where Equirect (Camera Metadata) gets its calibration. Timeline (Auto) follows the clip under the playhead — multi-camera timelines pick up each camera's own calibration as the playhead crosses it (maps are cached per camera, and gaps/non-BRAW clips keep the last camera's maps rather than popping to passthrough). Auto needs Resolve's external scripting enabled (Preferences > System > General > External scripting using: Local) and a system python3; if either is missing the log says so — use Manual Path, which reads the clip picked below instead."
 #define kParamBRAWClip "brawClip"
 #define kParamBRAWClipLabel "Camera Clip (.braw)"
-#define kParamBRAWClipHint "Any URSA Cine Immersive BRAW clip shot on this camera — the embedded factory calibration is per-camera, not per-shot, so one pick covers every clip from the same body. Used only in Equirect (Camera Metadata) mode; the clip is opened for its metadata (instant), never decoded."
+#define kParamBRAWClipHint "Manual Path mode only: any URSA Cine Immersive BRAW clip shot on the camera — the embedded factory calibration is per-camera, not per-shot, so one pick covers every clip from the same body. The clip is opened for its metadata (instant), never decoded."
 #define kParamBRAWClipBrowse "brawClipBrowse"
 #define kParamBRAWClipBrowseLabel "Browse for Camera Clip..."
 #define kParamBRAWClipBrowseHint "Pick the camera's BRAW clip with a file dialog and fill the path field above."
@@ -590,6 +596,7 @@ struct NDIInstanceData {
     OfxParamHandle stmapLayoutParam;
     OfxParamHandle stmapLeftParam;
     OfxParamHandle stmapRightParam;
+    OfxParamHandle brawSourceParam;
     OfxParamHandle brawClipParam;
     OfxParamHandle brawMapSizeParam;
     OfxParamHandle brawMaskParam;
@@ -642,8 +649,17 @@ struct NDIInstanceData {
     std::string stmapLeftPathWanted;    // parameter values as last read
     std::string stmapRightPathWanted;
     std::string brawClipPathWanted;     // Camera Metadata mode's .braw (issue #11)
+    int brawSourceChoice = 0;           // 0 = Timeline (Auto), 1 = Manual Path
     int brawMapSizeChoice = 1;          // 0 = 1024, 1 = 2048, 2 = 4096 (per eye)
     int brawMaskChoice = 0;             // 0 = Off, 1 = Camera porthole
+    // Auto camera-clip mode: config mirror the playhead watcher's thread
+    // reads (written by readInstanceParams on the main thread), plus the
+    // last auto path applied/skipped — both under stmapMutex.
+    std::atomic<bool> autoLensWanted{false};
+    std::atomic<int> autoLensMapSize{2048};
+    std::atomic<bool> autoLensMask{false};
+    std::string autoLensAppliedPath;
+    std::string autoLensSkippedPath;
     std::mutex stmapMutex;
     std::shared_ptr<StmapEntry> stmapLeft;
     std::shared_ptr<StmapEntry> stmapRight;   // null: left map serves both eyes
@@ -2207,8 +2223,124 @@ static OfxStatus onLoad(void)
 
 static OfxStatus onUnLoad(void)
 {
+#ifdef __APPLE__
+    ndi_timelinewatch::shutdown();
+#endif
     return kOfxStatOK;
 }
+
+static int brawMapSizeFromChoice(int choice)
+{
+    return (choice == 0) ? 1024 : (choice == 2) ? 4096 : 2048;
+}
+
+// ---------------------------------------------------------------------------
+// Auto camera-clip mode (issue #11): a process-wide watcher follows the clip
+// under the Resolve playhead (src/TimelineClipWatcher.h); registered
+// instances in Timeline (Auto) source re-derive their lens maps whenever it
+// changes. The registry mutex serializes the watcher's walk against
+// createInstance/destroyInstance, so an instance can never die mid-apply.
+// ---------------------------------------------------------------------------
+
+static std::mutex gInstanceRegistryMutex;
+static std::vector<NDIInstanceData*> gInstanceRegistry;
+
+static void instanceRegistryAdd(NDIInstanceData* data)
+{
+    std::lock_guard<std::mutex> lock(gInstanceRegistryMutex);
+    if (std::find(gInstanceRegistry.begin(), gInstanceRegistry.end(), data) ==
+        gInstanceRegistry.end()) {
+        gInstanceRegistry.push_back(data);
+    }
+}
+
+static void instanceRegistryRemove(NDIInstanceData* data)
+{
+    std::lock_guard<std::mutex> lock(gInstanceRegistryMutex);
+    gInstanceRegistry.erase(
+        std::remove(gInstanceRegistry.begin(), gInstanceRegistry.end(), data),
+        gInstanceRegistry.end());
+}
+
+#ifdef __APPLE__
+// Runs on the watcher thread: re-source this instance's lens maps for the
+// clip now under the playhead. Sticky on anything unusable — a gap between
+// clips, a non-BRAW clip, a BRAW without calibration — the previous camera's
+// maps keep flowing (a monitoring stream must never pop its geometry at a
+// cut); each offending path logs its skip once. Map (re)generation is a
+// cache hit for every camera seen before, so cuts between known cameras
+// swap maps in microseconds.
+static void applyAutoLensClip(NDIInstanceData* data, const std::string& path)
+{
+    if (!data->autoLensWanted.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const int mapSize = data->autoLensMapSize.load(std::memory_order_relaxed);
+    const bool mask = data->autoLensMask.load(std::memory_order_relaxed);
+
+    if (path.empty()) {
+        std::lock_guard<std::mutex> lock(data->stmapMutex);
+        if (data->autoLensSkippedPath != "\n(none)") {  // '\n' can't occur in a real path
+            data->autoLensSkippedPath = "\n(none)";
+            NDI_LOG("Auto camera clip: nothing under the playhead — keeping the current calibration");
+        }
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(data->stmapMutex);
+        if (data->autoLensAppliedPath == path &&
+            data->stmapLeft && data->stmapLeft->valid) {
+            return;  // already following this clip
+        }
+    }
+
+    std::shared_ptr<StmapEntry> left, right;
+    brawAcquireLensPair(path, mapSize, mask, &left, &right);
+    if (left && left->valid && right && right->valid) {
+        std::shared_ptr<StmapEntry> oldLeft, oldRight;
+        {
+            std::lock_guard<std::mutex> lock(data->stmapMutex);
+            oldLeft = std::move(data->stmapLeft);
+            oldRight = std::move(data->stmapRight);
+            data->stmapLeft = left;
+            data->stmapRight = right;
+            data->autoLensAppliedPath = path;
+            data->autoLensSkippedPath.clear();
+        }
+        data->projStatus.store(kProjActive, std::memory_order_relaxed);
+        NDI_LOG_TEXT(("Auto camera clip: following '" + path + "'").c_str());
+    } else {
+        bool haveMaps = false, firstSkip = false;
+        {
+            std::lock_guard<std::mutex> lock(data->stmapMutex);
+            haveMaps = data->stmapLeft && data->stmapLeft->valid &&
+                       data->stmapRight && data->stmapRight->valid;
+            firstSkip = (data->autoLensSkippedPath != path);
+            data->autoLensSkippedPath = path;
+        }
+        if (!haveMaps) {
+            data->projStatus.store(kProjError, std::memory_order_relaxed);
+        }
+        if (firstSkip) {
+            const std::string why =
+                (left && !left->error.empty()) ? left->error : "no calibration";
+            NDI_LOG_TEXT(("Auto camera clip: '" + path + "' unusable (" + why + ") — " +
+                          (haveMaps ? "keeping the current calibration" : "passthrough"))
+                             .c_str());
+        }
+    }
+}
+
+// Watcher change callback (watcher thread): fan the new playhead clip out to
+// every instance that wants auto mode.
+static void timelineClipChanged(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(gInstanceRegistryMutex);
+    for (NDIInstanceData* data : gInstanceRegistry) {
+        applyAutoLensClip(data, path);
+    }
+}
+#endif // __APPLE__
 
 // Bring the instance's loaded STMaps in line with the current parameter
 // values (issue #7). Called from createInstance and instanceChanged, never
@@ -2226,7 +2358,9 @@ static void refreshSTMaps(NDIInstanceData* data)
     const bool wantStmap = (data->projectionMode == 1);
     const bool wantMetadata = (data->projectionMode == 2);
     const bool packedLayout = (data->stmapLayout == 1);
+    const bool autoSource = (data->brawSourceChoice == 0);
     std::shared_ptr<StmapEntry> left, right;
+    std::string metadataClipPath;
     if (wantStmap && !data->stmapLeftPathWanted.empty()) {
         if (packedLayout) {
             // One packed side-by-side file yields both eyes; the right-eye
@@ -2239,15 +2373,25 @@ static void refreshSTMaps(NDIInstanceData* data)
     if (wantStmap && !packedLayout && !data->stmapRightPathWanted.empty()) {
         right = stmapAcquire(data->stmapRightPathWanted);
     }
-    if (wantMetadata && !data->brawClipPathWanted.empty()) {
-        const int mapSize = (data->brawMapSizeChoice == 0)   ? 1024
-                            : (data->brawMapSizeChoice == 2) ? 4096
-                                                             : 2048;
-        brawAcquireLensPair(data->brawClipPathWanted, mapSize, data->brawMaskChoice == 1,
-                            &left, &right);
+    if (wantMetadata) {
+        metadataClipPath = data->brawClipPathWanted;  // Manual Path source
+#ifdef __APPLE__
+        if (autoSource) {
+            // Timeline (Auto): follow the playhead clip. The watcher keeps
+            // pushing changes via timelineClipChanged; here we just take its
+            // current answer so mode/size/mask edits apply immediately.
+            ndi_timelinewatch::ensureStarted(&timelineClipChanged);
+            metadataClipPath = ndi_timelinewatch::currentClipPath();
+        }
+#endif
+        if (!metadataClipPath.empty()) {
+            brawAcquireLensPair(metadataClipPath, brawMapSizeFromChoice(data->brawMapSizeChoice),
+                                data->brawMaskChoice == 1, &left, &right);
+        }
     }
 
     int status = kProjOff;
+    bool stickyKeep = false;  // auto mode: hold the last camera's maps through gaps
     if (wantStmap) {
         if (!left && data->stmapLeftPathWanted.empty()) {
             NDI_LOG("Equirect (STMap) selected but no left-eye STMap path is set — passthrough");
@@ -2269,13 +2413,34 @@ static void refreshSTMaps(NDIInstanceData* data)
     } else if (wantMetadata) {
         // The pair generates together from one calibration: either both eyes
         // are valid (same size by construction) or neither is.
-        if (!left && data->brawClipPathWanted.empty()) {
-            NDI_LOG("Equirect (Camera Metadata) selected but no camera clip is set — passthrough");
-            status = kProjError;
-        } else if (!left || !left->valid || !right || !right->valid) {
+        const bool pairValid = left && left->valid && right && right->valid;
+        if (pairValid) {
+            status = kProjActive;
+        } else if (autoSource) {
+            // Same sticky rule the watcher applies: an unusable playhead clip
+            // (or none yet) keeps the last camera's maps instead of popping
+            // the stream to passthrough.
+            {
+                std::lock_guard<std::mutex> lock(data->stmapMutex);
+                stickyKeep = data->stmapLeft && data->stmapLeft->valid &&
+                             data->stmapRight && data->stmapRight->valid;
+            }
+            if (stickyKeep) {
+                status = kProjActive;
+            } else {
+                status = kProjError;
+#ifdef __APPLE__
+                std::string detail;
+                ndi_timelinewatch::healthy(&detail);
+                NDI_LOG_TEXT(("Equirect (Camera Metadata) auto: no usable clip under the "
+                              "playhead yet (watcher: " + detail + ") — passthrough").c_str());
+#endif
+            }
+        } else if (metadataClipPath.empty()) {
+            NDI_LOG("Equirect (Camera Metadata) manual source but no camera clip is set — passthrough");
             status = kProjError;
         } else {
-            status = kProjActive;
+            status = kProjError;
         }
     }
 
@@ -2285,7 +2450,8 @@ static void refreshSTMaps(NDIInstanceData* data)
     // host queue's device except on multi-GPU Macs, where the render path
     // uploads once itself (also outside the entry mutex). No GPU context yet
     // (NDI disabled) is fine — the render path covers it.
-    if (status == kProjActive && data->gpuContext && data->gpuContext->initialized &&
+    if (status == kProjActive && !stickyKeep && left && left->valid &&
+        data->gpuContext && data->gpuContext->initialized &&
         data->gpuContext->metalContext) {
         stmapMetalBufferForQueue(left, data->gpuContext->metalContext, nullptr);
         if (right) {
@@ -2295,12 +2461,16 @@ static void refreshSTMaps(NDIInstanceData* data)
 #endif
 
     std::shared_ptr<StmapEntry> oldLeft, oldRight;
-    {
+    if (!stickyKeep) {  // sticky: the maps already installed stay untouched
         std::lock_guard<std::mutex> lock(data->stmapMutex);
         oldLeft = std::move(data->stmapLeft);
         oldRight = std::move(data->stmapRight);
         data->stmapLeft = left;
         data->stmapRight = right;
+        if (wantMetadata && autoSource) {
+            data->autoLensAppliedPath = metadataClipPath;
+            data->autoLensSkippedPath.clear();
+        }
     }
     // oldLeft/oldRight die here — a replaced map's hundreds of MB free
     // outside the mutex the render path takes.
@@ -2351,8 +2521,16 @@ static void readInstanceParams(NDIInstanceData* myData)
     char* brawClipPath = nullptr;
     gParamHost->paramGetValue(myData->brawClipParam, &brawClipPath);
     myData->brawClipPathWanted = brawClipPath ? brawClipPath : "";
+    gParamHost->paramGetValue(myData->brawSourceParam, &myData->brawSourceChoice);
     gParamHost->paramGetValue(myData->brawMapSizeParam, &myData->brawMapSizeChoice);
     gParamHost->paramGetValue(myData->brawMaskParam, &myData->brawMaskChoice);
+    // Mirror the auto-mode config into the atomics the playhead watcher
+    // thread reads (see applyAutoLensClip).
+    myData->autoLensWanted.store(myData->projectionMode == 2 && myData->brawSourceChoice == 0,
+                                 std::memory_order_relaxed);
+    myData->autoLensMapSize.store(brawMapSizeFromChoice(myData->brawMapSizeChoice),
+                                  std::memory_order_relaxed);
+    myData->autoLensMask.store(myData->brawMaskChoice == 1, std::memory_order_relaxed);
 
     int hdrEnabled;
     gParamHost->paramGetValue(myData->hdrEnabledParam, &hdrEnabled);
@@ -2455,6 +2633,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamSTMapLayout, &myData->stmapLayoutParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLeft, &myData->stmapLeftParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamBRAWSource, &myData->brawSourceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWClip, &myData->brawClipParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWMapSize, &myData->brawMapSizeParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWMask, &myData->brawMaskParam, 0);
@@ -2470,6 +2649,10 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     // Honor the project's saved parameter values (source name above all)
     // before the first NDI attach.
     readInstanceParams(myData);
+
+    // Auto camera-clip mode: visible to the playhead watcher from here on
+    // (the walk holds the registry mutex, so destroyInstance can't race it).
+    instanceRegistryAdd(myData);
 
     // Initialize NDI if enabled
     if (myData->enabled) {
@@ -2488,9 +2671,10 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
 static OfxStatus destroyInstance(OfxImageEffectHandle effect)
 {
     NDI_LOG("Destroying instance");
-    
+
     NDIInstanceData *myData = getInstanceData(effect);
     if (myData) {
+        instanceRegistryRemove(myData);  // before delete: the watcher walk holds the same mutex
         shutdownNDI(myData);
         delete myData;
     }
@@ -3023,8 +3207,22 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
 #endif
 
+    // Define the camera clip source parameter - in Projection group (issue
+    // #11: Timeline (Auto) follows the playhead via the scripting watcher,
+    // Manual Path reads the clip picked below)
+    OfxPropertySetHandle brawSourceProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamBRAWSource, &brawSourceProps);
+    gPropHost->propSetString(brawSourceProps, kOfxPropLabel, 0, kParamBRAWSourceLabel);
+    gPropHost->propSetString(brawSourceProps, kOfxParamPropScriptName, 0, kParamBRAWSource);
+    gPropHost->propSetString(brawSourceProps, kOfxParamPropHint, 0, kParamBRAWSourceHint);
+    gPropHost->propSetString(brawSourceProps, kOfxParamPropChoiceOption, 0, "Timeline (Auto)");
+    gPropHost->propSetString(brawSourceProps, kOfxParamPropChoiceOption, 1, "Manual Path");
+    gPropHost->propSetInt(brawSourceProps, kOfxParamPropDefault, 0, 0); // Timeline (Auto)
+    gPropHost->propSetInt(brawSourceProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(brawSourceProps, kOfxParamPropParent, 0, "projectionGroup");
+
     // Define the camera clip path parameter - in Projection group (issue #11:
-    // Camera Metadata mode reads the embedded lens calibration from any BRAW
+    // Manual Path mode reads the embedded lens calibration from any BRAW
     // clip shot on the camera)
     OfxPropertySetHandle brawClipProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamBRAWClip, &brawClipProps);

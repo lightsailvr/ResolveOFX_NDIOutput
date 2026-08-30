@@ -34,6 +34,8 @@ The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed 
 
 The Camera Metadata projection (v1.10.0) compiles against [third_party/braw/](third_party/braw/) — the Blackmagic RAW API header and dispatch shim, vendored from Blackmagic RAW SDK 5.1 under their Boost-style license (notices intact; re-copy both files from `/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Include/` to update). **Nothing Blackmagic is linked or bundled**: the shim resolves `BlackmagicRawAPI.framework` at runtime from the host application's own bundle — inside Resolve that is Resolve's shipped copy (identical to the SDK's, verified 5.1/50100.40.160) — falling back to the standalone SDK install, and failing soft (passthrough + Stream Status message) when neither exists. Building the plugin therefore needs no Blackmagic install at all.
 
+Its Timeline (Auto) camera-clip source (v1.11.0) bundles `src/ndi_timeline_watch.py` into `Contents/Resources/` (the Makefile copies it); at runtime the plugin spawns it with the system python3 to poll the Resolve scripting API for the clip under the playhead (`src/TimelineClipWatcher.cpp`). Auto mode needs Resolve's external-scripting preference (Preferences → System → General → External scripting using: Local) and a python3 on the machine; without either it logs why and Manual Path mode still works.
+
 ### Unit tests
 
 ```bash
