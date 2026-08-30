@@ -5,6 +5,9 @@
 *.o
 /NDIOutput.ofx.bundle/
 
+# Release packaging output (scripts/package_release.sh)
+/dist/
+
 # CMake build trees (Windows/CUDA build)
 /build/
 CMakeCache.txt

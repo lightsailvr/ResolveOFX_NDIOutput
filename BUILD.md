@@ -92,6 +92,32 @@ The version lives in **two places that must stay in sync**: the `VERSION` file a
 
 Do **not** use `make bump-patch/minor/major` — those only touch the `VERSION` file and let the source drift.
 
+### Release packaging (signed installer + GitHub release)
+
+Two scripts turn a working tree into a public release:
+
+```bash
+./scripts/package_release.sh          # build → sign → pkg → notarize → dist/v<VERSION>/
+./scripts/publish_github_release.sh   # tag + draft GitHub release with the artifacts
+```
+
+`package_release.sh` produces a **universal (arm64 + x86_64), macOS 13+ binary** with `libndi_advanced.dylib` bundled inside `Contents/Frameworks/` (`@loader_path` reference) — end users need **no NDI SDK**, unlike the dev flow where `make install` points the plugin at the SDK's dylib by absolute path. It signs the bundle with the Developer ID **Application** cert (hardened runtime, timestamps), builds a `productbuild` pkg installing to `/Library/OFX/Plugins` (bundle relocation disabled), signs that with the Developer ID **Installer** cert, then notarizes and staples via `notarytool`. Output: `NDIOutput-<V>-macOS.pkg` (installer), `NDIOutput-<V>-macOS.zip` (bare signed bundle for manual installs), `SHA256SUMS.txt`. The NDI attribution file `libndi_licenses.txt` ships inside `Contents/Resources/` and the installer readme carries the required ndi.video link (NDI SDK distribution terms).
+
+One-time signing setup (the script's preflight names anything missing):
+
+1. **Developer ID Application** certificate in the login keychain.
+2. **Developer ID Installer** certificate — create in Xcode → Settings → Accounts → Manage Certificates → **+** → Developer ID Installer (Account Holder only), or via CSR at developer.apple.com.
+3. **Notarization profile** — one-time, with an app-specific password from [account.apple.com](https://account.apple.com) → Sign-In and Security → App-Specific Passwords:
+   ```bash
+   xcrun notarytool store-credentials NDI_NOTARY --apple-id <your-apple-id> --team-id <TEAMID>
+   ```
+
+Flags: `--skip-notarize` (local testing), `--skip-tests`, `--host-arch-only`, `--unsigned-dev-build` (pipeline smoke test without the Installer cert — output named `-UNSIGNED-DEV`, never distribute it).
+
+`publish_github_release.sh` refuses un-notarized pkgs (`stapler validate` + `spctl` gate), takes release notes from the `## [X.Y.Z]` section of CHANGELOG.md (or `--notes-file`), pushes the `vX.Y.Z` tag, and creates a **draft** release — publish after review with `gh release edit vX.Y.Z --draft=false` (or run with `--publish`).
+
+A release build differs from the dev build (universal, deployment target, bundled dylib), so run the Tiers 1–2 loop with the **pkg-installed** plugin before publishing.
+
 ---
 
 ## Windows (CUDA) — STATUS: not building yet
@@ -117,8 +143,8 @@ Requirements when resuming: Visual Studio 2019/2022 (C++ workload), CUDA Toolkit
 ## Troubleshooting
 
 **Plugin doesn't appear in Resolve**
-1. Confirm the bundle is installed: `ls "/Library/OFX/Plugins/NDIOutput.ofx.bundle/Contents/macOS/"`
-2. Check the dylib is resolvable: `otool -L "/Library/OFX/Plugins/NDIOutput.ofx.bundle/Contents/macOS/NDIOutput.ofx"` — the NDI entry must be an absolute path, not `@rpath` (if it's `@rpath`, `make install`'s `install_name_tool` step didn't run)
+1. Confirm the bundle is installed: `ls "/Library/OFX/Plugins/NDIOutput.ofx.bundle/Contents/MacOS/"`
+2. Check the dylib is resolvable: `otool -L "/Library/OFX/Plugins/NDIOutput.ofx.bundle/Contents/MacOS/NDIOutput.ofx"` — the NDI entry must be an absolute path, not `@rpath` (if it's `@rpath`, `make install`'s `install_name_tool` step didn't run)
 3. Check the plugin cache entry for `status="0"` (command above). If the entry is stale or bad, quit Resolve and delete `OFXPluginCacheV2.xml` to force a full re-scan at next launch.
 
 **Plugin loads but no NDI source on the network**

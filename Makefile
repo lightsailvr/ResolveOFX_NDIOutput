@@ -9,14 +9,23 @@ NDI_SDK_PATH = "/Library/NDI Advanced SDK for Apple"
 NDI_INCLUDE = $(NDI_SDK_PATH)/include
 NDI_LIB = $(NDI_SDK_PATH)/lib/macOS/libndi_advanced.dylib
 
+# Deployment target / architectures.
+# libndi_advanced.dylib requires macOS 13+, so that is our floor. Without an
+# explicit -mmacosx-version-min the binary is stamped with the build host's OS
+# version and refuses to load on anything older (bit us in v1.12: minos 26.0).
+# ARCHFLAGS is empty for dev builds (host arch); release packaging passes
+# ARCHFLAGS="-arch arm64 -arch x86_64" for a universal binary.
+DEPLOYMENT_TARGET ?= 13.0
+ARCHFLAGS ?=
+
 # Compiler settings
 # third_party/braw holds the vendored (Boost-licensed) Blackmagic RAW API
 # header + dispatch shim; the framework itself is resolved at runtime from the
 # host app (Resolve ships it), so nothing Blackmagic is linked or bundled.
 CXX = c++
-CXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -Ithird_party/braw
-OBJCXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -x objective-c++
-LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -framework AppKit -framework UniformTypeIdentifiers -lz
+CXXFLAGS = -c -fvisibility=hidden -mmacosx-version-min=$(DEPLOYMENT_TARGET) $(ARCHFLAGS) -Iopenfx/include -I$(NDI_INCLUDE) -Ithird_party/braw
+OBJCXXFLAGS = -c -fvisibility=hidden -mmacosx-version-min=$(DEPLOYMENT_TARGET) $(ARCHFLAGS) -Iopenfx/include -I$(NDI_INCLUDE) -x objective-c++
+LDFLAGS = -bundle -fvisibility=hidden -mmacosx-version-min=$(DEPLOYMENT_TARGET) $(ARCHFLAGS) -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -framework AppKit -framework UniformTypeIdentifiers -lz
 
 # Source files
 SOURCES = src/NDIOutputPlugin.cpp src/BRAWImmersiveReader.cpp src/TimelineClipWatcher.cpp
@@ -25,7 +34,7 @@ OBJECTS = $(SOURCES:.cpp=.o) $(OBJCXX_SOURCES:.mm=.o)
 
 # Bundle structure
 BUNDLE_NAME = NDIOutput.ofx.bundle
-BUNDLE_EXECUTABLE = $(BUNDLE_NAME)/Contents/macOS/NDIOutput.ofx
+BUNDLE_EXECUTABLE = $(BUNDLE_NAME)/Contents/MacOS/NDIOutput.ofx
 
 # Build targets
 .PHONY: all clean dev install test test-metal
@@ -78,9 +87,9 @@ $(BUNDLE_EXECUTABLE): $(OBJECTS) | bundle_structure
 
 # Bundle structure
 bundle_structure:
-	mkdir -p $(BUNDLE_NAME)/Contents/macOS
+	mkdir -p $(BUNDLE_NAME)/Contents/MacOS
 	mkdir -p $(BUNDLE_NAME)/Contents/Resources
-	cp BaldavengerOFX.NDIOutput.png $(BUNDLE_NAME)/Contents/
+	cp BaldavengerOFX.NDIOutput.png $(BUNDLE_NAME)/Contents/Resources/
 	cp Info.plist $(BUNDLE_NAME)/Contents/
 	cp src/ndi_timeline_watch.py $(BUNDLE_NAME)/Contents/Resources/
 

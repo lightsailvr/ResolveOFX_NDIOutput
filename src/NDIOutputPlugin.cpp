@@ -106,9 +106,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 12
+#define kPluginVersionMinor 13
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.12.0"
+#define kPluginVersionString "1.13.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"

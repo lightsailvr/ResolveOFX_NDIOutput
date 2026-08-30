@@ -5,6 +5,34 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-08-30
+
+First public release.
+
+### Added
+- **Signed macOS installer**: `NDIOutput-<version>-macOS.pkg` — Developer ID signed, notarized, and stapled; installs to `/Library/OFX/Plugins`. A signed `.zip` of the bare bundle is published alongside it for manual installs. Universal binary (Apple Silicon + Intel), macOS 13+.
+- **The NDI runtime ships inside the plugin** (`Contents/Frameworks/libndi_advanced.dylib`, referenced via `@loader_path`) — end users no longer need any NDI SDK installed. NDI® is a registered trademark of Vizrt NDI AB; third-party notices are included in `Contents/Resources/libndi_licenses.txt`.
+- Release tooling: `scripts/package_release.sh` (build → sign → pkg → notarize) and `scripts/publish_github_release.sh` (tag + draft GitHub release). See BUILD.md "Release packaging".
+
+### Fixed
+- **Minimum macOS is now correctly 13.0**: binaries were previously stamped with the build machine's OS version and would refuse to load on anything older.
+- **Bundle layout corrected for code signing**: executable directory renamed to the canonical `Contents/MacOS/` spelling and the icon PNG moved into `Contents/Resources/` — both broke codesign's resource seal (harmless to Resolve, fatal to signing).
+
+## [1.12.0] - 2026-08-30
+
+### Fixed
+- **Stereo↔mono geometry pops on eye stalls** (#12): the stream's canvas is now locked once stereo latches — an eye starving no longer shrinks the frame to mono (a severe nausea trigger in-headset). Degraded mode packs the flowing eye into both halves on the unchanged canvas, degrade/recover both have hysteresis (≈4 s sustained silence to degrade, 3 clean frames to recover), and a parked timeline can no longer degrade at all. During stalls the last packed frame is re-sent so receivers keep flowing.
+
+## [1.11.0] - 2026-08-30
+
+### Added
+- **Timeline (Auto) camera-clip source** (#11): Camera Metadata projection now follows the playhead. A bundled helper (`ndi_timeline_watch.py`, spawned with the system python3) polls the Resolve scripting API for the clip under the playhead and swaps lens calibrations automatically at cuts — per-camera maps are cached, and gaps/uncalibrated clips keep the last camera's warp so the stream never pops. Requires Resolve's external-scripting preference (Local); Manual Path mode is unaffected without it.
+
+## [1.10.0] - 2026-08-30
+
+### Added
+- **Equirect (Camera Metadata) projection** (#11): warps URSA Cine Immersive BRAW footage to equirect directly from the lens calibration embedded in the clip (Mei-Rives model) — no STMap files needed. The Blackmagic RAW API is resolved at runtime from Resolve's own bundle; nothing Blackmagic is linked or shipped, and clips without calibration fall back soft to passthrough with a Stream Status message.
+
 ## [1.9.0] - 2026-08-30
 
 ### Added
