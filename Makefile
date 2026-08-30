@@ -10,13 +10,16 @@ NDI_INCLUDE = $(NDI_SDK_PATH)/include
 NDI_LIB = $(NDI_SDK_PATH)/lib/macOS/libndi_advanced.dylib
 
 # Compiler settings
+# third_party/braw holds the vendored (Boost-licensed) Blackmagic RAW API
+# header + dispatch shim; the framework itself is resolved at runtime from the
+# host app (Resolve ships it), so nothing Blackmagic is linked or bundled.
 CXX = c++
-CXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE)
+CXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -Ithird_party/braw
 OBJCXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -x objective-c++
 LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -framework AppKit -framework UniformTypeIdentifiers -lz
 
 # Source files
-SOURCES = src/NDIOutputPlugin.cpp
+SOURCES = src/NDIOutputPlugin.cpp src/BRAWImmersiveReader.cpp
 OBJCXX_SOURCES = src/MetalGPUAcceleration.mm src/MacFileDialog.mm
 OBJECTS = $(SOURCES:.cpp=.o) $(OBJCXX_SOURCES:.mm=.o)
 
@@ -42,6 +45,8 @@ test:
 	./build/test_stereo_pair
 	$(CXX) -Isrc tests/test_stmap.cpp -o build/test_stmap -lz
 	./build/test_stmap
+	$(CXX) -Isrc tests/test_brawmap.cpp -o build/test_brawmap -lz
+	./build/test_brawmap
 
 # GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
 test-metal: src/MetalGPUAcceleration.o

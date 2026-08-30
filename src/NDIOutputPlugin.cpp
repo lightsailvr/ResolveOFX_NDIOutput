@@ -44,12 +44,14 @@
 
 #include <sys/stat.h>
 
+#include "BRAWLensMap.h"
 #include "RenderProbe.h"
 #include "STMap.h"
 #include "StereoPair.h"
 #include "StreamResolution.h"
 
 #ifdef __APPLE__
+#include "BRAWImmersiveReader.h"
 #include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
 #endif
@@ -101,9 +103,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 9
+#define kPluginVersionMinor 10
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.9.0"
+#define kPluginVersionString "1.10.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -134,7 +136,7 @@
 // Projection Parameters (issue #7)
 #define kParamProjection "projectionMode"
 #define kParamProjectionLabel "Projection"
-#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player. The warped output resolution equals the STMap's resolution (the Resolution control then applies on top). A missing or invalid STMap falls back to Passthrough and says so in Stream Status."
+#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player; the warped output resolution equals the STMap's resolution. Equirect (Camera Metadata) does the same warp but derives the per-eye maps from the lens calibration embedded in an URSA Cine Immersive BRAW clip (pick any clip shot on the camera below) — no STMap files needed; the output is a 180ºx180º equirect per eye at the Metadata Map Size. Either way the Resolution control applies on top, and a missing/invalid map source falls back to Passthrough and says so in Stream Status."
 
 #define kParamSTMapLayout "stmapLayout"
 #define kParamSTMapLayoutLabel "STMap Layout"
@@ -157,6 +159,21 @@
 #define kParamSTMapRightBrowse "stmapRightBrowse"
 #define kParamSTMapRightBrowseLabel "Browse for Right-Eye STMap..."
 #define kParamSTMapRightBrowseHint "Pick the right-eye STMap EXR with a file dialog and fill the path field above."
+
+// Camera-metadata projection (issue #11): per-eye warp maps generated from the
+// Apple Immersive lens calibration embedded in URSA Cine Immersive BRAW.
+#define kParamBRAWClip "brawClip"
+#define kParamBRAWClipLabel "Camera Clip (.braw)"
+#define kParamBRAWClipHint "Any URSA Cine Immersive BRAW clip shot on this camera — the embedded factory calibration is per-camera, not per-shot, so one pick covers every clip from the same body. Used only in Equirect (Camera Metadata) mode; the clip is opened for its metadata (instant), never decoded."
+#define kParamBRAWClipBrowse "brawClipBrowse"
+#define kParamBRAWClipBrowseLabel "Browse for Camera Clip..."
+#define kParamBRAWClipBrowseHint "Pick the camera's BRAW clip with a file dialog and fill the path field above."
+#define kParamBRAWMapSize "metadataMapSize"
+#define kParamBRAWMapSizeLabel "Metadata Map Size"
+#define kParamBRAWMapSizeHint "Resolution of the generated per-eye 180ºx180º equirect (Camera Metadata mode only) — like an STMap's resolution, this is the warped output size per eye before the Resolution control divides it. 2048 is right for monitoring; 4096 costs 4x the map memory."
+#define kParamBRAWMask "metadataMask"
+#define kParamBRAWMaskLabel "Metadata Edge Mask"
+#define kParamBRAWMaskHint "Off streams the full calibrated 180º field. Camera applies the clip's embedded visionOS-style porthole (a circle ~80º off-axis on this lens), hiding the smeary outer lens edge the way Apple players do — currently a hard cut at the circle, not the 2.5º feather."
 
 // GPU Acceleration Parameters
 #define kParamGPUAcceleration "gpuAcceleration"
@@ -407,6 +424,92 @@ static void stmapAcquirePackedPair(const std::string& path,
     *rightOut = right;
 }
 
+// Fetch BOTH per-eye maps generated from an URSA Cine Immersive BRAW clip's
+// embedded lens calibration (issue #11 — see src/BRAWLensMap.h for the
+// geometry). Same derived-pseudo-key caching as the packed-SbS split above,
+// staleness-checked against the .braw itself; a re-pick of the same clip (or
+// both per-eye instances naming it) reuses the generated maps. The BRAW open
+// is metadata-only and the generation ~30 ms at 2048² — both fine for the
+// parameter-edit path this runs on.
+static void brawAcquireLensPair(const std::string& path, int mapSize, bool applyMask,
+                                std::shared_ptr<StmapEntry>* leftOut,
+                                std::shared_ptr<StmapEntry>* rightOut)
+{
+    const std::string suffix = "\n#brawLens:" + std::to_string(mapSize) +
+                               (applyMask ? ":mask" : ":nomask");
+    const std::string keyLeft = path + suffix + ":L";
+    const std::string keyRight = path + suffix + ":R";
+    long long mtime = 0, size = 0;
+    const bool statOk = stmapFileStat(path.c_str(), &mtime, &size);
+    {
+        std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+        auto itL = gStmapCache.find(keyLeft);
+        auto itR = gStmapCache.find(keyRight);
+        if (itL != gStmapCache.end() && itR != gStmapCache.end()) {
+            std::shared_ptr<StmapEntry> left = itL->second.lock();
+            std::shared_ptr<StmapEntry> right = itR->second.lock();
+            if (left && right && statOk &&
+                left->fileMtime == mtime && left->fileSize == size) {
+                *leftOut = left;
+                *rightOut = right;
+                return;
+            }
+        }
+    }
+
+    std::shared_ptr<StmapEntry> left = std::make_shared<StmapEntry>();
+    std::shared_ptr<StmapEntry> right = std::make_shared<StmapEntry>();
+    left->path = keyLeft;
+    right->path = keyRight;
+    left->fileMtime = right->fileMtime = mtime;
+    left->fileSize = right->fileSize = size;
+
+#ifdef __APPLE__
+    std::string json, kind, calType, error;
+    ndi_brawmap::LensCalibration cal;
+    if (!ndi_brawreader::readImmersiveCalibration(path, &json, &kind, &calType, &error) ||
+        !ndi_brawmap::parseCalibrationJSON(json, &cal, &error)) {
+        left->error = right->error = error;
+        NDI_LOG_TEXT(("BRAW lens maps: '" + path + "' — " + error).c_str());
+    } else {
+        const bool maskUsable = cal.left.maskRadiusDeg > 0.0 && cal.right.maskRadiusDeg > 0.0;
+        if (applyMask && !maskUsable) {
+            NDI_LOG_TEXT(("BRAW lens maps: '" + path +
+                          "' carries no usable maskData — edge mask skipped").c_str());
+        }
+        if (applyMask && cal.left.maskSpreadDeg > 1.0) {
+            NDI_LOG("BRAW lens maps: mask ring is non-circular (%.1f deg spread) — "
+                    "approximated by its mean circle",
+                    cal.left.maskSpreadDeg);
+        }
+        if (!ndi_brawmap::generateLensMaps(cal, mapSize, applyMask, &left->map, &right->map,
+                                           &error)) {
+            left->error = right->error = error;
+            NDI_LOG_TEXT(("BRAW lens maps: generation failed for '" + path + "' — " + error).c_str());
+        } else {
+            left->valid = right->valid = true;
+            NDI_LOG_TEXT(("BRAW lens maps: '" + path + "' (" + kind + "/" + calType + ", " +
+                          cal.generator + ") -> 2x " + std::to_string(mapSize) + "x" +
+                          std::to_string(mapSize) + " equirect 180, mask " +
+                          (applyMask && maskUsable
+                               ? (std::to_string(cal.left.maskRadiusDeg) + " deg")
+                               : std::string("off")))
+                             .c_str());
+        }
+    }
+#else
+    (void)mapSize;
+    (void)applyMask;
+    left->error = right->error = "Camera-metadata projection is macOS-only for now";
+#endif
+
+    std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+    gStmapCache[keyLeft] = left;
+    gStmapCache[keyRight] = right;
+    *leftOut = left;
+    *rightOut = right;
+}
+
 #ifdef __APPLE__
 // Per-device Metal upload of an STMap's uv data, cached on the shared entry:
 // uploaded once, referenced by every subsequent frame's command buffer (which
@@ -487,6 +590,9 @@ struct NDIInstanceData {
     OfxParamHandle stmapLayoutParam;
     OfxParamHandle stmapLeftParam;
     OfxParamHandle stmapRightParam;
+    OfxParamHandle brawClipParam;
+    OfxParamHandle brawMapSizeParam;
+    OfxParamHandle brawMaskParam;
     OfxParamHandle hdrEnabledParam;
     OfxParamHandle colorSpaceParam;
     OfxParamHandle transferFunctionParam;
@@ -531,10 +637,13 @@ struct NDIInstanceData {
     // a shared_ptr per render, so a mid-flight swap can never free a map a
     // render is reading. renderStmap is this render's selected map (null =
     // passthrough), stashed like renderEye.
-    int projectionMode = 0;             // 0 = Passthrough, 1 = Equirect (STMap)
+    int projectionMode = 0;             // 0 = Passthrough, 1 = Equirect (STMap), 2 = Equirect (Camera Metadata)
     int stmapLayout = 0;                // 0 = Per-Eye Files, 1 = Packed Side-by-Side
     std::string stmapLeftPathWanted;    // parameter values as last read
     std::string stmapRightPathWanted;
+    std::string brawClipPathWanted;     // Camera Metadata mode's .braw (issue #11)
+    int brawMapSizeChoice = 1;          // 0 = 1024, 1 = 2048, 2 = 4096 (per eye)
+    int brawMaskChoice = 0;             // 0 = Off, 1 = Camera porthole
     std::mutex stmapMutex;
     std::shared_ptr<StmapEntry> stmapLeft;
     std::shared_ptr<StmapEntry> stmapRight;   // null: left map serves both eyes
@@ -824,12 +933,14 @@ static std::string hubComposeStatusLocked(SenderHub* hub, NDIInstanceData* data)
             status = "Mono";
             break;
     }
+    const bool metadataMode = (data->projectionMode == 2);
     switch (data->projStatus.load(std::memory_order_relaxed)) {
         case kProjActive:
-            status += ", Equirect (STMap)";
+            status += metadataMode ? ", Equirect (Camera Metadata)" : ", Equirect (STMap)";
             break;
         case kProjError:
-            status += ", STMap invalid — passthrough (see log)";
+            status += metadataMode ? ", Camera metadata invalid — passthrough (see log)"
+                                   : ", STMap invalid — passthrough (see log)";
             break;
         case kProjMismatch:
             status += ", STMap L/R size mismatch — passthrough";
@@ -2112,10 +2223,11 @@ static OfxStatus onUnLoad(void)
 // Stream Status message, never a refusal to stream.
 static void refreshSTMaps(NDIInstanceData* data)
 {
-    const bool want = (data->projectionMode == 1);
+    const bool wantStmap = (data->projectionMode == 1);
+    const bool wantMetadata = (data->projectionMode == 2);
     const bool packedLayout = (data->stmapLayout == 1);
     std::shared_ptr<StmapEntry> left, right;
-    if (want && !data->stmapLeftPathWanted.empty()) {
+    if (wantStmap && !data->stmapLeftPathWanted.empty()) {
         if (packedLayout) {
             // One packed side-by-side file yields both eyes; the right-eye
             // slot is ignored in this layout (the param hint says so).
@@ -2124,12 +2236,19 @@ static void refreshSTMaps(NDIInstanceData* data)
             left = stmapAcquire(data->stmapLeftPathWanted);
         }
     }
-    if (want && !packedLayout && !data->stmapRightPathWanted.empty()) {
+    if (wantStmap && !packedLayout && !data->stmapRightPathWanted.empty()) {
         right = stmapAcquire(data->stmapRightPathWanted);
+    }
+    if (wantMetadata && !data->brawClipPathWanted.empty()) {
+        const int mapSize = (data->brawMapSizeChoice == 0)   ? 1024
+                            : (data->brawMapSizeChoice == 2) ? 4096
+                                                             : 2048;
+        brawAcquireLensPair(data->brawClipPathWanted, mapSize, data->brawMaskChoice == 1,
+                            &left, &right);
     }
 
     int status = kProjOff;
-    if (want) {
+    if (wantStmap) {
         if (!left && data->stmapLeftPathWanted.empty()) {
             NDI_LOG("Equirect (STMap) selected but no left-eye STMap path is set — passthrough");
             status = kProjError;
@@ -2144,6 +2263,17 @@ static void refreshSTMaps(NDIInstanceData* data)
             NDI_LOG("STMap L/R size mismatch: left %dx%d vs right %dx%d — passthrough",
                     left->map.width, left->map.height, right->map.width, right->map.height);
             status = kProjMismatch;
+        } else {
+            status = kProjActive;
+        }
+    } else if (wantMetadata) {
+        // The pair generates together from one calibration: either both eyes
+        // are valid (same size by construction) or neither is.
+        if (!left && data->brawClipPathWanted.empty()) {
+            NDI_LOG("Equirect (Camera Metadata) selected but no camera clip is set — passthrough");
+            status = kProjError;
+        } else if (!left || !left->valid || !right || !right->valid) {
+            status = kProjError;
         } else {
             status = kProjActive;
         }
@@ -2218,6 +2348,11 @@ static void readInstanceParams(NDIInstanceData* myData)
     char* stmapRightPath = nullptr;
     gParamHost->paramGetValue(myData->stmapRightParam, &stmapRightPath);
     myData->stmapRightPathWanted = stmapRightPath ? stmapRightPath : "";
+    char* brawClipPath = nullptr;
+    gParamHost->paramGetValue(myData->brawClipParam, &brawClipPath);
+    myData->brawClipPathWanted = brawClipPath ? brawClipPath : "";
+    gParamHost->paramGetValue(myData->brawMapSizeParam, &myData->brawMapSizeChoice);
+    gParamHost->paramGetValue(myData->brawMaskParam, &myData->brawMaskChoice);
 
     int hdrEnabled;
     gParamHost->paramGetValue(myData->hdrEnabledParam, &hdrEnabled);
@@ -2320,6 +2455,9 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamSTMapLayout, &myData->stmapLayoutParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLeft, &myData->stmapLeftParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamBRAWClip, &myData->brawClipParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamBRAWMapSize, &myData->brawMapSizeParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamBRAWMask, &myData->brawMaskParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamColorSpace, &myData->colorSpaceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamTransferFunction, &myData->transferFunctionParam, 0);
@@ -2391,6 +2529,16 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
                                      "exr", currentPath, picked, sizeof(picked))) {
                 gParamHost->paramSetValue(pathParam, picked);
                 NDI_LOG_TEXT((std::string("STMap browse picked: '") + picked + "'").c_str());
+            }
+        }
+        if (strcmp(paramName, kParamBRAWClipBrowse) == 0) {
+            char* currentPath = nullptr;
+            gParamHost->paramGetValue(myData->brawClipParam, &currentPath);
+            char picked[4096];
+            if (mac_open_file_dialog("Choose any BRAW clip shot on the URSA Cine Immersive",
+                                     "braw", currentPath, picked, sizeof(picked))) {
+                gParamHost->paramSetValue(myData->brawClipParam, picked);
+                NDI_LOG_TEXT((std::string("Camera clip browse picked: '") + picked + "'").c_str());
             }
         }
 #endif
@@ -2496,7 +2644,7 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     int projectionChoice = 0;
     gParamHost->paramGetValue(myData->projectionParam, &projectionChoice);
     myData->renderStmap.reset();
-    if (projectionChoice == 1 && !myData->renderIsThumbnail &&
+    if ((projectionChoice == 1 || projectionChoice == 2) && !myData->renderIsThumbnail &&
         myData->projStatus.load(std::memory_order_relaxed) == kProjActive) {
         std::lock_guard<std::mutex> lock(myData->stmapMutex);
         const std::shared_ptr<StmapEntry>& sel =
@@ -2813,6 +2961,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(projectionProps, kOfxParamPropHint, 0, kParamProjectionHint);
     gPropHost->propSetString(projectionProps, kOfxParamPropChoiceOption, 0, "Passthrough");
     gPropHost->propSetString(projectionProps, kOfxParamPropChoiceOption, 1, "Equirect (STMap)");
+    gPropHost->propSetString(projectionProps, kOfxParamPropChoiceOption, 2, "Equirect (Camera Metadata)");
     gPropHost->propSetInt(projectionProps, kOfxParamPropDefault, 0, 0); // Passthrough
     gPropHost->propSetInt(projectionProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(projectionProps, kOfxParamPropParent, 0, "projectionGroup");
@@ -2873,6 +3022,54 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropHint, 0, kParamSTMapRightBrowseHint);
     gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
 #endif
+
+    // Define the camera clip path parameter - in Projection group (issue #11:
+    // Camera Metadata mode reads the embedded lens calibration from any BRAW
+    // clip shot on the camera)
+    OfxPropertySetHandle brawClipProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamBRAWClip, &brawClipProps);
+    gPropHost->propSetString(brawClipProps, kOfxPropLabel, 0, kParamBRAWClipLabel);
+    gPropHost->propSetString(brawClipProps, kOfxParamPropScriptName, 0, kParamBRAWClip);
+    gPropHost->propSetString(brawClipProps, kOfxParamPropHint, 0, kParamBRAWClipHint);
+    gPropHost->propSetString(brawClipProps, kOfxParamPropDefault, 0, "");
+    gPropHost->propSetString(brawClipProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
+    gPropHost->propSetInt(brawClipProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(brawClipProps, kOfxParamPropParent, 0, "projectionGroup");
+
+#ifdef __APPLE__
+    // Define the camera clip browse button - in Projection group
+    OfxPropertySetHandle brawClipBrowseProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamBRAWClipBrowse, &brawClipBrowseProps);
+    gPropHost->propSetString(brawClipBrowseProps, kOfxPropLabel, 0, kParamBRAWClipBrowseLabel);
+    gPropHost->propSetString(brawClipBrowseProps, kOfxParamPropScriptName, 0, kParamBRAWClipBrowse);
+    gPropHost->propSetString(brawClipBrowseProps, kOfxParamPropHint, 0, kParamBRAWClipBrowseHint);
+    gPropHost->propSetString(brawClipBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
+#endif
+
+    // Define the metadata map size parameter - in Projection group
+    OfxPropertySetHandle brawMapSizeProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamBRAWMapSize, &brawMapSizeProps);
+    gPropHost->propSetString(brawMapSizeProps, kOfxPropLabel, 0, kParamBRAWMapSizeLabel);
+    gPropHost->propSetString(brawMapSizeProps, kOfxParamPropScriptName, 0, kParamBRAWMapSize);
+    gPropHost->propSetString(brawMapSizeProps, kOfxParamPropHint, 0, kParamBRAWMapSizeHint);
+    gPropHost->propSetString(brawMapSizeProps, kOfxParamPropChoiceOption, 0, "1024 x 1024 per eye");
+    gPropHost->propSetString(brawMapSizeProps, kOfxParamPropChoiceOption, 1, "2048 x 2048 per eye");
+    gPropHost->propSetString(brawMapSizeProps, kOfxParamPropChoiceOption, 2, "4096 x 4096 per eye");
+    gPropHost->propSetInt(brawMapSizeProps, kOfxParamPropDefault, 0, 1); // 2048
+    gPropHost->propSetInt(brawMapSizeProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(brawMapSizeProps, kOfxParamPropParent, 0, "projectionGroup");
+
+    // Define the metadata edge mask parameter - in Projection group
+    OfxPropertySetHandle brawMaskProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamBRAWMask, &brawMaskProps);
+    gPropHost->propSetString(brawMaskProps, kOfxPropLabel, 0, kParamBRAWMaskLabel);
+    gPropHost->propSetString(brawMaskProps, kOfxParamPropScriptName, 0, kParamBRAWMask);
+    gPropHost->propSetString(brawMaskProps, kOfxParamPropHint, 0, kParamBRAWMaskHint);
+    gPropHost->propSetString(brawMaskProps, kOfxParamPropChoiceOption, 0, "Off");
+    gPropHost->propSetString(brawMaskProps, kOfxParamPropChoiceOption, 1, "Camera");
+    gPropHost->propSetInt(brawMaskProps, kOfxParamPropDefault, 0, 0); // Off
+    gPropHost->propSetInt(brawMaskProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(brawMaskProps, kOfxParamPropParent, 0, "projectionGroup");
 
     // Define GPU acceleration parameter - in Performance group
     OfxPropertySetHandle gpuAccelerationProps = NULL;
