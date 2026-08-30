@@ -42,11 +42,15 @@
 #include "ofxMemory.h"
 #include "ofxMultiThread.h"
 
+#include <sys/stat.h>
+
 #include "RenderProbe.h"
+#include "STMap.h"
 #include "StereoPair.h"
 #include "StreamResolution.h"
 
 #ifdef __APPLE__
+#include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
 #endif
 
@@ -97,9 +101,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 6
-#define kPluginVersionPatch 1
-#define kPluginVersionString "1.6.1"
+#define kPluginVersionMinor 9
+#define kPluginVersionPatch 0
+#define kPluginVersionString "1.9.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -126,6 +130,33 @@
 #define kParamStereoStatus "stereoStatus"
 #define kParamStereoStatusLabel "Stream Status"
 #define kParamStereoStatusHint "What the stream is currently carrying: Mono, a packed stereo pair, a labeled single-eye fallback when the partner eye stops rendering, or the sender-creation failure (e.g. the NDI name is already in use on this machine)."
+
+// Projection Parameters (issue #7)
+#define kParamProjection "projectionMode"
+#define kParamProjectionLabel "Projection"
+#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player. The warped output resolution equals the STMap's resolution (the Resolution control then applies on top). A missing or invalid STMap falls back to Passthrough and says so in Stream Status."
+
+#define kParamSTMapLayout "stmapLayout"
+#define kParamSTMapLayoutLabel "STMap Layout"
+#define kParamSTMapLayoutHint "How the STMap file(s) carry the eyes. Per-Eye Files: each loaded EXR applies whole to each rendered frame — also the right choice for a packed-frame source on a mono timeline (e.g. a dual-fisheye clip: one map in the left slot warps the whole packed frame). Packed Side-by-Side: the left-eye slot holds ONE EXR whose left half maps the left eye and right half the right eye (Canon VR-style authoring), for Stereo 3D timelines; each half's U convention (per-eye vs packed-frame coordinates) is auto-detected and logged, and the right-eye slot is ignored. Eye assignment always comes from the timeline's stereo tracks — the map halves define geometry only."
+
+#define kParamSTMapLeft "stmapLeft"
+#define kParamSTMapLeftLabel "STMap (Left Eye)"
+#define kParamSTMapLeftHint "32-bit float (or half) EXR STMap for the left eye: R = normalized source U, G = normalized source V, bottom-left origin (Fusion/Nuke convention). Scanline EXR with None/RLE/Zip compression. Required for Equirect mode; also used for the right eye when no right-eye map is set, and for mono timelines."
+
+#define kParamSTMapRight "stmapRight"
+#define kParamSTMapRightLabel "STMap (Right Eye)"
+#define kParamSTMapRightHint "Optional right-eye STMap EXR (same format and resolution as the left map). Leave empty to warp both eyes through the left map."
+
+// Native browse buttons: Resolve renders filePath string params as plain
+// text fields with no browse control (verified 2026-08-30), so the plugin
+// pops its own NSOpenPanel from push-button params (macOS only).
+#define kParamSTMapLeftBrowse "stmapLeftBrowse"
+#define kParamSTMapLeftBrowseLabel "Browse for Left-Eye STMap..."
+#define kParamSTMapLeftBrowseHint "Pick the left-eye (or packed side-by-side) STMap EXR with a file dialog and fill the path field above."
+#define kParamSTMapRightBrowse "stmapRightBrowse"
+#define kParamSTMapRightBrowseLabel "Browse for Right-Eye STMap..."
+#define kParamSTMapRightBrowseHint "Pick the right-eye STMap EXR with a file dialog and fill the path field above."
 
 // GPU Acceleration Parameters
 #define kParamGPUAcceleration "gpuAcceleration"
@@ -224,6 +255,216 @@ struct SenderHub; // process-shared NDI sender + eye pairer (defined below)
 struct AsyncPump; // per-instance off-render-thread NDI worker (defined below)
 #endif
 
+// ---------------------------------------------------------------------------
+// STMap store (issue #7). One loaded map is shared process-wide via a
+// weak-pointer cache: in stereo, both per-eye instances name the same files,
+// and an 8K float map runs to hundreds of MB — loading it once matters. An
+// entry is immutable after load (the per-device Metal upload cache is the one
+// lazily-filled part, behind its own mutex); instances hold shared_ptrs and
+// the map frees itself when the last instance lets go.
+// ---------------------------------------------------------------------------
+
+struct StmapEntry {
+    std::string path;
+    long long fileMtime = 0;
+    long long fileSize = 0;
+    bool valid = false;
+    std::string error;
+    ndi_stmap::STMapImage map;
+#ifdef __APPLE__
+    // Per-device Metal upload of map.uv, created lazily on the render path
+    // and reused every frame. In-flight command buffers retain the MTLBuffer,
+    // so releasing here while one executes is safe.
+    std::mutex metalMutex;
+    std::map<void*, void*> metalBufferByDevice; // key: device ptr; value: retained MTLBuffer
+    bool metalUploadFailed = false;             // don't retry (or re-log) an OOM every frame
+    ~StmapEntry()
+    {
+        for (auto& kv : metalBufferByDevice) {
+            metal_gpu_release_buffer(kv.second);
+        }
+    }
+#endif
+};
+
+static std::mutex gStmapCacheMutex;
+static std::map<std::string, std::weak_ptr<StmapEntry>> gStmapCache;
+
+static bool stmapFileStat(const char* path, long long* mtime, long long* size)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return false;
+    }
+    *mtime = static_cast<long long>(st.st_mtime);
+    *size = static_cast<long long>(st.st_size);
+    return true;
+}
+
+// Fetch the STMap at `path`, loading it only when no instance already holds a
+// current copy (keyed on mtime+size, so overwriting the file and touching any
+// parameter picks up the new bytes). The load itself runs OUTSIDE every lock —
+// a large EXR takes real time and render threads must never queue behind it;
+// they keep streaming passthrough until the caller swaps the entry in.
+static std::shared_ptr<StmapEntry> stmapAcquire(const std::string& path)
+{
+    long long mtime = 0, size = 0;
+    const bool statOk = stmapFileStat(path.c_str(), &mtime, &size);
+    {
+        std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+        for (auto it = gStmapCache.begin(); it != gStmapCache.end();) {
+            it = it->second.expired() ? gStmapCache.erase(it) : std::next(it);
+        }
+        auto it = gStmapCache.find(path);
+        if (it != gStmapCache.end()) {
+            std::shared_ptr<StmapEntry> hit = it->second.lock();
+            if (hit && statOk && hit->fileMtime == mtime && hit->fileSize == size) {
+                return hit;
+            }
+            // Stale (file replaced) or vanished: fall through to a fresh load,
+            // which surfaces the current state of the path.
+        }
+    }
+
+    std::shared_ptr<StmapEntry> entry = std::make_shared<StmapEntry>();
+    entry->path = path;
+    entry->fileMtime = mtime;
+    entry->fileSize = size;
+    entry->valid = ndi_stmap::loadSTMapEXR(path.c_str(), &entry->map, &entry->error);
+    if (entry->valid) {
+        NDI_LOG_TEXT(("STMap loaded: '" + path + "' (" + std::to_string(entry->map.width) +
+                      "x" + std::to_string(entry->map.height) + ")").c_str());
+    } else {
+        NDI_LOG_TEXT(("STMap load failed: '" + path + "' — " + entry->error).c_str());
+    }
+
+    std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+    gStmapCache[path] = entry;
+    return entry;
+}
+
+// Fetch BOTH per-eye maps derived from one side-by-side packed STMap file
+// (Canon VR-style authoring — see ndi_stmap::splitPackedSTMap for the split
+// and U-convention auto-detection). The derived halves are cached process-
+// wide under pseudo-keys (a real path can't contain '\n', so no collision
+// with file entries) and staleness-checked against the SOURCE file like any
+// entry; the full packed image is only held while splitting — once both
+// halves exist, its cache slot expires and the memory frees.
+static void stmapAcquirePackedPair(const std::string& path,
+                                   std::shared_ptr<StmapEntry>* leftOut,
+                                   std::shared_ptr<StmapEntry>* rightOut)
+{
+    const std::string keyLeft = path + "\n#packedSbS:L";
+    const std::string keyRight = path + "\n#packedSbS:R";
+    long long mtime = 0, size = 0;
+    const bool statOk = stmapFileStat(path.c_str(), &mtime, &size);
+    {
+        std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+        auto itL = gStmapCache.find(keyLeft);
+        auto itR = gStmapCache.find(keyRight);
+        if (itL != gStmapCache.end() && itR != gStmapCache.end()) {
+            std::shared_ptr<StmapEntry> left = itL->second.lock();
+            std::shared_ptr<StmapEntry> right = itR->second.lock();
+            if (left && right && statOk &&
+                left->fileMtime == mtime && left->fileSize == size) {
+                *leftOut = left;
+                *rightOut = right;
+                return;
+            }
+        }
+    }
+
+    std::shared_ptr<StmapEntry> packed = stmapAcquire(path); // shared, cached, stat-keyed
+    std::shared_ptr<StmapEntry> left = std::make_shared<StmapEntry>();
+    std::shared_ptr<StmapEntry> right = std::make_shared<StmapEntry>();
+    left->path = keyLeft;
+    right->path = keyRight;
+    left->fileMtime = right->fileMtime = packed->fileMtime;
+    left->fileSize = right->fileSize = packed->fileSize;
+    if (!packed->valid) {
+        left->error = right->error = packed->error;
+    } else {
+        ndi_stmap::PackedHalfCoords leftCoords, rightCoords;
+        std::string splitError;
+        if (ndi_stmap::splitPackedSTMap(packed->map, &left->map, &right->map,
+                                        &leftCoords, &rightCoords, &splitError)) {
+            left->valid = right->valid = true;
+            NDI_LOG_TEXT(("STMap packed SbS split: '" + path + "' " +
+                          std::to_string(packed->map.width) + "x" + std::to_string(packed->map.height) +
+                          " -> 2x " + std::to_string(left->map.width) + "x" + std::to_string(left->map.height) +
+                          "; left half: " + ndi_stmap::packedHalfCoordsName(leftCoords) +
+                          "; right half: " + ndi_stmap::packedHalfCoordsName(rightCoords)).c_str());
+        } else {
+            left->error = right->error = splitError;
+            NDI_LOG_TEXT(("STMap packed SbS split failed: '" + path + "' — " + splitError).c_str());
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(gStmapCacheMutex);
+    gStmapCache[keyLeft] = left;
+    gStmapCache[keyRight] = right;
+    *leftOut = left;
+    *rightOut = right;
+}
+
+#ifdef __APPLE__
+// Per-device Metal upload of an STMap's uv data, cached on the shared entry:
+// uploaded once, referenced by every subsequent frame's command buffer (which
+// retains it while executing, so the entry dying mid-flight is safe). Returns
+// NULL on failure — callers fall back to the CPU warp. The upload itself (a
+// multi-hundred-MB memcpy for a big map) runs OUTSIDE entry->metalMutex so
+// the other eye's render thread never queues behind it; normally it doesn't
+// run on a render thread at all — refreshSTMaps pre-warms it on the host's
+// main thread whenever the context device matches the host queue's device
+// (always, except multi-GPU Macs).
+static void* stmapMetalBufferForQueue(const std::shared_ptr<StmapEntry>& entry,
+                                      MetalGPUContextRef metalContext, void* metalQueue)
+{
+    if (!entry || !entry->valid) {
+        return nullptr;
+    }
+    void* deviceKey = metal_gpu_queue_device(metalContext, metalQueue);
+    if (!deviceKey) {
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(entry->metalMutex);
+        auto it = entry->metalBufferByDevice.find(deviceKey);
+        if (it != entry->metalBufferByDevice.end()) {
+            return it->second;
+        }
+        if (entry->metalUploadFailed) {
+            return nullptr;
+        }
+    }
+    void* buffer = metal_gpu_create_shared_buffer_for_queue(metalContext, metalQueue,
+                                                            entry->map.uv.data(),
+                                                            entry->map.uv.size() * sizeof(float));
+    std::lock_guard<std::mutex> lock(entry->metalMutex);
+    if (!buffer) {
+        entry->metalUploadFailed = true; // don't retry (or re-log) an OOM every frame
+        NDI_LOG("STMap: GPU upload failed (%zu bytes) — using the CPU warp fallback",
+                entry->map.uv.size() * sizeof(float));
+        return nullptr;
+    }
+    auto inserted = entry->metalBufferByDevice.emplace(deviceKey, buffer);
+    if (!inserted.second) {
+        // Lost a concurrent upload race — keep the first, drop ours.
+        metal_gpu_release_buffer(buffer);
+        return inserted.first->second;
+    }
+    return buffer;
+}
+#endif // __APPLE__
+
+// Stream-status projection tag, composed into the Stream Status parameter.
+enum ProjStatus {
+    kProjOff = 0,       // Passthrough selected — no suffix
+    kProjActive = 1,    // warping through valid maps
+    kProjError = 2,     // Equirect selected but a map is missing/invalid: passthrough
+    kProjMismatch = 3,  // L/R maps disagree on size (would split eye geometry): passthrough
+};
+
 // Private instance data
 struct NDIInstanceData {
     // Clip handles
@@ -242,6 +483,10 @@ struct NDIInstanceData {
     OfxParamHandle debugLoggingParam;
     OfxParamHandle stereoPackingParam;
     OfxParamHandle stereoStatusParam;
+    OfxParamHandle projectionParam;
+    OfxParamHandle stmapLayoutParam;
+    OfxParamHandle stmapLeftParam;
+    OfxParamHandle stmapRightParam;
     OfxParamHandle hdrEnabledParam;
     OfxParamHandle colorSpaceParam;
     OfxParamHandle transferFunctionParam;
@@ -280,6 +525,21 @@ struct NDIInstanceData {
     double renderTime;         // kOfxPropTime — the pairing key
     bool renderIsThumbnail;
     int stereoPacking;         // 0 = Side-by-Side, 1 = Top-Bottom
+
+    // Projection normalization (issue #7). The loaded entries swap under
+    // stmapMutex on parameter changes (main thread) while render threads copy
+    // a shared_ptr per render, so a mid-flight swap can never free a map a
+    // render is reading. renderStmap is this render's selected map (null =
+    // passthrough), stashed like renderEye.
+    int projectionMode = 0;             // 0 = Passthrough, 1 = Equirect (STMap)
+    int stmapLayout = 0;                // 0 = Per-Eye Files, 1 = Packed Side-by-Side
+    std::string stmapLeftPathWanted;    // parameter values as last read
+    std::string stmapRightPathWanted;
+    std::mutex stmapMutex;
+    std::shared_ptr<StmapEntry> stmapLeft;
+    std::shared_ptr<StmapEntry> stmapRight;   // null: left map serves both eyes
+    std::atomic<int> projStatus{kProjOff};
+    std::shared_ptr<StmapEntry> renderStmap;
     // Stream status handoff: the pump worker composes status off-thread while
     // render threads flush it to the UI param, so both fields live behind
     // their own small mutex (taken after hub->mutex, never the reverse).
@@ -548,17 +808,36 @@ static std::string hubComposeStatusLocked(SenderHub* hub, NDIInstanceData* data)
     if (!hub->sender) {
         return "No NDI sender — name '" + hub->name + "' unavailable (in use?)";
     }
+    std::string status;
     switch (hub->pairer.mode()) {
         case ndi_stereo::StreamMode::Stereo:
-            return data->stereoPacking == 1 ? "Stereo (Top-Bottom)" : "Stereo (Side-by-Side)";
+            status = data->stereoPacking == 1 ? "Stereo (Top-Bottom)" : "Stereo (Side-by-Side)";
+            break;
         case ndi_stereo::StreamMode::LeftOnly:
-            return "Stereo degraded: right eye missing — sending left eye only";
+            status = "Stereo degraded: right eye missing — sending left eye only";
+            break;
         case ndi_stereo::StreamMode::RightOnly:
-            return "Stereo degraded: left eye missing — sending right eye only";
+            status = "Stereo degraded: left eye missing — sending right eye only";
+            break;
         case ndi_stereo::StreamMode::Mono:
         default:
-            return "Mono";
+            status = "Mono";
+            break;
     }
+    switch (data->projStatus.load(std::memory_order_relaxed)) {
+        case kProjActive:
+            status += ", Equirect (STMap)";
+            break;
+        case kProjError:
+            status += ", STMap invalid — passthrough (see log)";
+            break;
+        case kProjMismatch:
+            status += ", STMap L/R size mismatch — passthrough";
+            break;
+        default:
+            break;
+    }
+    return status;
 }
 
 // Caller holds hub->mutex. Recompose the stream status; log hub-level
@@ -1609,9 +1888,9 @@ static void flushStatusParam(NDIInstanceData* data)
     }
 }
 
-// Frame arrived in CPU memory: apply the Resolution downscale (box filter)
-// before the conversion+send path. Also repacks a padded row stride — the
-// converters assume tight rows.
+// Frame arrived in CPU memory: apply the Resolution downscale (box filter) —
+// or, in Equirect mode, the STMap warp — before the conversion+send path.
+// Also repacks a padded row stride — the converters assume tight rows.
 static void sendCPUFrameToNDI(NDIInstanceData* data, void* imageData, int width, int height, int rowBytes)
 {
     int rowFloats = rowBytes / static_cast<int>(sizeof(float));
@@ -1620,6 +1899,28 @@ static void sendCPUFrameToNDI(NDIInstanceData* data, void* imageData, int width,
     }
 
     const int divisor = data->resolutionDivisor;
+
+    // Equirect (STMap) projection (issue #7): the warp replaces the plain
+    // downscale — the map defines the destination image, so output dimensions
+    // are the MAP's, with the Resolution divisor applied on top. This is the
+    // fallback-quality path (full CPU warp); the Metal render path warps on
+    // the GPU.
+    if (const StmapEntry* stmap = data->renderStmap.get()) {
+        int outWidth = 0, outHeight = 0;
+        ndi_stream::outputDims(stmap->map.width, stmap->map.height, divisor, &outWidth, &outHeight);
+        const size_t outFloats = static_cast<size_t>(outWidth) * outHeight * 4;
+        if (data->downscaleBuffer.size() < outFloats) {
+            data->downscaleBuffer.resize(outFloats);
+        }
+        ndi_stmap::warpRGBABox(static_cast<const float*>(imageData), width, height, rowFloats,
+                               stmap->map.uv.data(), stmap->map.width, stmap->map.height,
+                               divisor, data->downscaleBuffer.data(), outWidth, outHeight);
+        NDI_LOG("CPU STMap warp: %dx%d -> %dx%d (divisor %d)",
+                width, height, outWidth, outHeight, divisor);
+        sendNDIFrame(data, data->downscaleBuffer.data(), outWidth, outHeight);
+        return;
+    }
+
     if (divisor <= 1 && rowFloats == width * 4) {
         sendNDIFrame(data, imageData, width, height);
         return;
@@ -1645,7 +1946,10 @@ static void sendCPUFrameToNDI(NDIInstanceData* data, void* imageData, int width,
 // downscale happens before any readback, so only the small converted frame
 // crosses to the CPU. Any GPU-convert gap (legacy RGBA format, GPU
 // Acceleration off, kernel failure) falls back to a full-frame readback plus
-// the CPU path, so the stream survives every combination.
+// the CPU path, so the stream survives every combination. In Equirect mode
+// (issue #7) the fused kernel is the STMap warp variant and the output takes
+// the MAP's dimensions; the readback fallback then warps on the CPU instead,
+// so the stream stays geometrically correct on every path.
 static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* dstBuffer,
                                   int width, int height, int srcRowBytes, int dstRowBytes,
                                   void* metalQueue)
@@ -1679,8 +1983,14 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
     }
 
     const int divisor = data->resolutionDivisor;
+    const StmapEntry* stmap = data->renderStmap.get();
     int outWidth = 0, outHeight = 0;
-    ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
+    if (stmap) {
+        // Equirect: the map defines the destination image.
+        ndi_stream::outputDims(stmap->map.width, stmap->map.height, divisor, &outWidth, &outHeight);
+    } else {
+        ndi_stream::outputDims(width, height, divisor, &outWidth, &outHeight);
+    }
     const int rowFloats = srcRowBytes / static_cast<int>(sizeof(float));
 
     bool handledByFastPath = false;
@@ -1715,15 +2025,30 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
         }
         ++pump->pendingSubmits;
         const auto convT0 = std::chrono::steady_clock::now();
-        const metal_submit_status st = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
-                                                                  width, height, rowFloats, divisor,
-                                                                  outWidth, outHeight, wantP216,
-                                                                  pumpOnConvertDone, ctx);
+        metal_submit_status st = METAL_SUBMIT_INVALID;
+        if (stmap) {
+            // Warp path: a failed map upload never reaches the submit — it
+            // stays INVALID and falls through to the readback + CPU warp, so
+            // the stream keeps its corrected geometry (slowly) either way.
+            void* mapBuffer = stmapMetalBufferForQueue(data->renderStmap, metalContext, metalQueue);
+            if (mapBuffer) {
+                st = metal_gpu_warp_submit(metalContext, metalQueue, srcBuffer,
+                                           width, height, rowFloats,
+                                           mapBuffer, stmap->map.width, stmap->map.height,
+                                           divisor, outWidth, outHeight, wantP216,
+                                           pumpOnConvertDone, ctx);
+            }
+        } else {
+            st = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
+                                            width, height, rowFloats, divisor,
+                                            outWidth, outHeight, wantP216,
+                                            pumpOnConvertDone, ctx);
+        }
         data->timerConvMs = msSince(convT0);
         if (st == METAL_SUBMIT_OK) {
             handledByFastPath = true;
-            NDI_LOG("GPU-native async: %dx%d Metal frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216)",
-                    width, height, outWidth, outHeight, wantP216 ? 1 : 0, divisor);
+            NDI_LOG("GPU-native async: %dx%d Metal frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216, warp %d)",
+                    width, height, outWidth, outHeight, wantP216 ? 1 : 0, divisor, stmap ? 1 : 0);
         } else {
             --pump->pendingSubmits;
             delete ctx;
@@ -1774,6 +2099,84 @@ static OfxStatus onUnLoad(void)
     return kOfxStatOK;
 }
 
+// Bring the instance's loaded STMaps in line with the current parameter
+// values (issue #7). Called from createInstance and instanceChanged, never
+// render — a multi-hundred-MB EXR load takes real time. Cache hits are a
+// stat() and a map lookup, so calling on every parameter edit is cheap and
+// doubles as the reload path when a map file is overwritten on disk.
+//
+// Warp engages only when the LEFT map is valid (the right map is optional and
+// defaults to the left) and, when both are set, their dimensions agree —
+// otherwise the two eyes would produce different frame sizes and the stereo
+// pairer could never mate them. Every failure is soft: passthrough plus a
+// Stream Status message, never a refusal to stream.
+static void refreshSTMaps(NDIInstanceData* data)
+{
+    const bool want = (data->projectionMode == 1);
+    const bool packedLayout = (data->stmapLayout == 1);
+    std::shared_ptr<StmapEntry> left, right;
+    if (want && !data->stmapLeftPathWanted.empty()) {
+        if (packedLayout) {
+            // One packed side-by-side file yields both eyes; the right-eye
+            // slot is ignored in this layout (the param hint says so).
+            stmapAcquirePackedPair(data->stmapLeftPathWanted, &left, &right);
+        } else {
+            left = stmapAcquire(data->stmapLeftPathWanted);
+        }
+    }
+    if (want && !packedLayout && !data->stmapRightPathWanted.empty()) {
+        right = stmapAcquire(data->stmapRightPathWanted);
+    }
+
+    int status = kProjOff;
+    if (want) {
+        if (!left && data->stmapLeftPathWanted.empty()) {
+            NDI_LOG("Equirect (STMap) selected but no left-eye STMap path is set — passthrough");
+            status = kProjError;
+        } else if (!left || !left->valid) {
+            status = kProjError;
+        } else if (right && !right->valid) {
+            // An explicitly-set right map that fails to load: honest
+            // passthrough beats silently warping that eye through the left map.
+            status = kProjError;
+        } else if (right && (right->map.width != left->map.width ||
+                             right->map.height != left->map.height)) {
+            NDI_LOG("STMap L/R size mismatch: left %dx%d vs right %dx%d — passthrough",
+                    left->map.width, left->map.height, right->map.width, right->map.height);
+            status = kProjMismatch;
+        } else {
+            status = kProjActive;
+        }
+    }
+
+#ifdef __APPLE__
+    // Pre-warm the GPU upload here, on the host's main thread, so the first
+    // warped render doesn't pay it. The context's default device matches the
+    // host queue's device except on multi-GPU Macs, where the render path
+    // uploads once itself (also outside the entry mutex). No GPU context yet
+    // (NDI disabled) is fine — the render path covers it.
+    if (status == kProjActive && data->gpuContext && data->gpuContext->initialized &&
+        data->gpuContext->metalContext) {
+        stmapMetalBufferForQueue(left, data->gpuContext->metalContext, nullptr);
+        if (right) {
+            stmapMetalBufferForQueue(right, data->gpuContext->metalContext, nullptr);
+        }
+    }
+#endif
+
+    std::shared_ptr<StmapEntry> oldLeft, oldRight;
+    {
+        std::lock_guard<std::mutex> lock(data->stmapMutex);
+        oldLeft = std::move(data->stmapLeft);
+        oldRight = std::move(data->stmapRight);
+        data->stmapLeft = left;
+        data->stmapRight = right;
+    }
+    // oldLeft/oldRight die here — a replaced map's hundreds of MB free
+    // outside the mutex the render path takes.
+    data->projStatus.store(status, std::memory_order_relaxed);
+}
+
 // Read every persisted parameter into the instance fields. Used at
 // createInstance — so a saved project's values (source name above all) are
 // honored BEFORE the first NDI attach, not only after the user touches a
@@ -1806,6 +2209,15 @@ static void readInstanceParams(NDIInstanceData* myData)
     myData->optimalFormat = (optimalFormat != 0);
 
     gParamHost->paramGetValue(myData->stereoPackingParam, &myData->stereoPacking);
+
+    gParamHost->paramGetValue(myData->projectionParam, &myData->projectionMode);
+    gParamHost->paramGetValue(myData->stmapLayoutParam, &myData->stmapLayout);
+    char* stmapLeftPath = nullptr;
+    gParamHost->paramGetValue(myData->stmapLeftParam, &stmapLeftPath);
+    myData->stmapLeftPathWanted = stmapLeftPath ? stmapLeftPath : "";
+    char* stmapRightPath = nullptr;
+    gParamHost->paramGetValue(myData->stmapRightParam, &stmapRightPath);
+    myData->stmapRightPathWanted = stmapRightPath ? stmapRightPath : "";
 
     int hdrEnabled;
     gParamHost->paramGetValue(myData->hdrEnabledParam, &hdrEnabled);
@@ -1904,6 +2316,10 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamDebugLogging, &myData->debugLoggingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamStereoPacking, &myData->stereoPackingParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamStereoStatus, &myData->stereoStatusParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamProjection, &myData->projectionParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapLayout, &myData->stmapLayoutParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapLeft, &myData->stmapLeftParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamColorSpace, &myData->colorSpaceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamTransferFunction, &myData->transferFunctionParam, 0);
@@ -1921,6 +2337,10 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     if (myData->enabled) {
         initializeNDI(myData);
     }
+
+    // After NDI init so the GPU context exists for the STMap pre-warm — a
+    // saved project's Equirect mode loads (and uploads) its maps now.
+    refreshSTMaps(myData);
 
     NDI_LOG_TEXT(("Instance created successfully on page '" +
                   (myData->resolvePage.empty() ? std::string("?") : myData->resolvePage) + "'").c_str());
@@ -1954,7 +2374,29 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         
         NDI_LOG("Parameter changed: %s", paramName);
 
+#ifdef __APPLE__
+        // Browse buttons: pop the native open panel and write the picked path
+        // into the matching STMap field, then fall through — the reads below
+        // pick the new value up and refreshSTMaps loads the map. Cancel (or
+        // any dialog failure) changes nothing.
+        if (strcmp(paramName, kParamSTMapLeftBrowse) == 0 ||
+            strcmp(paramName, kParamSTMapRightBrowse) == 0) {
+            const bool isLeft = (strcmp(paramName, kParamSTMapLeftBrowse) == 0);
+            OfxParamHandle pathParam = isLeft ? myData->stmapLeftParam : myData->stmapRightParam;
+            char* currentPath = nullptr;
+            gParamHost->paramGetValue(pathParam, &currentPath);
+            char picked[4096];
+            if (mac_open_file_dialog(isLeft ? "Choose the left-eye (or packed side-by-side) STMap EXR"
+                                            : "Choose the right-eye STMap EXR",
+                                     "exr", currentPath, picked, sizeof(picked))) {
+                gParamHost->paramSetValue(pathParam, picked);
+                NDI_LOG_TEXT((std::string("STMap browse picked: '") + picked + "'").c_str());
+            }
+        }
+#endif
+
         readInstanceParams(myData);
+        refreshSTMaps(myData);
 
         NDI_LOG("Updated params - sourceName='%s', enabled=%d, frameRate=%.2f, hdr=%d, colorSpace='%s', transferFunc='%s'",
                myData->sourceName.c_str(), myData->enabled, myData->frameRate, myData->hdrEnabled, 
@@ -2044,6 +2486,27 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
             (gPropHost->propGetInt(srcClipProps, kOfxImageClipPropThumbnail, 0, &thumbnailValue) == kOfxStatOK);
     }
     myData->renderIsThumbnail = (hasThumbnail && thumbnailValue != 0);
+
+    // Select this render's warp map (issue #7): only when Equirect is chosen
+    // (read fresh, like every param) and the last refresh validated the maps.
+    // Thumbnails stay passthrough — a filmstrip thumb warped to map
+    // dimensions would emit giant frames. Copying the shared_ptr under the
+    // lock keeps the entry alive for this whole render even if a parameter
+    // change swaps the maps mid-flight.
+    int projectionChoice = 0;
+    gParamHost->paramGetValue(myData->projectionParam, &projectionChoice);
+    myData->renderStmap.reset();
+    if (projectionChoice == 1 && !myData->renderIsThumbnail &&
+        myData->projStatus.load(std::memory_order_relaxed) == kProjActive) {
+        std::lock_guard<std::mutex> lock(myData->stmapMutex);
+        const std::shared_ptr<StmapEntry>& sel =
+            (myData->renderEye == ndi_stereo::kEyeRight && myData->stmapRight && myData->stmapRight->valid)
+                ? myData->stmapRight
+                : myData->stmapLeft;
+        if (sel && sel->valid) {
+            myData->renderStmap = sel;
+        }
+    }
 
     // Diagnostic render-call probe: when enabled, log exactly what the host feeds
     // this render call — before any image fetch, so calls that fail later still show.
@@ -2242,6 +2705,11 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stereoGroupProps, kOfxPropLabel, 0, "Stereo");
     gPropHost->propSetInt(stereoGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
 
+    OfxPropertySetHandle projectionGroupProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "projectionGroup", &projectionGroupProps);
+    gPropHost->propSetString(projectionGroupProps, kOfxPropLabel, 0, "Projection");
+    gPropHost->propSetInt(projectionGroupProps, kOfxParamPropGroupOpen, 0, 1); // Open by default
+
     OfxPropertySetHandle performanceGroupProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypeGroup, "performanceGroup", &performanceGroupProps);
     gPropHost->propSetString(performanceGroupProps, kOfxPropLabel, 0, "Performance Settings");
@@ -2336,6 +2804,75 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stereoStatusProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetInt(stereoStatusProps, kOfxParamPropPersistant, 0, 0); // live status, not a setting
     gPropHost->propSetString(stereoStatusProps, kOfxParamPropParent, 0, "stereoGroup");
+
+    // Define projection mode parameter - in Projection group (issue #7)
+    OfxPropertySetHandle projectionProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamProjection, &projectionProps);
+    gPropHost->propSetString(projectionProps, kOfxPropLabel, 0, kParamProjectionLabel);
+    gPropHost->propSetString(projectionProps, kOfxParamPropScriptName, 0, kParamProjection);
+    gPropHost->propSetString(projectionProps, kOfxParamPropHint, 0, kParamProjectionHint);
+    gPropHost->propSetString(projectionProps, kOfxParamPropChoiceOption, 0, "Passthrough");
+    gPropHost->propSetString(projectionProps, kOfxParamPropChoiceOption, 1, "Equirect (STMap)");
+    gPropHost->propSetInt(projectionProps, kOfxParamPropDefault, 0, 0); // Passthrough
+    gPropHost->propSetInt(projectionProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(projectionProps, kOfxParamPropParent, 0, "projectionGroup");
+
+    // Define STMap layout parameter - in Projection group
+    OfxPropertySetHandle stmapLayoutProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeChoice, kParamSTMapLayout, &stmapLayoutProps);
+    gPropHost->propSetString(stmapLayoutProps, kOfxPropLabel, 0, kParamSTMapLayoutLabel);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropScriptName, 0, kParamSTMapLayout);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropHint, 0, kParamSTMapLayoutHint);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropChoiceOption, 0, "Per-Eye Files");
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropChoiceOption, 1, "Packed Side-by-Side");
+    gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropDefault, 0, 0); // Per-Eye Files
+    gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(stmapLayoutProps, kOfxParamPropParent, 0, "projectionGroup");
+
+    // Define left-eye STMap path parameter - in Projection group
+    OfxPropertySetHandle stmapLeftProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamSTMapLeft, &stmapLeftProps);
+    gPropHost->propSetString(stmapLeftProps, kOfxPropLabel, 0, kParamSTMapLeftLabel);
+    gPropHost->propSetString(stmapLeftProps, kOfxParamPropScriptName, 0, kParamSTMapLeft);
+    gPropHost->propSetString(stmapLeftProps, kOfxParamPropHint, 0, kParamSTMapLeftHint);
+    gPropHost->propSetString(stmapLeftProps, kOfxParamPropDefault, 0, "");
+    // FilePathExists stays at its spec default (1): hosts that render a
+    // picker for filePath strings show an open-existing dialog.
+    gPropHost->propSetString(stmapLeftProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
+    gPropHost->propSetInt(stmapLeftProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(stmapLeftProps, kOfxParamPropParent, 0, "projectionGroup");
+
+#ifdef __APPLE__
+    // Define the left-eye browse button - in Projection group (native panel;
+    // Resolve draws no browse control on filePath string params)
+    OfxPropertySetHandle stmapLeftBrowseProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapLeftBrowse, &stmapLeftBrowseProps);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxPropLabel, 0, kParamSTMapLeftBrowseLabel);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapLeftBrowse);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropHint, 0, kParamSTMapLeftBrowseHint);
+    gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
+#endif
+
+    // Define right-eye STMap path parameter - in Projection group
+    OfxPropertySetHandle stmapRightProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamSTMapRight, &stmapRightProps);
+    gPropHost->propSetString(stmapRightProps, kOfxPropLabel, 0, kParamSTMapRightLabel);
+    gPropHost->propSetString(stmapRightProps, kOfxParamPropScriptName, 0, kParamSTMapRight);
+    gPropHost->propSetString(stmapRightProps, kOfxParamPropHint, 0, kParamSTMapRightHint);
+    gPropHost->propSetString(stmapRightProps, kOfxParamPropDefault, 0, "");
+    gPropHost->propSetString(stmapRightProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
+    gPropHost->propSetInt(stmapRightProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(stmapRightProps, kOfxParamPropParent, 0, "projectionGroup");
+
+#ifdef __APPLE__
+    // Define the right-eye browse button - in Projection group
+    OfxPropertySetHandle stmapRightBrowseProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapRightBrowse, &stmapRightBrowseProps);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxPropLabel, 0, kParamSTMapRightBrowseLabel);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapRightBrowse);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropHint, 0, kParamSTMapRightBrowseHint);
+    gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
+#endif
 
     // Define GPU acceleration parameter - in Performance group
     OfxPropertySetHandle gpuAccelerationProps = NULL;

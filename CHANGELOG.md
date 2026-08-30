@@ -5,6 +5,52 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-08-30
+
+### Added
+- **Browse buttons for the STMap paths** (macOS): Resolve draws no browse control on OFX filePath string params (confirmed in the first v1.8.0 session — plain text field), so the plugin now provides **Browse for Left/Right-Eye STMap…** push buttons that pop a native macOS open panel (filtered to .exr, starting in the current path's folder) and fill the field. Cancel changes nothing; pasting a path still works. The panel runs modally inside the parameter-change action — flagged for a stability check at the next Tier 1 pass.
+
+## [1.8.1] - 2026-08-30
+
+### Fixed
+- **Packed side-by-side split misclassified the Canon EOS R5C RF5.2mm STMap's left half** (found in Matt's first Tier-2 session with v1.8.0): the left eye of the warped stream showed a large black disc. The map's left-eye half samples the packed frame's right half (Canon's eye swap) — but ~1% of its texels are (0,0) *filler* padding the unused corners, and the U-convention auto-detect used absolute min/max bounds, so those zeros defeated the packed-frame classification and the half went out un-rescaled. Detection now keys on where the **mass** of the valid values sits (up to 5% spill tolerated); filler texels rescale to out-of-range and render black, which is correct for content-free regions. Verified against the real Canon map: both halves classify as packed-frame and the left eye's black coverage drops to the healthy baseline.
+
+## [1.8.0] - 2026-08-30
+
+> Tier 0 + `make test` (179 assertions; 21 new for the packed-map split) + `make test-metal` pass. Tier 1–3 pending alongside 1.7.0.
+
+### Added
+- **STMap Layout** parameter (Projection group): **Per-Eye Files** (as in 1.7.0) or **Packed Side-by-Side** — one EXR whose left half maps the left eye and right half the right eye (Canon VR-style authoring). In packed layout the single file goes in the left-eye slot and the plugin splits it into per-eye maps; the right-eye slot is ignored. Split halves are cached process-wide like whole files, and the full packed image is only held while splitting.
+- Each half's U-coordinate convention is **auto-detected** (per-eye [0,1] vs packed-frame [0,0.5]/[0.5,1]) and rescaled when needed; the decision is logged per half. Detection is per half, so maps that bake in the Canon eye swap (a destination half sampling the other source half) rescale correctly too. Eye assignment always comes from the timeline's stereo tracks — the map halves define geometry only.
+- Note: for a packed-frame source on a **mono** timeline (e.g. a dual-fisheye clip), keep **Per-Eye Files** and load the one packed map in the left slot — it warps the whole frame and streams packed SbS equirect (this worked in 1.7.0 already; now documented in the hints).
+
+### Changed
+- The STMap path params leave `FilePathExists` at its spec default, so a host that renders a picker for filePath strings shows an open-existing dialog. Whether Resolve draws a browse button is still the pending Tier-1 check; pasting a path works regardless.
+
+## [1.7.0] - 2026-08-30
+
+> Tier 0 + `make test` (158 assertions incl. the 41 new STMap-seam checks) + `make test-metal` (25 checks incl. the warp kernels) pass. Tier 1–3 (Resolve install, stream check, fisheye timeline verified in the Quest stereo-180 player against a Fusion-authored STMap) pending.
+
+### Added
+- **Projection normalization** (issue #7): new **Projection** parameter group with a **Passthrough / Equirect (STMap)** mode. In Equirect mode the plugin warps each eye on the GPU through a per-eye 32-bit float (or half) EXR STMap — the Fusion-authored maps of the VR.NDI lens pipeline — **before** stereo packing, so an Apple Immersive fisheye timeline displays geometrically correct in the existing Quest stereo-180 mode with zero receiver changes. The warped output resolution is the STMap's resolution (the map defines the destination image); the Resolution control then applies on top.
+- **STMap (Left Eye) / STMap (Right Eye)** file parameters. The left map is required for Equirect mode and serves both eyes (and mono timelines) when no right map is set. Loaded maps are shared process-wide (both stereo eye instances read the same files once) and reload when the file changes on disk.
+- Minimal, fully bounds-checked EXR reader (`src/STMap.h`): single-part scanline, float/half channels, None/RLE/ZIPS/ZIP compression. Anything else — or a missing, truncated, or hostile file — **fails soft**: the stream continues in passthrough and Stream Status says why (e.g. "STMap invalid — passthrough (see log)"). Validated against third-party EXRs (ffmpeg-encoded fixtures) as well as in-test-built ones.
+- STMap warp Metal kernels (UYVY + P216) fused with the downscale and running through the same non-blocking slot-ring submit path as v1.6.0 — the render action still only encodes. Every fallback keeps the corrected geometry: no Metal map upload → full readback + CPU warp; CPU render path → CPU warp.
+- Stream Status now appends the projection state: ", Equirect (STMap)" while warping, or the passthrough reason (invalid map, L/R map size mismatch).
+
+### Notes
+- Passthrough mode takes exactly the pre-1.7.0 code path — output is bit-identical to 1.6.1.
+- L/R maps must agree on resolution; a mismatch would give the two eyes different frame sizes (unpairable), so it falls back to passthrough with a status message instead.
+- The plugin now links zlib (`-lz`, macOS SDK) for Zip-compressed EXR chunks.
+
+## [1.6.1] - 2026-08-28
+
+*(backfilled: 1.6.0/1.6.1 shipped without changelog entries; full detail in LEARNINGS.md, issue #5)*
+
+### Fixed / Performance
+- **1.6.0 — non-blocking GPU fast path:** the render action now only encodes the fused downscale+convert kernel into a ring of CPU-visible staging slots and returns (~0 ms); Metal's completion callback wakes a per-instance pump worker that pairs, packs, and sends off the render thread. Backpressure drops frames instead of ever blocking the host (8K stereo playback had collapsed 30→5 fps on ~90 ms of per-eye render-action blocking).
+- **1.6.1 — the wait had moved, not died:** render threads were queueing on the sender-hub mutex while pump workers held it through a cold-page pairer copy plus a sync send. A lock-free `senderReady` atomic now answers the render path's only question, and the pairer recycles hold-payload buffers so the hold is a warm-page memcpy.
+
 ## [1.5.0] - 2026-08-28
 
 > Validated 2026-08-28 through the LEARNINGS.md testing loop: unit tests, Tier 0, and Tier 1–2 in Resolve (stereo timeline streams packed stereo; mono unchanged).

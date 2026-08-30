@@ -30,19 +30,23 @@ make dev
 
 Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle, all object files, and the `build/` test-binary directory.
 
+The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks) and, on macOS, AppKit + UniformTypeIdentifiers (for the STMap Browse buttons' native open panel, `src/MacFileDialog.mm`). All ship with the macOS SDK — no extra install. A future Windows build needs a zlib to match; the browse buttons are macOS-only.
+
 ### Unit tests
 
 ```bash
 make test
 ```
 
-Host-independent tests in [tests/](tests/) (render-probe log-line formatter, stream-resolution divisor/dims/box-downscale, and the stereo eye-pairer/packers — pairing decisions, reorder window, starvation fallback, SbS/TB byte layout) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
+Host-independent tests in [tests/](tests/) (render-probe log-line formatter, stream-resolution divisor/dims/box-downscale, the stereo eye-pairer/packers — pairing decisions, reorder window, starvation fallback, SbS/TB byte layout — and the STMap seam: the EXR reader against both third-party fixture files in [tests/fixtures/](tests/fixtures/) and in-test-built ones incl. hostile inputs, plus the CPU reference warp) — compiles in seconds into `build/`, needs neither Resolve nor the NDI SDK. Run it alongside `make dev` before installing.
+
+The `tests/fixtures/*.exr` files were written by ffmpeg's OpenEXR encoder (32×16 identity STMap; one file per compression, plus a half-float variant) so the EXR reader is validated against files our own test writer didn't author.
 
 ```bash
 make test-metal
 ```
 
-GPU kernel correctness tests: runs the fused downscale+convert Metal kernels (UYVY and P216) on a synthetic frame — through both the blocking calls and the non-blocking slot-ring submit path (v1.6.0) — and compares against the CPU reference. Needs a Metal device (any Mac; skips cleanly without one), but still no Resolve or NDI SDK. The kernels are compiled from source at runtime, so this is the only pre-Resolve check that catches shader errors — run it whenever `src/MetalGPUAcceleration.mm` changes.
+GPU kernel correctness tests: runs the fused downscale+convert Metal kernels (UYVY and P216) and their STMap-warp variants (v1.7.0) on a synthetic frame — through both the blocking calls and the non-blocking slot-ring submit path (v1.6.0) — and compares against the CPU references (`ndi_stream::downscaleRGBABox`, `ndi_stmap::warpRGBABox`, plus the converters). An identity STMap must reproduce the plain downscale kernels byte-for-byte. Needs a Metal device (any Mac; skips cleanly without one), but still no Resolve or NDI SDK. The kernels are compiled from source at runtime, so this is the only pre-Resolve check that catches shader errors — run it whenever `src/MetalGPUAcceleration.mm` changes.
 
 ```bash
 make bench

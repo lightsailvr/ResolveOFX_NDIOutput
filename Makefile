@@ -13,11 +13,11 @@ NDI_LIB = $(NDI_SDK_PATH)/lib/macOS/libndi_advanced.dylib
 CXX = c++
 CXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE)
 OBJCXXFLAGS = -c -fvisibility=hidden -Iopenfx/include -I$(NDI_INCLUDE) -x objective-c++
-LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation
+LDFLAGS = -bundle -fvisibility=hidden -exported_symbols_list openfx/Support/include/osxSymbols $(NDI_LIB) -framework Metal -framework MetalKit -framework Foundation -framework AppKit -framework UniformTypeIdentifiers -lz
 
 # Source files
 SOURCES = src/NDIOutputPlugin.cpp
-OBJCXX_SOURCES = src/MetalGPUAcceleration.mm
+OBJCXX_SOURCES = src/MetalGPUAcceleration.mm src/MacFileDialog.mm
 OBJECTS = $(SOURCES:.cpp=.o) $(OBJCXX_SOURCES:.mm=.o)
 
 # Bundle structure
@@ -40,12 +40,14 @@ test:
 	./build/test_stream_resolution
 	$(CXX) -Isrc tests/test_stereo_pair.cpp -o build/test_stereo_pair
 	./build/test_stereo_pair
+	$(CXX) -Isrc tests/test_stmap.cpp -o build/test_stmap -lz
+	./build/test_stmap
 
 # GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
 test-metal: src/MetalGPUAcceleration.o
 	mkdir -p build
 	$(CXX) -Isrc tests/test_metal_downscale.mm src/MetalGPUAcceleration.o \
-		-o build/test_metal_downscale -framework Metal -framework Foundation
+		-o build/test_metal_downscale -framework Metal -framework Foundation -lz
 	./build/test_metal_downscale
 
 # Pipeline timing harness at production 8K dims (needs Metal + NDI SDK, no

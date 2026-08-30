@@ -65,6 +65,37 @@ bool metal_gpu_buffer_downscale_to_p216(MetalGPUContextRef context,
                                         unsigned short* p216Out);
 
 // ---------------------------------------------------------------------------
+// STMap warp variants (issue #7): same fused structure, but each output pixel
+// gathers through an STMap instead of a fixed box grid — the map texel for a
+// full-res destination pixel gives the normalized source position to sample
+// bilinearly, and divisor 2/4 box-averages those full-res warped taps. Bit-for-
+// bit the composition ndi_stmap::warpRGBABox + the flipping converters (the
+// identity checked by make test-metal). mapMetalBuffer holds mapWidth*mapHeight
+// interleaved (u,v) float pairs, row 0 = top (STMapImage::uv verbatim), on the
+// same device as commandQueue. Output dimensions come from
+// ndi_stream::outputDims(mapWidth, mapHeight, divisor) — the map defines the
+// destination image.
+// ---------------------------------------------------------------------------
+
+bool metal_gpu_buffer_warp_to_uyvy(MetalGPUContextRef context,
+                                   void* commandQueue,
+                                   void* srcMetalBuffer,
+                                   int srcWidth, int srcHeight, int srcRowFloats,
+                                   void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                   int divisor,
+                                   int outWidth, int outHeight,
+                                   unsigned char* uyvyOut);
+
+bool metal_gpu_buffer_warp_to_p216(MetalGPUContextRef context,
+                                   void* commandQueue,
+                                   void* srcMetalBuffer,
+                                   int srcWidth, int srcHeight, int srcRowFloats,
+                                   void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                   int divisor,
+                                   int outWidth, int outHeight,
+                                   unsigned short* p216Out);
+
+// ---------------------------------------------------------------------------
 // Non-blocking fast path (issue #5, v1.6.0): same fused kernels, but the
 // render thread only ENCODES — no waitUntilCompleted. The kernel writes into
 // one of a small ring of context-owned shared-storage staging buffers
@@ -109,6 +140,20 @@ metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
                                                bool p216,
                                                metal_downscale_done_fn done, void* user);
 
+// Non-blocking STMap warp: identical contract to metal_gpu_downscale_submit
+// (same slot ring, same done callback, same BUSY/INVALID semantics), with the
+// warp kernels instead of the plain downscale. A null/undersized map buffer is
+// INVALID — the caller falls back to the CPU warp so the stream survives.
+metal_submit_status metal_gpu_warp_submit(MetalGPUContextRef context,
+                                          void* commandQueue,
+                                          void* srcMetalBuffer,
+                                          int srcWidth, int srcHeight, int srcRowFloats,
+                                          void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                          int divisor,
+                                          int outWidth, int outHeight,
+                                          bool p216,
+                                          metal_downscale_done_fn done, void* user);
+
 void metal_gpu_downscale_release(MetalGPUContextRef context, void* slot);
 
 // Device-to-device copy of byteCount bytes (the render passthrough when the
@@ -133,6 +178,14 @@ bool metal_gpu_read_buffer(MetalGPUContextRef context,
 void* metal_gpu_create_shared_buffer(MetalGPUContextRef context, const void* initialData, size_t byteCount);
 void* metal_gpu_buffer_contents(void* metalBuffer);
 void  metal_gpu_release_buffer(void* metalBuffer);
+
+// STMap upload for the render path: like metal_gpu_create_shared_buffer but on
+// commandQueue's device (which can differ from the context default on
+// multi-GPU Macs — pass the host's queue). NULL commandQueue uses the context
+// device. metal_gpu_queue_device returns the device pointer for cache keying.
+void* metal_gpu_create_shared_buffer_for_queue(MetalGPUContextRef context, void* commandQueue,
+                                               const void* initialData, size_t byteCount);
+void* metal_gpu_queue_device(MetalGPUContextRef context, void* commandQueue);
 
 // Check if Metal is available on this system
 bool metal_gpu_is_available(void);
