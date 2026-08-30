@@ -258,6 +258,13 @@ Facts the GPU fast path is built on, from `/Library/Application Support/Blackmag
 **Validated by:** the rebuilt pkg's PackageInfo shows an empty `<bundle-version/>` (vs the first build enrolling the bundle for version checking); regression case exercised for real — re-install over the untouched stale "2.0" bundle replaced it, and Resolve shows v1.13.0 (U, Matt, 2026-08-30).
 **Rule:** for plugin/bundle pkgs, always disable PackageKit's bundle version check, and after any pkg install trust `grep <bundle-id> /var/log/install.log` over the receipt — receipts get written even for skipped payloads.
 
+### 2026-08-30 — Resolve honors runtime kOfxParamPropSecret: mode-aware inspector panels work
+**Symptom:** (capability verification, not a bug) the projection group stacked every mode's map-source fields at once — per-eye + packed STMap slots and the camera-clip picker — regardless of which mode could read them. Unknown whether Resolve only reads `kOfxParamPropSecret` at describe time or honors runtime edits.
+**Root cause:** n/a — v1.14.0 UI cleanup.
+**Fix:** `updateParamVisibility()` flips `kOfxParamPropSecret` per param via `paramGetPropertySet` + `propSetInt`, called at createInstance (restores a saved project's visibility) and on every instanceChanged; describe-time secret states match the param defaults so a fresh instance is right before the first sync.
+**Validated by:** Tier 1–2 pass (Matt, 2026-08-30): fields swap live in the inspector when STMap Layout / Camera Clip Source change, with no reselect needed, and saved projects restore the correct set.
+**Rule:** Resolve repaints on runtime `kOfxParamPropSecret` edits to instance params — hide inapplicable params instead of stacking every mode's fields.
+
 ### OPEN — Windows/CUDA build failing (as of 2026-08-28)
 Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
 

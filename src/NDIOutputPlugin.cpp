@@ -106,9 +106,9 @@
 "Version: " kPluginVersionString " - GPU-Accelerated NDI Advanced"
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 13
+#define kPluginVersionMinor 14
 #define kPluginVersionPatch 0
-#define kPluginVersionString "1.13.0"
+#define kPluginVersionString "1.14.0"
 
 // Parameter names
 #define kParamSourceName "sourceName"
@@ -139,11 +139,15 @@
 // Projection Parameters (issue #7)
 #define kParamProjection "projectionMode"
 #define kParamProjectionLabel "Projection"
-#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through a per-eye STMap EXR before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player; the warped output resolution equals the STMap's resolution. Equirect (Camera Metadata) does the same warp but derives the per-eye maps from the lens calibration embedded in URSA Cine Immersive BRAW clips — by default following whichever clip is under the playhead (see Camera Clip Source), so multi-camera timelines just work; no STMap files needed. The output is a 180ºx180º equirect per eye at the Metadata Map Size. Either way the Resolution control applies on top, and a missing/invalid map source falls back to Passthrough and says so in Stream Status."
+#define kParamProjectionHint "Projection of the outgoing stream. Passthrough sends the timeline's native projection untouched. Equirect (STMap) warps each eye through the loaded STMap EXR(s) before packing, so a fisheye/lens-space timeline (e.g. Apple Immersive) displays correctly on equirect receivers such as the Quest stereo-180 player; the warped output resolution equals the STMap's resolution. Equirect (Camera Metadata) does the same warp but derives the per-eye maps from the lens calibration embedded in URSA Cine Immersive BRAW clips — by default following whichever clip is under the playhead (see Camera Clip Source), so multi-camera timelines just work; no STMap files needed. The output is a 180ºx180º equirect per eye at the Metadata Map Size. Either way the Resolution control applies on top, and a missing/invalid map source falls back to Passthrough and says so in Stream Status."
 
 #define kParamSTMapLayout "stmapLayout"
 #define kParamSTMapLayoutLabel "STMap Layout"
-#define kParamSTMapLayoutHint "How the STMap file(s) carry the eyes. Per-Eye Files: each loaded EXR applies whole to each rendered frame — also the right choice for a packed-frame source on a mono timeline (e.g. a dual-fisheye clip: one map in the left slot warps the whole packed frame). Packed Side-by-Side: the left-eye slot holds ONE EXR whose left half maps the left eye and right half the right eye (Canon VR-style authoring), for Stereo 3D timelines; each half's U convention (per-eye vs packed-frame coordinates) is auto-detected and logged, and the right-eye slot is ignored. Eye assignment always comes from the timeline's stereo tracks — the map halves define geometry only."
+#define kParamSTMapLayoutHint "How the STMap file(s) carry the eyes. Packed Side-by-Side (default): the STMap field holds ONE EXR whose left half maps the left eye and right half the right eye (Canon VR-style authoring), for Stereo 3D timelines; each half's U convention (per-eye vs packed-frame coordinates) is auto-detected and logged. Per-Eye Files: separate left/right fields appear and each loaded EXR applies whole to each rendered frame — also the right choice for a packed-frame source on a mono timeline (e.g. a dual-fisheye clip: one map in the left slot warps the whole packed frame). Eye assignment always comes from the timeline's stereo tracks — the map halves define geometry only."
+
+#define kParamSTMapPacked "stmapPacked"
+#define kParamSTMapPackedLabel "STMap"
+#define kParamSTMapPackedHint "Packed side-by-side STMap: ONE 32-bit float (or half) EXR whose left half maps the left eye and right half the right eye. R = normalized source U, G = normalized source V, bottom-left origin (Fusion/Nuke convention). Scanline EXR with None/RLE/Zip compression. Required for Equirect (STMap) mode in this layout."
 
 #define kParamSTMapLeft "stmapLeft"
 #define kParamSTMapLeftLabel "STMap (Left Eye)"
@@ -156,9 +160,12 @@
 // Native browse buttons: Resolve renders filePath string params as plain
 // text fields with no browse control (verified 2026-08-30), so the plugin
 // pops its own NSOpenPanel from push-button params (macOS only).
+#define kParamSTMapPackedBrowse "stmapPackedBrowse"
+#define kParamSTMapPackedBrowseLabel "Browse for STMap..."
+#define kParamSTMapPackedBrowseHint "Pick the packed side-by-side STMap EXR with a file dialog and fill the path field above."
 #define kParamSTMapLeftBrowse "stmapLeftBrowse"
 #define kParamSTMapLeftBrowseLabel "Browse for Left-Eye STMap..."
-#define kParamSTMapLeftBrowseHint "Pick the left-eye (or packed side-by-side) STMap EXR with a file dialog and fill the path field above."
+#define kParamSTMapLeftBrowseHint "Pick the left-eye STMap EXR with a file dialog and fill the path field above."
 #define kParamSTMapRightBrowse "stmapRightBrowse"
 #define kParamSTMapRightBrowseLabel "Browse for Right-Eye STMap..."
 #define kParamSTMapRightBrowseHint "Pick the right-eye STMap EXR with a file dialog and fill the path field above."
@@ -594,10 +601,19 @@ struct NDIInstanceData {
     OfxParamHandle stereoStatusParam;
     OfxParamHandle projectionParam;
     OfxParamHandle stmapLayoutParam;
+    OfxParamHandle stmapPackedParam;
     OfxParamHandle stmapLeftParam;
     OfxParamHandle stmapRightParam;
     OfxParamHandle brawSourceParam;
     OfxParamHandle brawClipParam;
+#ifdef __APPLE__
+    // Browse buttons (Apple-only, like their definitions) — cached so
+    // updateParamVisibility can flip their secret state with the path fields.
+    OfxParamHandle stmapPackedBrowseParam;
+    OfxParamHandle stmapLeftBrowseParam;
+    OfxParamHandle stmapRightBrowseParam;
+    OfxParamHandle brawClipBrowseParam;
+#endif
     OfxParamHandle brawMapSizeParam;
     OfxParamHandle brawMaskParam;
     OfxParamHandle hdrEnabledParam;
@@ -645,8 +661,9 @@ struct NDIInstanceData {
     // render is reading. renderStmap is this render's selected map (null =
     // passthrough), stashed like renderEye.
     int projectionMode = 0;             // 0 = Passthrough, 1 = Equirect (STMap), 2 = Equirect (Camera Metadata)
-    int stmapLayout = 0;                // 0 = Per-Eye Files, 1 = Packed Side-by-Side
-    std::string stmapLeftPathWanted;    // parameter values as last read
+    int stmapLayout = 1;                // 0 = Per-Eye Files, 1 = Packed Side-by-Side (default)
+    std::string stmapPackedPathWanted;  // parameter values as last read
+    std::string stmapLeftPathWanted;
     std::string stmapRightPathWanted;
     std::string brawClipPathWanted;     // Camera Metadata mode's .braw (issue #11)
     int brawSourceChoice = 0;           // 0 = Timeline (Auto), 1 = Manual Path
@@ -2418,15 +2435,21 @@ static void refreshSTMaps(NDIInstanceData* data)
     const bool wantMetadata = (data->projectionMode == 2);
     const bool packedLayout = (data->stmapLayout == 1);
     const bool autoSource = (data->brawSourceChoice == 0);
+    // Packed layout reads the single STMap field; projects saved before that
+    // field existed carried the packed file in the left-eye slot, so an empty
+    // packed field falls back there.
+    const std::string& packedPath = !data->stmapPackedPathWanted.empty()
+        ? data->stmapPackedPathWanted : data->stmapLeftPathWanted;
+    const std::string& stmapPathWanted = packedLayout ? packedPath : data->stmapLeftPathWanted;
     std::shared_ptr<StmapEntry> left, right;
     std::string metadataClipPath;
-    if (wantStmap && !data->stmapLeftPathWanted.empty()) {
+    if (wantStmap && !stmapPathWanted.empty()) {
         if (packedLayout) {
-            // One packed side-by-side file yields both eyes; the right-eye
-            // slot is ignored in this layout (the param hint says so).
-            stmapAcquirePackedPair(data->stmapLeftPathWanted, &left, &right);
+            // One packed side-by-side file yields both eyes; the per-eye
+            // slots are ignored in this layout.
+            stmapAcquirePackedPair(stmapPathWanted, &left, &right);
         } else {
-            left = stmapAcquire(data->stmapLeftPathWanted);
+            left = stmapAcquire(stmapPathWanted);
         }
     }
     if (wantStmap && !packedLayout && !data->stmapRightPathWanted.empty()) {
@@ -2452,8 +2475,8 @@ static void refreshSTMaps(NDIInstanceData* data)
     int status = kProjOff;
     bool stickyKeep = false;  // auto mode: hold the last camera's maps through gaps
     if (wantStmap) {
-        if (!left && data->stmapLeftPathWanted.empty()) {
-            NDI_LOG("Equirect (STMap) selected but no left-eye STMap path is set — passthrough");
+        if (!left && stmapPathWanted.empty()) {
+            NDI_LOG("Equirect (STMap) selected but no STMap path is set — passthrough");
             status = kProjError;
         } else if (!left || !left->valid) {
             status = kProjError;
@@ -2536,6 +2559,35 @@ static void refreshSTMaps(NDIInstanceData* data)
     data->projStatus.store(status, std::memory_order_relaxed);
 }
 
+static void setParamSecret(OfxParamHandle param, bool secret)
+{
+    if (!param) return;
+    OfxPropertySetHandle props = NULL;
+    gParamHost->paramGetPropertySet(param, &props);
+    if (props) gPropHost->propSetInt(props, kOfxParamPropSecret, 0, secret ? 1 : 0);
+}
+
+// Show only the map-source fields the current mode actually reads: packed
+// layout swaps the single STMap field in for the per-eye pair, and Timeline
+// (Auto) hides the manual camera-clip picker. Called from createInstance (a
+// saved project's choices restore their visibility) and instanceChanged.
+// Resolve honors kOfxParamPropSecret edits on instance params.
+static void updateParamVisibility(NDIInstanceData* data)
+{
+    const bool packed = (data->stmapLayout == 1);
+    setParamSecret(data->stmapPackedParam, !packed);
+    setParamSecret(data->stmapLeftParam, packed);
+    setParamSecret(data->stmapRightParam, packed);
+    const bool autoClip = (data->brawSourceChoice == 0);
+    setParamSecret(data->brawClipParam, autoClip);
+#ifdef __APPLE__
+    setParamSecret(data->stmapPackedBrowseParam, !packed);
+    setParamSecret(data->stmapLeftBrowseParam, packed);
+    setParamSecret(data->stmapRightBrowseParam, packed);
+    setParamSecret(data->brawClipBrowseParam, autoClip);
+#endif
+}
+
 // Read every persisted parameter into the instance fields. Used at
 // createInstance — so a saved project's values (source name above all) are
 // honored BEFORE the first NDI attach, not only after the user touches a
@@ -2571,6 +2623,9 @@ static void readInstanceParams(NDIInstanceData* myData)
 
     gParamHost->paramGetValue(myData->projectionParam, &myData->projectionMode);
     gParamHost->paramGetValue(myData->stmapLayoutParam, &myData->stmapLayout);
+    char* stmapPackedPath = nullptr;
+    gParamHost->paramGetValue(myData->stmapPackedParam, &stmapPackedPath);
+    myData->stmapPackedPathWanted = stmapPackedPath ? stmapPackedPath : "";
     char* stmapLeftPath = nullptr;
     gParamHost->paramGetValue(myData->stmapLeftParam, &stmapLeftPath);
     myData->stmapLeftPathWanted = stmapLeftPath ? stmapLeftPath : "";
@@ -2632,8 +2687,8 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     myData->ndiInitialized = false;
     myData->sourceName = "DaVinci Resolve NDI Output";
     myData->enabled = true;
-    myData->frameRate = 25.0;
-    myData->resolutionDivisor = 1;
+    myData->frameRate = 30.0;
+    myData->resolutionDivisor = 2;  // Half, mirroring the param default; render reads the param fresh
 
     // Stereo pairing context (issue #6)
     myData->renderEye = ndi_stereo::kEyeLeft;
@@ -2690,10 +2745,17 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamStereoStatus, &myData->stereoStatusParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamProjection, &myData->projectionParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLayout, &myData->stmapLayoutParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapPacked, &myData->stmapPackedParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLeft, &myData->stmapLeftParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWSource, &myData->brawSourceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWClip, &myData->brawClipParam, 0);
+#ifdef __APPLE__
+    gParamHost->paramGetHandle(paramSet, kParamSTMapPackedBrowse, &myData->stmapPackedBrowseParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapLeftBrowse, &myData->stmapLeftBrowseParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamSTMapRightBrowse, &myData->stmapRightBrowseParam, 0);
+    gParamHost->paramGetHandle(paramSet, kParamBRAWClipBrowse, &myData->brawClipBrowseParam, 0);
+#endif
     gParamHost->paramGetHandle(paramSet, kParamBRAWMapSize, &myData->brawMapSizeParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWMask, &myData->brawMaskParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamHDREnabled, &myData->hdrEnabledParam, 0);
@@ -2708,6 +2770,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     // Honor the project's saved parameter values (source name above all)
     // before the first NDI attach.
     readInstanceParams(myData);
+    updateParamVisibility(myData);
 
     // Auto camera-clip mode: visible to the playhead watcher from here on
     // (the walk holds the registry mutex, so destroyInstance can't race it).
@@ -2760,15 +2823,19 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         // into the matching STMap field, then fall through — the reads below
         // pick the new value up and refreshSTMaps loads the map. Cancel (or
         // any dialog failure) changes nothing.
-        if (strcmp(paramName, kParamSTMapLeftBrowse) == 0 ||
+        if (strcmp(paramName, kParamSTMapPackedBrowse) == 0 ||
+            strcmp(paramName, kParamSTMapLeftBrowse) == 0 ||
             strcmp(paramName, kParamSTMapRightBrowse) == 0) {
+            const bool isPacked = (strcmp(paramName, kParamSTMapPackedBrowse) == 0);
             const bool isLeft = (strcmp(paramName, kParamSTMapLeftBrowse) == 0);
-            OfxParamHandle pathParam = isLeft ? myData->stmapLeftParam : myData->stmapRightParam;
+            OfxParamHandle pathParam = isPacked ? myData->stmapPackedParam
+                                     : isLeft  ? myData->stmapLeftParam : myData->stmapRightParam;
             char* currentPath = nullptr;
             gParamHost->paramGetValue(pathParam, &currentPath);
             char picked[4096];
-            if (mac_open_file_dialog(isLeft ? "Choose the left-eye (or packed side-by-side) STMap EXR"
-                                            : "Choose the right-eye STMap EXR",
+            if (mac_open_file_dialog(isPacked ? "Choose the packed side-by-side STMap EXR"
+                                    : isLeft  ? "Choose the left-eye STMap EXR"
+                                              : "Choose the right-eye STMap EXR",
                                      "exr", currentPath, picked, sizeof(picked))) {
                 gParamHost->paramSetValue(pathParam, picked);
                 NDI_LOG_TEXT((std::string("STMap browse picked: '") + picked + "'").c_str());
@@ -2787,6 +2854,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
 #endif
 
         readInstanceParams(myData);
+        updateParamVisibility(myData);
         refreshSTMaps(myData);
 
         NDI_LOG("Updated params - sourceName='%s', enabled=%d, frameRate=%.2f, hdr=%d, colorSpace='%s', transferFunc='%s'",
@@ -3152,7 +3220,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(frameRateProps, kOfxPropLabel, 0, kParamFrameRateLabel);
     gPropHost->propSetString(frameRateProps, kOfxParamPropScriptName, 0, kParamFrameRate);
     gPropHost->propSetString(frameRateProps, kOfxParamPropHint, 0, kParamFrameRateHint);
-    gPropHost->propSetDouble(frameRateProps, kOfxParamPropDefault, 0, 25.0);
+    gPropHost->propSetDouble(frameRateProps, kOfxParamPropDefault, 0, 30.0);
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropMin, 0, 1.0);
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropMax, 0, 120.0);
     gPropHost->propSetDouble(frameRateProps, kOfxParamPropDisplayMin, 0, 23.976);
@@ -3169,7 +3237,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 0, "Full");
     gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 1, "Half");
     gPropHost->propSetString(resolutionProps, kOfxParamPropChoiceOption, 2, "Quarter");
-    gPropHost->propSetInt(resolutionProps, kOfxParamPropDefault, 0, 0); // Full
+    gPropHost->propSetInt(resolutionProps, kOfxParamPropDefault, 0, 1); // Half
     gPropHost->propSetInt(resolutionProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(resolutionProps, kOfxParamPropParent, 0, "basicGroup");
 
@@ -3217,9 +3285,38 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapLayoutProps, kOfxParamPropHint, 0, kParamSTMapLayoutHint);
     gPropHost->propSetString(stmapLayoutProps, kOfxParamPropChoiceOption, 0, "Per-Eye Files");
     gPropHost->propSetString(stmapLayoutProps, kOfxParamPropChoiceOption, 1, "Packed Side-by-Side");
-    gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropDefault, 0, 0); // Per-Eye Files
+    gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropDefault, 0, 1); // Packed Side-by-Side
     gPropHost->propSetInt(stmapLayoutProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapLayoutProps, kOfxParamPropParent, 0, "projectionGroup");
+
+    // The STMap path fields swap with the layout choice (updateParamVisibility):
+    // packed shows the single field below, per-eye shows the left/right pair.
+    // Describe-time secret states match the Packed Side-by-Side default;
+    // createInstance re-syncs them to a saved project's choice.
+
+    // Define packed side-by-side STMap path parameter - in Projection group
+    OfxPropertySetHandle stmapPackedProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypeString, kParamSTMapPacked, &stmapPackedProps);
+    gPropHost->propSetString(stmapPackedProps, kOfxPropLabel, 0, kParamSTMapPackedLabel);
+    gPropHost->propSetString(stmapPackedProps, kOfxParamPropScriptName, 0, kParamSTMapPacked);
+    gPropHost->propSetString(stmapPackedProps, kOfxParamPropHint, 0, kParamSTMapPackedHint);
+    gPropHost->propSetString(stmapPackedProps, kOfxParamPropDefault, 0, "");
+    // FilePathExists stays at its spec default (1): hosts that render a
+    // picker for filePath strings show an open-existing dialog.
+    gPropHost->propSetString(stmapPackedProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
+    gPropHost->propSetInt(stmapPackedProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetString(stmapPackedProps, kOfxParamPropParent, 0, "projectionGroup");
+
+#ifdef __APPLE__
+    // Define the packed STMap browse button - in Projection group (native
+    // panel; Resolve draws no browse control on filePath string params)
+    OfxPropertySetHandle stmapPackedBrowseProps = NULL;
+    gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapPackedBrowse, &stmapPackedBrowseProps);
+    gPropHost->propSetString(stmapPackedBrowseProps, kOfxPropLabel, 0, kParamSTMapPackedBrowseLabel);
+    gPropHost->propSetString(stmapPackedBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapPackedBrowse);
+    gPropHost->propSetString(stmapPackedBrowseProps, kOfxParamPropHint, 0, kParamSTMapPackedBrowseHint);
+    gPropHost->propSetString(stmapPackedBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
+#endif
 
     // Define left-eye STMap path parameter - in Projection group
     OfxPropertySetHandle stmapLeftProps = NULL;
@@ -3228,20 +3325,19 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropScriptName, 0, kParamSTMapLeft);
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropHint, 0, kParamSTMapLeftHint);
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropDefault, 0, "");
-    // FilePathExists stays at its spec default (1): hosts that render a
-    // picker for filePath strings show an open-existing dialog.
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
     gPropHost->propSetInt(stmapLeftProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetInt(stmapLeftProps, kOfxParamPropSecret, 0, 1); // hidden in packed layout (the default)
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropParent, 0, "projectionGroup");
 
 #ifdef __APPLE__
-    // Define the left-eye browse button - in Projection group (native panel;
-    // Resolve draws no browse control on filePath string params)
+    // Define the left-eye browse button - in Projection group
     OfxPropertySetHandle stmapLeftBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapLeftBrowse, &stmapLeftBrowseProps);
     gPropHost->propSetString(stmapLeftBrowseProps, kOfxPropLabel, 0, kParamSTMapLeftBrowseLabel);
     gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapLeftBrowse);
     gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropHint, 0, kParamSTMapLeftBrowseHint);
+    gPropHost->propSetInt(stmapLeftBrowseProps, kOfxParamPropSecret, 0, 1);
     gPropHost->propSetString(stmapLeftBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
 #endif
 
@@ -3254,6 +3350,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapRightProps, kOfxParamPropDefault, 0, "");
     gPropHost->propSetString(stmapRightProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
     gPropHost->propSetInt(stmapRightProps, kOfxParamPropAnimates, 0, 0);
+    gPropHost->propSetInt(stmapRightProps, kOfxParamPropSecret, 0, 1); // hidden in packed layout (the default)
     gPropHost->propSetString(stmapRightProps, kOfxParamPropParent, 0, "projectionGroup");
 
 #ifdef __APPLE__
@@ -3263,6 +3360,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(stmapRightBrowseProps, kOfxPropLabel, 0, kParamSTMapRightBrowseLabel);
     gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropScriptName, 0, kParamSTMapRightBrowse);
     gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropHint, 0, kParamSTMapRightBrowseHint);
+    gPropHost->propSetInt(stmapRightBrowseProps, kOfxParamPropSecret, 0, 1);
     gPropHost->propSetString(stmapRightBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
 #endif
 
@@ -3291,6 +3389,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(brawClipProps, kOfxParamPropDefault, 0, "");
     gPropHost->propSetString(brawClipProps, kOfxParamPropStringMode, 0, kOfxParamStringIsFilePath);
     gPropHost->propSetInt(brawClipProps, kOfxParamPropAnimates, 0, 0);
+    // Hidden while Camera Clip Source sits at Timeline (Auto), the default —
+    // updateParamVisibility shows it when Manual Path is chosen.
+    gPropHost->propSetInt(brawClipProps, kOfxParamPropSecret, 0, 1);
     gPropHost->propSetString(brawClipProps, kOfxParamPropParent, 0, "projectionGroup");
 
 #ifdef __APPLE__
@@ -3300,6 +3401,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetString(brawClipBrowseProps, kOfxPropLabel, 0, kParamBRAWClipBrowseLabel);
     gPropHost->propSetString(brawClipBrowseProps, kOfxParamPropScriptName, 0, kParamBRAWClipBrowse);
     gPropHost->propSetString(brawClipBrowseProps, kOfxParamPropHint, 0, kParamBRAWClipBrowseHint);
+    gPropHost->propSetInt(brawClipBrowseProps, kOfxParamPropSecret, 0, 1); // hidden in Timeline (Auto), the default
     gPropHost->propSetString(brawClipBrowseProps, kOfxParamPropParent, 0, "projectionGroup");
 #endif
 

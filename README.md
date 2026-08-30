@@ -43,7 +43,8 @@ sudo make install   # install to /Library/OFX/Plugins
 2. **Configure Parameters**:
    - **NDI Source Name**: Set the name that will appear on the network (default: "DaVinci Resolve NDI Output")
    - **Enable NDI Output**: Toggle to start/stop streaming (default: enabled)
-   - **Frame Rate**: Set the output frame rate (default: 25 fps)
+   - **Frame Rate**: Set the output frame rate (default: 30 fps)
+   - **Resolution**: Stream at Full, Half, or Quarter of the incoming frame size (default: Half)
 
 3. **HDR Configuration** (when working with HDR content):
    - **Enable HDR**: Toggle HDR mode for high dynamic range content
