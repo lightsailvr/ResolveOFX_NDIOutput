@@ -218,55 +218,219 @@ int main()
         expectInt(static_cast<long long>(pairer.pendingCount()), 2, "timeout: young frames survive");
     }
 
-    // --- Single-eye starvation: when the partner eye stops rendering (e.g.
-    // Vision switched back to Mono), the stream degrades to labeled mono
-    // instead of freezing — and recovers to stereo when the partner returns. ---
+    // --- Degrade hysteresis (issue #12): a partner stall at the OLD 1.5 s
+    // starvation timeout must no longer flip the stream — brief stalls
+    // (heavy 8K loads, UI interactions) ride through in Stereo mode, and
+    // nothing single-eye-sized is ever sent once the canvas is stereo. ---
     {
         EyePairer pairer;
         // Healthy pairing at 40 ms cadence.
         submit(pairer, kEyeRight, 900.0, kEyeMeta, payload(1), 0);
         submit(pairer, kEyeLeft, 900.0, kEyeMeta, payload(2), 30);
-        expectTrue(pairer.mode() == StreamMode::Stereo, "starve: healthy stereo");
+        expectTrue(pairer.mode() == StreamMode::Stereo, "hyst: healthy stereo");
 
-        // R stops. L keeps arriving: holds at first (inside the grace window)…
+        // R stops. L keeps arriving with advancing times: still Stereo at the
+        // old 1.5 s mark — and critically, never SendMono (canvas stability).
         SubmitResult r = submit(pairer, kEyeLeft, 901.0, kEyeMeta, payload(3), 70);
-        expectTrue(r.action == SubmitAction::Hold, "starve: L holds inside the window");
+        expectTrue(r.action == SubmitAction::Hold, "hyst: L holds inside the window");
+        r = submit(pairer, kEyeLeft, 902.0, kEyeMeta, payload(4), 30 + 1501);
+        expectTrue(r.action != SubmitAction::SendMono, "hyst: no mono at the old 1.5s timeout");
+        expectTrue(pairer.mode() == StreamMode::Stereo, "hyst: still Stereo at 1.5s silence");
+        r = submit(pairer, kEyeLeft, 903.0, kEyeMeta, payload(5), 30 + 3000);
+        expectTrue(r.action != SubmitAction::SendMono, "hyst: no mono at 3s silence");
+        expectTrue(pairer.mode() == StreamMode::Stereo, "hyst: still Stereo at 3s silence");
 
-        // …but once R has been silent past the starvation window, the stream
-        // falls back to mono from the still-arriving eye. No deadlock.
-        r = submit(pairer, kEyeLeft, 902.0, kEyeMeta, payload(4),
-                   30 + kStarvationTimeoutMs + 1);
-        expectTrue(r.action == SubmitAction::SendMono, "starve: L streams mono after window");
-        expectTrue(pairer.mode() == StreamMode::LeftOnly, "starve: mode labels left-only");
+        // Sustained silence past the degrade window (with the flowing eye
+        // advancing through distinct times): degrade — but on the LOCKED
+        // canvas, duplicating the flowing eye into both halves. Dimensions
+        // never change; SendMono never happens again on this stream.
+        r = submit(pairer, kEyeLeft, 904.0, kEyeMeta, payload(6),
+                   30 + kDegradeSilenceMs + 1);
+        expectTrue(r.action == SubmitAction::SendDuplicate, "hyst: degrade duplicates the flowing eye");
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "hyst: mode labels left-only");
         expectInt(static_cast<long long>(pairer.pendingCount()), 0,
-                  "starve: fallback clears pending");
+                  "hyst: degrade clears pending");
 
-        // Subsequent L frames keep streaming mono.
-        r = submit(pairer, kEyeLeft, 903.0, kEyeMeta, payload(5),
-                   30 + kStarvationTimeoutMs + 40);
-        expectTrue(r.action == SubmitAction::SendMono, "starve: mono keeps flowing");
-
-        // R returns: stereo re-latches immediately and pairing resumes.
-        uint64_t resumeMs = 30 + kStarvationTimeoutMs + 80;
-        r = submit(pairer, kEyeRight, 904.0, kEyeMeta, payload(6), resumeMs);
-        expectTrue(r.action == SubmitAction::Hold, "starve: returning R holds");
-        expectTrue(pairer.mode() == StreamMode::Stereo, "starve: stereo re-latches");
-        r = submit(pairer, kEyeLeft, 904.0, kEyeMeta, payload(7), resumeMs + 30);
-        expectTrue(r.action == SubmitAction::SendPair, "starve: pairing resumes");
+        // Subsequent flowing-eye frames keep duplicating on the same canvas.
+        r = submit(pairer, kEyeLeft, 905.0, kEyeMeta, payload(7),
+                   30 + kDegradeSilenceMs + 40);
+        expectTrue(r.action == SubmitAction::SendDuplicate, "hyst: degraded keeps duplicating");
     }
 
-    // --- Starvation with only the right eye ever arriving (left instance
-    // gone): the grace window measures from stereo activation, then falls
-    // back to labeled right-only mono. ---
+    // --- Parked timeline (the issue #12 flap): phantom re-renders repeat ONE
+    // frame time while the partner sits silent. That is not starvation — the
+    // content is static and the last sent pair is already correct — so the
+    // stream must never degrade, no matter how long the silence runs. Degrade
+    // requires the flowing eye to advance through distinct frame times. ---
+    {
+        EyePairer pairer;
+        submit(pairer, kEyeRight, 900.0, kEyeMeta, payload(1), 0);
+        submit(pairer, kEyeLeft, 900.0, kEyeMeta, payload(2), 30);
+        expectTrue(pairer.mode() == StreamMode::Stereo, "parked: healthy stereo");
+
+        // Only-L phantoms of the same time, sporadically, for 20 s.
+        bool everDegraded = false;
+        for (int i = 1; i <= 10; ++i) {
+            SubmitResult r = submit(pairer, kEyeLeft, 900.0, kEyeMeta, payload(3),
+                                    30 + static_cast<uint64_t>(i) * 2000);
+            everDegraded = everDegraded || (r.action == SubmitAction::SendDuplicate) ||
+                           (r.action == SubmitAction::SendMono);
+        }
+        expectTrue(!everDegraded, "parked: same-time phantoms never degrade");
+        expectTrue(pairer.mode() == StreamMode::Stereo, "parked: mode pinned Stereo");
+
+        // A phantom R completes the still-held phantom L (same content
+        // re-sent — correct while parked).
+        SubmitResult r = submit(pairer, kEyeRight, 900.0, kEyeMeta, payload(4), 21000);
+        expectTrue(r.action == SubmitAction::SendPair, "parked: phantom R pairs with held phantom L");
+
+        // Once the flowing eye ADVANCES (play with the partner dead), the
+        // degrade window runs from the resume of active sending — and then
+        // the stream does degrade: the user needs to see new frames.
+        r = submit(pairer, kEyeLeft, 901.0, kEyeMeta, payload(6), 25500);
+        expectTrue(r.action != SubmitAction::SendDuplicate, "parked: first advance alone insufficient");
+        r = submit(pairer, kEyeLeft, 902.0, kEyeMeta, payload(7), 27000);
+        expectTrue(r.action != SubmitAction::SendDuplicate, "parked: window measures from resume");
+        r = submit(pairer, kEyeLeft, 903.0, kEyeMeta, payload(8),
+                   25500 + kDegradeSilenceMs + 1);
+        expectTrue(r.action == SubmitAction::SendDuplicate, "parked: advancing eye degrades after window");
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "parked: degrade labels left-only");
+    }
+
+    // --- Degrade with only the right eye ever arriving (left instance gone):
+    // silence measures from stereo activation; past the window the stream
+    // degrades to right-eye duplication on the locked canvas. ---
     {
         EyePairer pairer;
         submit(pairer, kEyeRight, 1000.0, kEyeMeta, payload(1), 0); // latch, hold
         SubmitResult r = submit(pairer, kEyeRight, 1001.0, kEyeMeta, payload(2), 40);
         expectTrue(r.action == SubmitAction::Hold, "r-only: holds inside grace window");
 
-        r = submit(pairer, kEyeRight, 1002.0, kEyeMeta, payload(3), kStarvationTimeoutMs + 1);
-        expectTrue(r.action == SubmitAction::SendMono, "r-only: falls back to mono");
+        r = submit(pairer, kEyeRight, 1002.0, kEyeMeta, payload(3), kDegradeSilenceMs + 1);
+        expectTrue(r.action == SubmitAction::SendDuplicate, "r-only: degrades to duplication");
         expectTrue(pairer.mode() == StreamMode::RightOnly, "r-only: mode labels right-only");
+    }
+
+    // --- Mutual stall (UI interaction, page switch): both eyes pause, then
+    // resume together. The frames right after the shared pause must not
+    // degrade off the stale partner silence accumulated during it — the
+    // silence clock restarts when the submitting eye itself resumes. ---
+    {
+        EyePairer pairer;
+        submit(pairer, kEyeRight, 100.0, kEyeMeta, payload(1), 0);
+        submit(pairer, kEyeLeft, 100.0, kEyeMeta, payload(2), 30);
+        submit(pairer, kEyeRight, 101.0, kEyeMeta, payload(3), 70);
+        submit(pairer, kEyeLeft, 101.0, kEyeMeta, payload(4), 100);
+        expectTrue(pairer.mode() == StreamMode::Stereo, "mutual: healthy stereo");
+
+        // Everything pauses 20 s; L resumes a few frames ahead of R.
+        SubmitResult r = submit(pairer, kEyeLeft, 200.0, kEyeMeta, payload(5), 20000);
+        expectTrue(r.action != SubmitAction::SendDuplicate, "mutual: first frame back no degrade");
+        r = submit(pairer, kEyeLeft, 201.0, kEyeMeta, payload(6), 20040);
+        expectTrue(r.action != SubmitAction::SendDuplicate, "mutual: second frame back no degrade");
+        expectTrue(pairer.mode() == StreamMode::Stereo, "mutual: still stereo through resume");
+        r = submit(pairer, kEyeRight, 200.0, kEyeMeta, payload(7), 20060);
+        expectTrue(r.action == SubmitAction::SendPair, "mutual: pairing resumes seamlessly");
+
+        // A partner that stays dead after this eye's own resume still
+        // degrades — the window just measures from the resume point.
+        submit(pairer, kEyeLeft, 202.0, kEyeMeta, payload(8), 20100);
+        submit(pairer, kEyeLeft, 203.0, kEyeMeta, payload(9), 22000);
+        r = submit(pairer, kEyeLeft, 204.0, kEyeMeta, payload(10),
+                   20060 + kDegradeSilenceMs + 100);
+        expectTrue(r.action == SubmitAction::SendDuplicate, "mutual: dead partner after resume degrades");
+    }
+
+    // --- Recovery hysteresis: from degraded, one returning-eye frame (a
+    // parked phantom) must NOT re-latch stereo — that is the other half of
+    // the issue #12 flap. Re-latch needs a sustained run of distinct-time,
+    // meta-matching frames from the missing eye. ---
+    {
+        EyePairer pairer;
+        // Reach degraded LeftOnly: pair, then R dies while L advances.
+        submit(pairer, kEyeRight, 100.0, kEyeMeta, payload(1), 0);
+        submit(pairer, kEyeLeft, 100.0, kEyeMeta, payload(2), 30);
+        submit(pairer, kEyeLeft, 101.0, kEyeMeta, payload(3), 1000);
+        submit(pairer, kEyeLeft, 102.0, kEyeMeta, payload(4), 4100);
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "recover: degraded left-only");
+
+        // A single phantom R does not re-latch — it just holds (the flowing
+        // eye owns the keepalive; a returning frame must never RepeatLast).
+        SubmitResult r = submit(pairer, kEyeRight, 103.0, kEyeMeta, payload(5), 4200);
+        expectTrue(r.action == SubmitAction::Hold, "recover: returning frame holds while unrecovered");
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "recover: one R frame insufficient");
+        // …and the flowing eye keeps the stream alive meanwhile (no freeze).
+        r = submit(pairer, kEyeLeft, 104.0, kEyeMeta, payload(6), 4240);
+        expectTrue(r.action == SubmitAction::SendDuplicate, "recover: L keeps flowing while unrecovered");
+
+        // Sustained distinct-time R cadence re-latches on the 3rd frame.
+        submit(pairer, kEyeRight, 105.0, kEyeMeta, payload(7), 4280);
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "recover: two R frames insufficient");
+        submit(pairer, kEyeRight, 106.0, kEyeMeta, payload(8), 4320);
+        expectTrue(pairer.mode() == StreamMode::Stereo, "recover: sustained R cadence re-latches");
+
+        // Pairing then resumes normally.
+        r = submit(pairer, kEyeLeft, 106.0, kEyeMeta, payload(9), 4360);
+        expectTrue(r.action == SubmitAction::SendPair, "recover: pairing resumes");
+    }
+
+    // --- Stall keepalive: during a partner stall past kRepeatAfterMs (but
+    // before degrade), a held frame also asks for a re-send of the last
+    // packed frame, so receivers keep getting frames on the locked canvas
+    // through the long hysteresis window. ---
+    {
+        EyePairer pairer;
+        submit(pairer, kEyeRight, 100.0, kEyeMeta, payload(1), 0);
+        // Nothing packed yet: a stall here has nothing to repeat — plain hold.
+        SubmitResult r = submit(pairer, kEyeRight, 101.0, kEyeMeta, payload(2),
+                                kRepeatAfterMs + 100);
+        expectTrue(r.action == SubmitAction::Hold, "repeat: nothing packed yet, plain hold");
+
+        submit(pairer, kEyeLeft, 100.0, kEyeMeta, payload(3), 900); // first pair
+        // R stalls; a hold inside the repeat threshold stays a plain hold
+        // (normal eye-arrival skew must never trigger keepalives).
+        r = submit(pairer, kEyeLeft, 102.0, kEyeMeta, payload(4), 1450);
+        expectTrue(r.action == SubmitAction::Hold, "repeat: inside threshold, plain hold");
+        // Past the threshold: repeat the last packed frame, frame still held.
+        r = submit(pairer, kEyeLeft, 103.0, kEyeMeta, payload(5), 1700);
+        expectTrue(r.action == SubmitAction::RepeatLast, "repeat: stalled hold repeats last frame");
+        expectInt(static_cast<long long>(pairer.pendingCount()), 3, "repeat: frame still held");
+
+        // A meta change during the stall can't repeat (canvas would mismatch).
+        r = submit(pairer, kEyeLeft, 104.0, meta(1920, 1080), payload(6), 1800);
+        expectTrue(r.action == SubmitAction::Hold, "repeat: meta change blocks repeat");
+    }
+
+    // --- Recovery guards: frames that could not actually pair must never
+    // count toward re-latching. ---
+    {
+        EyePairer pairer;
+        submit(pairer, kEyeRight, 100.0, kEyeMeta, payload(1), 0);
+        submit(pairer, kEyeLeft, 100.0, kEyeMeta, payload(2), 30);
+        submit(pairer, kEyeLeft, 101.0, kEyeMeta, payload(3), 1000);
+        submit(pairer, kEyeLeft, 102.0, kEyeMeta, payload(4), 4100);
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "recover-guard: degraded left-only");
+
+        // R returns at the WRONG resolution (params settling): a sustained
+        // run of unpackable frames must not re-latch.
+        for (int i = 0; i < 6; ++i) {
+            submit(pairer, kEyeRight, 110.0 + i, meta(1920, 1080),
+                   payload(static_cast<uint8_t>(10 + i)), 4200 + static_cast<uint64_t>(i) * 40);
+        }
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "recover-guard: mismatched meta never re-latches");
+
+        // Distinct times spaced beyond the recovery gap (sporadic phantoms)
+        // never accumulate a streak.
+        submit(pairer, kEyeRight, 200.0, kEyeMeta, payload(20), 10000);
+        submit(pairer, kEyeRight, 201.0, kEyeMeta, payload(21), 10000 + kRecoverMaxGapMs + 100);
+        submit(pairer, kEyeRight, 202.0, kEyeMeta, payload(22), 10000 + 2 * (kRecoverMaxGapMs + 100));
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "recover-guard: sporadic frames never re-latch");
+
+        // A proper tight run still recovers afterwards.
+        submit(pairer, kEyeRight, 300.0, kEyeMeta, payload(30), 20000);
+        submit(pairer, kEyeRight, 301.0, kEyeMeta, payload(31), 20040);
+        submit(pairer, kEyeRight, 302.0, kEyeMeta, payload(32), 20080);
+        expectTrue(pairer.mode() == StreamMode::Stereo, "recover-guard: tight run still recovers");
     }
 
     // --- Thumbnail renders (filmstrip, tiny dims, probe-confirmed to hit the
@@ -292,6 +456,68 @@ int main()
         expectInt(static_cast<long long>(pairer.pendingCount()), 1, "thumb: pending untouched");
         r = submit(pairer, kEyeLeft, 51.0, kEyeMeta, payload(5), 40);
         expectTrue(r.action == SubmitAction::SendPair, "thumb: real pairing unaffected");
+    }
+
+    // --- Thumbnails while DEGRADED: the canvas is still locked, so they
+    // still drop — a 184×92 mono frame would pop the packed dimensions. ---
+    {
+        EyePairer pairer;
+        submit(pairer, kEyeRight, 100.0, kEyeMeta, payload(1), 0);
+        submit(pairer, kEyeLeft, 100.0, kEyeMeta, payload(2), 30);
+        submit(pairer, kEyeLeft, 101.0, kEyeMeta, payload(3), 1000);
+        submit(pairer, kEyeLeft, 102.0, kEyeMeta, payload(4), 4100);
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "thumb-degraded: degraded left-only");
+        SubmitResult r = submit(pairer, kEyeLeft, 53.0, meta(184, 92), payload(5), 4200, true);
+        expectTrue(r.action == SubmitAction::Drop, "thumb-degraded: thumbnail still dropped");
+    }
+
+    // --- Acceptance (issue #12): once stereo latches, no submit may ever
+    // produce a single-eye send — the canvas dimensions stay constant through
+    // stall, keepalive, degrade, thumbnail churn, phantom flap, recovery, and
+    // mutual stalls. ---
+    {
+        expectTrue(kDegradeSilenceMs >= 3000, "spec: degrade window well above the old 1.5s timeout");
+        expectTrue(kRepeatAfterMs > 668, "spec: repeat threshold clears 2x the observed eye skew");
+        expectTrue(kRecoverDistinctTimes >= 2, "spec: recovery needs a sustained run");
+
+        EyePairer pairer;
+        bool monoAfterLock = false;
+        auto step = [&](int eye, double time, uint64_t nowMs, bool thumb = false) {
+            SubmitResult r = submit(pairer, eye, time, thumb ? meta(184, 92) : kEyeMeta,
+                                    payload(9), nowMs, thumb);
+            monoAfterLock = monoAfterLock || (r.action == SubmitAction::SendMono);
+        };
+
+        uint64_t t = 0;
+        double frame = 1.0;
+        // Healthy pairing.
+        for (int i = 0; i < 5; ++i, ++frame) {
+            step(kEyeRight, frame, t += 20);
+            step(kEyeLeft, frame, t += 20);
+        }
+        // R dies; L advances for 8 s: holds → keepalives → degrade → duplication.
+        for (int i = 0; i < 40; ++i, ++frame) {
+            step(kEyeLeft, frame, t += 200);
+        }
+        expectTrue(pairer.mode() == StreamMode::LeftOnly, "acceptance: degraded mid-scenario");
+        // Thumbnail churn and a lone phantom R while degraded.
+        step(kEyeLeft, 2.0, t += 50, true);
+        step(kEyeRight, frame - 1.0, t += 50);
+        step(kEyeLeft, frame, t += 3000); // flowing eye keeps duplicating
+        // R returns for good.
+        for (int i = 0; i < 4; ++i, ++frame) {
+            step(kEyeRight, frame, t += 20);
+            step(kEyeLeft, frame, t += 20);
+        }
+        expectTrue(pairer.mode() == StreamMode::Stereo, "acceptance: recovered mid-scenario");
+        // Mutual stall, then both resume.
+        t += 20000;
+        for (int i = 0; i < 3; ++i, ++frame) {
+            step(kEyeLeft, frame, t += 20);
+            step(kEyeRight, frame, t += 20);
+        }
+        expectTrue(pairer.mode() == StreamMode::Stereo, "acceptance: stereo after mutual stall");
+        expectTrue(!monoAfterLock, "acceptance: no single-eye frame ever after latch");
     }
 
     // --- Frame packing: two same-meta eye frames become one packed frame.

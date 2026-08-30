@@ -19,8 +19,17 @@
   - parked re-renders repeat a time: a duplicate same-eye submission replaces
     the held frame;
   - unmated frames occur: pending frames age out instead of accumulating, and
-    a starving partner eye must never freeze the stream — the pairer falls
-    back to labeled mono until the partner returns.
+    a starving partner eye must never freeze the stream.
+
+  Geometry stability (issue #12): receivers re-fit whenever the outgoing frame
+  dimensions change, which pops the picture — an acute nausea trigger for
+  in-headset monitoring. So once stereo latches, the canvas is LOCKED: no
+  single-eye frame is ever emitted again on the stream. A partner stall first
+  repeats the last packed frame (keepalive); only sustained silence while the
+  flowing eye advances through new frame times degrades the stream — to the
+  flowing eye duplicated into both halves, same canvas. Recovery is damped the
+  same way (a sustained, pack-compatible run from the missing eye), so
+  parked-timeline phantom renders can never flap the mode in either direction.
 
   All timing is injected (nowMs) so behavior is deterministic under test.
 */
@@ -50,10 +59,30 @@ constexpr uint64_t kPendingTimeoutMs = 1000;
 // Recycled hold-payload buffers kept warm (see EyePairer::recycle).
 constexpr size_t kPayloadPoolCap = 4;
 // A partner eye silent this long means it stopped rendering (Vision switched
-// to Mono, instance gone): degrade to labeled mono rather than freeze. Must
-// sit well above the pending timeout plus the observed arrival skew so a slow
-// partner is never mistaken for a missing one.
-constexpr uint64_t kStarvationTimeoutMs = 1500;
+// to Mono, instance gone). Degrading is a last resort — the in-headset cost of
+// any mode flip is high (issue #12) — so the window sits far above the pending
+// timeout, the observed ±334 ms arrival skew, and the brief stalls UI
+// interactions and heavy 8K loads produce.
+constexpr uint64_t kDegradeSilenceMs = 4000;
+// Partner silence alone is NOT starvation: a parked timeline re-renders one
+// frame time sporadically (phantom renders, see LEARNINGS pitfalls), often
+// through a single eye — and there the last sent pair is already the correct
+// static content. Degrading only helps when the flowing eye is advancing
+// through NEW frame times its partner never matches.
+constexpr int kDegradeMinDistinctTimes = 2;
+// Re-latching out of degraded mode is damped the same way: the missing eye
+// must sustain a run of distinct-time, meta-matching frames (gaps under
+// kRecoverMaxGapMs) before the stream flips back — a lone parked phantom
+// render must never flap it. At playback cadence this is still fast (~3
+// frames ≈ 125 ms at 24 fps).
+constexpr int kRecoverDistinctTimes = 3;
+constexpr uint64_t kRecoverMaxGapMs = 1500;
+// Stall keepalive: while stereo waits out the degrade window, holds whose
+// partner has been quiet past this threshold re-send the last packed frame —
+// receivers keep getting frames (no signal-loss flags, no frozen-stream
+// ambiguity) and the geometry stays put. Sits above the probe's observed
+// ±334 ms healthy eye-arrival skew so normal pairing never triggers it.
+constexpr uint64_t kRepeatAfterMs = 700;
 
 struct FrameMeta {
     int width = 0;   // one eye's dimensions, post-downscale
@@ -71,10 +100,14 @@ inline bool operator==(const FrameMeta& a, const FrameMeta& b)
 enum class StreamMode { Mono, Stereo, LeftOnly, RightOnly };
 
 enum class SubmitAction {
-    SendMono,  // stream the submitted frame as-is, single eye
-    Hold,      // held awaiting its partner; nothing to send
-    SendPair,  // partner found: pack the submitted frame with matePayload
-    Drop       // do not send (e.g. thumbnail render while stereo is active)
+    SendMono,       // stream the submitted frame as-is, single eye
+    Hold,           // held awaiting its partner; nothing to send
+    SendPair,       // partner found: pack the submitted frame with matePayload
+    SendDuplicate,  // degraded: pack the submitted frame into BOTH halves —
+                    // the canvas keeps its stereo dimensions (issue #12)
+    RepeatLast,     // held awaiting its partner AND the partner is stalling:
+                    // re-send the last packed frame as a keepalive
+    Drop            // do not send (e.g. thumbnail render while stereo is active)
 };
 
 struct SubmitResult {
@@ -172,49 +205,101 @@ public:
         SubmitResult result;
 
         // Thumbnail renders (filmstrip/gallery) never touch pairing state: in
-        // mono they stream exactly as they always have; while stereo is
-        // active a tiny single-eye frame must not hijack the packed stream.
+        // mono they stream exactly as they always have; on a locked canvas
+        // (degraded included) a tiny single-eye frame must never hijack the
+        // packed stream.
         if (isThumbnail) {
-            result.action = stereoActive_ ? SubmitAction::Drop : SubmitAction::SendMono;
+            result.action = canvasLocked_ ? SubmitAction::Drop : SubmitAction::SendMono;
             return result;
         }
 
-        // Stereo (re)activation: from mono, a right-eye render is the stereo
-        // signal (the detector keys on "did an R call arrive", never on the
-        // eye property's mere presence). From a fallback state, only the
-        // MISSING eye returning re-activates — the still-flowing eye must
-        // never re-latch, or the stream would oscillate between fallback and
-        // freezing.
-        if (!stereoActive_ &&
-            ((fallbackEye_ < 0 && eye == kEyeRight) ||
-             (fallbackEye_ >= 0 && eye != fallbackEye_))) {
-            stereoActive_ = true;
+        const int self = (eye == kEyeRight) ? 1 : 0;
+        const int other = 1 - self;
+
+        if (!canvasLocked_) {
+            if (eye != kEyeRight) {
+                // True mono: stream unchanged (bit-identical shipping path).
+                lastSeenMs_[self] = nowMs;
+                result.action = SubmitAction::SendMono;
+                return result;
+            }
+            // Stereo activation: a right-eye render is the stereo signal (the
+            // detector keys on "did an R call arrive", never on the eye
+            // property's mere presence). This locks the canvas: from here on
+            // every outgoing frame keeps packed-stereo dimensions — receivers
+            // re-fit on a dimension change, which pops the geometry in-headset
+            // (issue #12).
+            canvasLocked_ = true;
+            degraded_ = false;
             fallbackEye_ = -1;
             stereoActivatedMs_ = nowMs;
         }
 
-        lastSeenMs_[eye == kEyeRight ? 1 : 0] = nowMs;
+        // Mutual-stall reset: when THIS eye returns from a silence longer
+        // than the degrade window (UI stall, page switch — both eyes paused),
+        // the partner's silence over that span proves nothing. Restart the
+        // clock instead of degrading on the first frames back.
+        if (lastSeenMs_[self] != 0 && nowMs - lastSeenMs_[self] > kDegradeSilenceMs) {
+            silenceFloorMs_ = nowMs;
+            resetDistinctHolds();
+        }
+        lastSeenMs_[self] = nowMs;
 
-        if (!stereoActive_) {
-            result.action = SubmitAction::SendMono;
-            return result;
+        if (degraded_) {
+            if (eye == fallbackEye_) {
+                // The flowing eye keeps the locked canvas alive, duplicated
+                // into both halves (2D momentarily, geometry never pops).
+                lastFlowingMeta_ = meta;
+                notePacked(meta);
+                result.action = SubmitAction::SendDuplicate;
+                return result;
+            }
+            // The missing eye is back. Re-latching is damped: it takes a
+            // sustained run of distinct-time frames that could actually pack
+            // against the flowing eye (meta match) — a lone parked phantom
+            // render must never flap the stream back. The frames still hold
+            // below, so pairing is warm the moment the mode flips.
+            if (meta == lastFlowingMeta_ &&
+                (!hasRecoverTime_ || time != lastRecoverTime_)) {
+                if (recoverStreak_ > 0 && nowMs - lastRecoverMs_ > kRecoverMaxGapMs) {
+                    recoverStreak_ = 0; // sporadic, not sustained — start over
+                }
+                ++recoverStreak_;
+                lastRecoverMs_ = nowMs;
+                lastRecoverTime_ = time;
+                hasRecoverTime_ = true;
+                if (recoverStreak_ >= kRecoverDistinctTimes) {
+                    degraded_ = false;
+                    fallbackEye_ = -1;
+                    stereoActivatedMs_ = nowMs; // fresh silence clock for both eyes
+                    resetDistinctHolds();
+                    resetRecovery();
+                }
+            }
         }
 
-        // Partner starvation: the other eye has been silent past the window
-        // (measured from stereo activation when it was never seen at all).
-        const int other = (eye == kEyeRight) ? 0 : 1;
-        const uint64_t otherSeenMs =
-            lastSeenMs_[other] > stereoActivatedMs_ ? lastSeenMs_[other] : stereoActivatedMs_;
-        if (nowMs - otherSeenMs > kStarvationTimeoutMs) {
-            stereoActive_ = false;
-            fallbackEye_ = eye;
-            dropped_ += pending_.size();
-            for (auto& entry : pending_) {
-                recycle(std::move(entry.second.payload));
+        if (!degraded_) {
+            // Partner starvation, damped: the other eye must have been silent
+            // past the (long) degrade window — measured from stereo activation
+            // when it was never seen at all — AND the flowing eye must be
+            // advancing through distinct frame times (this submit included).
+            const bool advancesTime = !hasDistinctHoldTime_ || time != lastDistinctHoldTime_;
+            if (nowMs - partnerSeenMs(other) > kDegradeSilenceMs &&
+                distinctHoldCount_ + (advancesTime ? 1 : 0) >= kDegradeMinDistinctTimes) {
+                degraded_ = true;
+                fallbackEye_ = eye;
+                lastFlowingMeta_ = meta;
+                notePacked(meta);
+                resetDistinctHolds();
+                resetRecovery();
+                dropped_ += pending_.size();
+                for (auto& entry : pending_) {
+                    recycle(std::move(entry.second.payload));
+                }
+                pending_.clear();
+                result.action = SubmitAction::SendDuplicate;
+                return result;
             }
-            pending_.clear();
-            result.action = SubmitAction::SendMono;
-            return result;
         }
 
         sweepStalePending(nowMs);
@@ -228,6 +313,8 @@ public:
                 result.mateMeta = it->second.meta;
                 result.matePayload = std::move(it->second.payload);
                 pending_.erase(it);
+                notePacked(meta);
+                resetDistinctHolds(); // partner demonstrably alive
                 return result;
             }
             // Mismatched partner (e.g. format/resolution param settling):
@@ -252,6 +339,26 @@ public:
         slot.heldAtMs = nowMs;
         slot.heldSeq = ++holdSeq_;
         evictOverCapacity();
+
+        // Degrade accounting: an unpaired hold at a NEW frame time is the
+        // flowing eye advancing past its silent partner. Same-time re-holds
+        // (parked phantom re-renders) deliberately don't count.
+        if (!hasDistinctHoldTime_ || time != lastDistinctHoldTime_) {
+            ++distinctHoldCount_;
+            lastDistinctHoldTime_ = time;
+            hasDistinctHoldTime_ = true;
+        }
+
+        // Stall keepalive: the partner is quiet past the repeat threshold and
+        // the last packed frame still matches this stream's canvas — ask the
+        // caller to re-send it. Never while degraded (the flowing eye owns
+        // the keepalive there), and never before anything packed has gone out.
+        if (!degraded_ && hasPacked_ && meta == lastPackedEyeMeta_ &&
+            nowMs - partnerSeenMs(other) > kRepeatAfterMs) {
+            result.action = SubmitAction::RepeatLast;
+            return result;
+        }
+
         result.action = SubmitAction::Hold;
         return result;
     }
@@ -268,10 +375,10 @@ public:
 
     StreamMode mode() const
     {
-        if (stereoActive_) return StreamMode::Stereo;
-        if (fallbackEye_ == kEyeLeft) return StreamMode::LeftOnly;
-        if (fallbackEye_ == kEyeRight) return StreamMode::RightOnly;
-        return StreamMode::Mono;
+        if (degraded_) {
+            return fallbackEye_ == kEyeLeft ? StreamMode::LeftOnly : StreamMode::RightOnly;
+        }
+        return canvasLocked_ ? StreamMode::Stereo : StreamMode::Mono;
     }
 
     size_t pendingCount() const { return pending_.size(); }
@@ -294,6 +401,33 @@ private:
         std::vector<uint8_t> v = std::move(pool_.back());
         pool_.pop_back();
         return v;
+    }
+
+    void resetDistinctHolds()
+    {
+        distinctHoldCount_ = 0;
+        hasDistinctHoldTime_ = false;
+    }
+
+    void resetRecovery()
+    {
+        recoverStreak_ = 0;
+        hasRecoverTime_ = false;
+    }
+
+    void notePacked(const FrameMeta& eyeMeta)
+    {
+        hasPacked_ = true;
+        lastPackedEyeMeta_ = eyeMeta;
+    }
+
+    // When the partner was last submitted — floored at stereo activation (an
+    // eye that never arrived counts as "last seen" at the latch) and at the
+    // mutual-stall reset point.
+    uint64_t partnerSeenMs(int other) const
+    {
+        uint64_t seen = lastSeenMs_[other] > stereoActivatedMs_ ? lastSeenMs_[other] : stereoActivatedMs_;
+        return seen > silenceFloorMs_ ? seen : silenceFloorMs_;
     }
 
     void sweepStalePending(uint64_t nowMs)
@@ -328,10 +462,25 @@ private:
     // and exact double equality keeps fractional (retimed) times working.
     std::map<double, PendingFrame> pending_;
     std::vector<std::vector<uint8_t>> pool_; // recycled hold-payload buffers
-    bool stereoActive_ = false;
-    int fallbackEye_ = -1;             // -1 = never fallen back; else the eye still flowing
+    // Once locked (first stereo latch), the outgoing canvas keeps packed
+    // dimensions for the stream's lifetime — degraded mode duplicates the
+    // flowing eye instead of shrinking the frame (issue #12).
+    bool canvasLocked_ = false;
+    bool degraded_ = false;            // one eye starved; canvas held via duplication
+    int fallbackEye_ = -1;             // the still-flowing eye while degraded
     uint64_t stereoActivatedMs_ = 0;
+    uint64_t silenceFloorMs_ = 0;      // partner-silence clock floor (mutual-stall reset)
     uint64_t lastSeenMs_[2] = {0, 0};  // [0]=left, [1]=right
+    int distinctHoldCount_ = 0;        // unpaired holds at distinct times (degrade gate)
+    double lastDistinctHoldTime_ = 0.0;
+    bool hasDistinctHoldTime_ = false;
+    FrameMeta lastFlowingMeta_;        // meta of the degraded stream's flowing eye
+    bool hasPacked_ = false;           // a packed frame (pair or duplicate) went out
+    FrameMeta lastPackedEyeMeta_;      // per-eye meta of that packed frame
+    int recoverStreak_ = 0;            // missing-eye frames counting toward re-latch
+    uint64_t lastRecoverMs_ = 0;
+    double lastRecoverTime_ = 0.0;
+    bool hasRecoverTime_ = false;
     unsigned long long dropped_ = 0;
     unsigned long long holdSeq_ = 0;
 };
