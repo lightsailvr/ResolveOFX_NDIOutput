@@ -1,11 +1,13 @@
 // Correctness test for the GPU-native fast path (src/MetalGPUAcceleration.mm):
 // the fused downscale+convert kernels must match the CPU reference composition
 // (ndi_stream::downscaleRGBABox + the flipping CPU converters) within rounding
-// tolerance, on a real Metal device. Also covers the passthrough copy and the
-// full-frame readback used by the CPU fallback.
+// tolerance, on a real Metal device. Also covers the passthrough copy, the
+// full-frame readback used by the CPU fallback, and the STMap warp kernels
+// (issue #7) against the ndi_stmap::warpRGBABox CPU reference.
 // Build & run: make test-metal (macOS with any Metal device; skips cleanly without one)
 
 #include "MetalGPUAcceleration.h"
+#include "STMap.h"
 #include "StreamResolution.h"
 
 #include <chrono>
@@ -330,6 +332,205 @@ int main()
                   "slot ring: 4 in flight, 5th refused, released slots reusable");
         }
 
+        metal_gpu_release_buffer(srcBuf);
+    }
+
+    // ------------------------------------------------------------------
+    // STMap warp kernels (issue #7). The warp with an identity map must be
+    // byte-identical to the plain downscale kernels (same taps, bilinear
+    // weights degenerate to exact fetches at power-of-two dims), and an
+    // arbitrary map must match the CPU reference warp within the same
+    // rounding tolerance as the downscale kernels.
+    // ------------------------------------------------------------------
+    {
+        // Identity map at source dims, row 0 = top, bottom-left v convention.
+        auto identityMapUV = [](int w, int h) {
+            std::vector<float> uv(static_cast<size_t>(w) * h * 2);
+            for (int row = 0; row < h; ++row) {
+                const float v = (h - 1 - row + 0.5f) / static_cast<float>(h);
+                for (int x = 0; x < w; ++x) {
+                    uv[(static_cast<size_t>(row) * w + x) * 2 + 0] = (x + 0.5f) / static_cast<float>(w);
+                    uv[(static_cast<size_t>(row) * w + x) * 2 + 1] = v;
+                }
+            }
+            return uv;
+        };
+
+        std::vector<float> frame;
+        fillFrame(frame, srcW, srcH, srcW * 4);
+        void* srcBuf = metal_gpu_create_shared_buffer(ctx, frame.data(), frame.size() * sizeof(float));
+
+        std::vector<float> ident = identityMapUV(srcW, srcH);
+        void* identBuf = metal_gpu_create_shared_buffer(ctx, ident.data(), ident.size() * sizeof(float));
+
+        for (int divisor : {1, 2}) {
+            int outW = 0, outH = 0;
+            ndi_stream::outputDims(srcW, srcH, divisor, &outW, &outH);
+            {
+                std::vector<uint8_t> plain(static_cast<size_t>(outW) * outH * 2, 0);
+                std::vector<uint8_t> warped(plain.size(), 1);
+                bool ranPlain = metal_gpu_buffer_downscale_to_uyvy(ctx, nullptr, srcBuf,
+                                                                   srcW, srcH, srcW * 4, divisor,
+                                                                   outW, outH, plain.data());
+                bool ranWarp = metal_gpu_buffer_warp_to_uyvy(ctx, nullptr, srcBuf,
+                                                             srcW, srcH, srcW * 4,
+                                                             identBuf, srcW, srcH, divisor,
+                                                             outW, outH, warped.data());
+                char name[128];
+                std::snprintf(name, sizeof(name),
+                              "identity-map warp UYVY == downscale kernel (divisor %d)", divisor);
+                check(ranPlain && ranWarp &&
+                          std::memcmp(plain.data(), warped.data(), plain.size()) == 0, name);
+            }
+            {
+                std::vector<uint16_t> plain(static_cast<size_t>(outW) * outH * 2, 0);
+                std::vector<uint16_t> warped(plain.size(), 1);
+                bool ranPlain = metal_gpu_buffer_downscale_to_p216(ctx, nullptr, srcBuf,
+                                                                   srcW, srcH, srcW * 4, divisor,
+                                                                   outW, outH, plain.data());
+                bool ranWarp = metal_gpu_buffer_warp_to_p216(ctx, nullptr, srcBuf,
+                                                             srcW, srcH, srcW * 4,
+                                                             identBuf, srcW, srcH, divisor,
+                                                             outW, outH, warped.data());
+                char name[128];
+                std::snprintf(name, sizeof(name),
+                              "identity-map warp P216 == downscale kernel (divisor %d)", divisor);
+                check(ranPlain && ranWarp &&
+                          std::memcmp(plain.data(), warped.data(), plain.size() * 2) == 0, name);
+            }
+        }
+
+        // Arbitrary smooth map at non-source dims, including an out-of-range
+        // corner region (outside the lens circle -> black). No NaNs here:
+        // GPU fast-math makes NaN comparisons formally undefined, and the
+        // CPU seam test already pins NaN behavior.
+        const int mapW = 48, mapH = 24;
+        std::vector<float> mapUV(static_cast<size_t>(mapW) * mapH * 2);
+        for (int row = 0; row < mapH; ++row) {
+            for (int x = 0; x < mapW; ++x) {
+                const float xn = (x + 0.5f) / mapW;
+                const float yn = (mapH - 1 - row + 0.5f) / mapH;
+                float u = xn * xn * 0.9f + 0.05f;
+                float v = 0.1f + 0.75f * yn + 0.1f * xn;
+                if (x < 4 && row < 4) { u = 1.5f; v = -0.25f; } // outside the circle
+                mapUV[(static_cast<size_t>(row) * mapW + x) * 2 + 0] = u;
+                mapUV[(static_cast<size_t>(row) * mapW + x) * 2 + 1] = v;
+            }
+        }
+        void* mapBuf = metal_gpu_create_shared_buffer(ctx, mapUV.data(), mapUV.size() * sizeof(float));
+
+        struct WarpCase { int divisor; int rowFloats; const char* name; };
+        const WarpCase warpCases[] = {
+            {1, srcW * 4, "divisor 1, tight rows"},
+            {2, srcW * 4, "divisor 2, tight rows"},
+            {2, (srcW + 2) * 4, "divisor 2, padded rows"},
+        };
+        for (const WarpCase& c : warpCases) {
+            std::vector<float> wframe;
+            fillFrame(wframe, srcW, srcH, c.rowFloats);
+            void* wsrcBuf = metal_gpu_create_shared_buffer(ctx, wframe.data(),
+                                                           wframe.size() * sizeof(float));
+            int outW = 0, outH = 0;
+            ndi_stream::outputDims(mapW, mapH, c.divisor, &outW, &outH);
+            std::vector<float> small(static_cast<size_t>(outW) * outH * 4);
+            ndi_stmap::warpRGBABox(wframe.data(), srcW, srcH, c.rowFloats,
+                                   mapUV.data(), mapW, mapH, c.divisor,
+                                   small.data(), outW, outH);
+            {
+                std::vector<uint8_t> expected, actual(static_cast<size_t>(outW) * outH * 2, 0);
+                referenceUYVY(small.data(), outW, outH, expected);
+                bool ran = metal_gpu_buffer_warp_to_uyvy(ctx, nullptr, wsrcBuf,
+                                                         srcW, srcH, c.rowFloats,
+                                                         mapBuf, mapW, mapH, c.divisor,
+                                                         outW, outH, actual.data());
+                char name[128];
+                std::snprintf(name, sizeof(name), "warp UYVY matches CPU reference (%s)", c.name);
+                check(ran && compareBuffers(actual.data(), expected.data(), expected.size(), 2, name),
+                      name);
+            }
+            {
+                std::vector<uint16_t> expected, actual(static_cast<size_t>(outW) * outH * 2, 0);
+                referenceP216(small.data(), outW, outH, expected);
+                bool ran = metal_gpu_buffer_warp_to_p216(ctx, nullptr, wsrcBuf,
+                                                         srcW, srcH, c.rowFloats,
+                                                         mapBuf, mapW, mapH, c.divisor,
+                                                         outW, outH, actual.data());
+                char name[128];
+                std::snprintf(name, sizeof(name), "warp P216 matches CPU reference (%s)", c.name);
+                check(ran && compareBuffers(actual.data(), expected.data(), expected.size(), 64, name),
+                      name);
+            }
+            metal_gpu_release_buffer(wsrcBuf);
+        }
+
+        // Async warp submit: same slot ring, output bit-equal to the blocking
+        // warp path.
+        {
+            struct AsyncCapture {
+                std::mutex m;
+                std::condition_variable cv;
+                int fired = 0;
+                bool ok = false;
+                std::vector<uint8_t> out;
+                void* slot = nullptr;
+            };
+            auto onDone = [](void* user, void* slot, const void* outPtr, size_t outBytes,
+                             double /*gpuMs*/, bool ok) {
+                AsyncCapture* cap = static_cast<AsyncCapture*>(user);
+                std::lock_guard<std::mutex> lock(cap->m);
+                cap->ok = ok;
+                cap->slot = slot;
+                cap->out.assign(static_cast<const uint8_t*>(outPtr),
+                                static_cast<const uint8_t*>(outPtr) + outBytes);
+                ++cap->fired;
+                cap->cv.notify_all();
+            };
+
+            int outW = 0, outH = 0;
+            ndi_stream::outputDims(mapW, mapH, 2, &outW, &outH);
+            std::vector<uint8_t> blocking(static_cast<size_t>(outW) * outH * 2, 0);
+            bool ranBlocking = metal_gpu_buffer_warp_to_uyvy(ctx, nullptr, srcBuf,
+                                                             srcW, srcH, srcW * 4,
+                                                             mapBuf, mapW, mapH, 2,
+                                                             outW, outH, blocking.data());
+            AsyncCapture cap;
+            bool submitted = metal_gpu_warp_submit(ctx, nullptr, srcBuf,
+                                                   srcW, srcH, srcW * 4,
+                                                   mapBuf, mapW, mapH, 2, outW, outH,
+                                                   /*p216=*/false, onDone, &cap) == METAL_SUBMIT_OK;
+            bool done = false;
+            if (submitted) {
+                std::unique_lock<std::mutex> lock(cap.m);
+                done = cap.cv.wait_for(lock, std::chrono::seconds(5), [&] { return cap.fired >= 1; });
+            }
+            check(ranBlocking && done && cap.ok && cap.out.size() == blocking.size() &&
+                      std::memcmp(cap.out.data(), blocking.data(), blocking.size()) == 0,
+                  "async warp submit matches blocking warp output");
+            if (cap.slot) metal_gpu_downscale_release(ctx, cap.slot);
+        }
+
+        // A missing/undersized map buffer must refuse as INVALID (the caller
+        // falls back to the CPU warp), never crash.
+        {
+            int outW = 0, outH = 0;
+            ndi_stream::outputDims(mapW, mapH, 1, &outW, &outH);
+            std::vector<uint8_t> outBytes(static_cast<size_t>(outW) * outH * 2, 0);
+            bool nullRefused = !metal_gpu_buffer_warp_to_uyvy(ctx, nullptr, srcBuf,
+                                                              srcW, srcH, srcW * 4,
+                                                              nullptr, mapW, mapH, 1,
+                                                              outW, outH, outBytes.data());
+            void* tiny = metal_gpu_create_shared_buffer(ctx, nullptr, 16);
+            auto noopDone = [](void*, void*, const void*, size_t, double, bool) {};
+            bool tinyRefused = metal_gpu_warp_submit(ctx, nullptr, srcBuf,
+                                                     srcW, srcH, srcW * 4,
+                                                     tiny, mapW, mapH, 1, outW, outH,
+                                                     false, noopDone, nullptr) == METAL_SUBMIT_INVALID;
+            metal_gpu_release_buffer(tiny);
+            check(nullRefused && tinyRefused, "warp refuses null/undersized map buffers as invalid");
+        }
+
+        metal_gpu_release_buffer(mapBuf);
+        metal_gpu_release_buffer(identBuf);
         metal_gpu_release_buffer(srcBuf);
     }
 

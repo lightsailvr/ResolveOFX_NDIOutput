@@ -5,6 +5,30 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-08-30
+
+> Tier 0 + `make test` (158 assertions incl. the 41 new STMap-seam checks) + `make test-metal` (25 checks incl. the warp kernels) pass. Tier 1–3 (Resolve install, stream check, fisheye timeline verified in the Quest stereo-180 player against a Fusion-authored STMap) pending.
+
+### Added
+- **Projection normalization** (issue #7): new **Projection** parameter group with a **Passthrough / Equirect (STMap)** mode. In Equirect mode the plugin warps each eye on the GPU through a per-eye 32-bit float (or half) EXR STMap — the Fusion-authored maps of the VR.NDI lens pipeline — **before** stereo packing, so an Apple Immersive fisheye timeline displays geometrically correct in the existing Quest stereo-180 mode with zero receiver changes. The warped output resolution is the STMap's resolution (the map defines the destination image); the Resolution control then applies on top.
+- **STMap (Left Eye) / STMap (Right Eye)** file parameters. The left map is required for Equirect mode and serves both eyes (and mono timelines) when no right map is set. Loaded maps are shared process-wide (both stereo eye instances read the same files once) and reload when the file changes on disk.
+- Minimal, fully bounds-checked EXR reader (`src/STMap.h`): single-part scanline, float/half channels, None/RLE/ZIPS/ZIP compression. Anything else — or a missing, truncated, or hostile file — **fails soft**: the stream continues in passthrough and Stream Status says why (e.g. "STMap invalid — passthrough (see log)"). Validated against third-party EXRs (ffmpeg-encoded fixtures) as well as in-test-built ones.
+- STMap warp Metal kernels (UYVY + P216) fused with the downscale and running through the same non-blocking slot-ring submit path as v1.6.0 — the render action still only encodes. Every fallback keeps the corrected geometry: no Metal map upload → full readback + CPU warp; CPU render path → CPU warp.
+- Stream Status now appends the projection state: ", Equirect (STMap)" while warping, or the passthrough reason (invalid map, L/R map size mismatch).
+
+### Notes
+- Passthrough mode takes exactly the pre-1.7.0 code path — output is bit-identical to 1.6.1.
+- L/R maps must agree on resolution; a mismatch would give the two eyes different frame sizes (unpairable), so it falls back to passthrough with a status message instead.
+- The plugin now links zlib (`-lz`, macOS SDK) for Zip-compressed EXR chunks.
+
+## [1.6.1] - 2026-08-28
+
+*(backfilled: 1.6.0/1.6.1 shipped without changelog entries; full detail in LEARNINGS.md, issue #5)*
+
+### Fixed / Performance
+- **1.6.0 — non-blocking GPU fast path:** the render action now only encodes the fused downscale+convert kernel into a ring of CPU-visible staging slots and returns (~0 ms); Metal's completion callback wakes a per-instance pump worker that pairs, packs, and sends off the render thread. Backpressure drops frames instead of ever blocking the host (8K stereo playback had collapsed 30→5 fps on ~90 ms of per-eye render-action blocking).
+- **1.6.1 — the wait had moved, not died:** render threads were queueing on the sender-hub mutex while pump workers held it through a cold-page pairer copy plus a sync send. A lock-free `senderReady` atomic now answers the render path's only question, and the pairer recycles hold-payload buffers so the hold is a warm-page memcpy.
+
 ## [1.5.0] - 2026-08-28
 
 > Validated 2026-08-28 through the LEARNINGS.md testing loop: unit tests, Tier 0, and Tier 1–2 in Resolve (stereo timeline streams packed stereo; mono unchanged).

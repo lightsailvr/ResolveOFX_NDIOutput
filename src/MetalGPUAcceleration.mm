@@ -20,6 +20,8 @@
 struct MetalFastPathState {
     id<MTLComputePipelineState> uyvyPipeline;
     id<MTLComputePipelineState> p216Pipeline;
+    id<MTLComputePipelineState> warpUyvyPipeline; // STMap warp variants (issue #7);
+    id<MTLComputePipelineState> warpP216Pipeline; // nil if compilation failed — warp then refuses, downscale still works
     id<MTLBuffer> staging;          // readback target, grown as needed
     size_t stagingCapacity;
 };
@@ -58,6 +60,18 @@ struct MetalDownscaleParams {
     uint32_t outWidth;
     uint32_t outHeight;
     uint32_t divisor;
+};
+
+// Must match the WarpParams struct inside the shader source below.
+struct MetalWarpParams {
+    uint32_t srcWidth;
+    uint32_t srcHeight;
+    uint32_t srcRowFloats;
+    uint32_t outWidth;
+    uint32_t outHeight;
+    uint32_t divisor;
+    uint32_t mapWidth;
+    uint32_t mapHeight;
 };
 
 // Metal shader source code
@@ -200,6 +214,46 @@ struct DownscaleParams {
     uint divisor;
 };
 
+// Shared packing tails of the fused kernels (downscale and STMap-warp
+// variants): two sampled pixels -> one UYVY macropixel / one P216 column
+// pair. Arithmetic matches the CPU converters exactly.
+static inline void emit_uyvy(device uchar4* dst, uint outWidth,
+                             uint2 gid, float3 rgb1, float3 rgb2) {
+    float y1 = 0.2126f * rgb1.r + 0.7152f * rgb1.g + 0.0722f * rgb1.b;
+    float y2 = 0.2126f * rgb2.r + 0.7152f * rgb2.g + 0.0722f * rgb2.b;
+    float3 avg = (rgb1 + rgb2) * 0.5f;
+    float u = -0.1146f * avg.r - 0.3854f * avg.g + 0.5f * avg.b;
+    float v = 0.5f * avg.r - 0.4542f * avg.g - 0.0458f * avg.b;
+
+    dst[gid.y * (outWidth / 2) + gid.x] = uchar4(
+        uchar((u + 0.5f) * 255.0f),
+        uchar(y1 * 255.0f),
+        uchar((v + 0.5f) * 255.0f),
+        uchar(y2 * 255.0f)
+    );
+}
+
+static inline void emit_p216(device ushort* dst, uint outWidth, uint outHeight,
+                             uint2 gid, uint x0, float3 rgb1, float3 rgb2) {
+    float y1 = 0.2627f * rgb1.r + 0.6780f * rgb1.g + 0.0593f * rgb1.b;
+    float y2 = 0.2627f * rgb2.r + 0.6780f * rgb2.g + 0.0593f * rgb2.b;
+    float3 avg = (rgb1 + rgb2) * 0.5f;
+    float u = -0.1396f * avg.r - 0.3604f * avg.g + 0.5f * avg.b;
+    float v = 0.5f * avg.r - 0.4598f * avg.g - 0.0402f * avg.b;
+
+    device ushort* yPlane = dst;
+    device ushort* uvPlane = dst + outWidth * outHeight;
+
+    uint yIdx = gid.y * outWidth + x0;
+    yPlane[yIdx] = ushort(4096.0f + y1 * 56064.0f);
+    if (x0 + 1 < outWidth) {
+        yPlane[yIdx + 1] = ushort(4096.0f + y2 * 56064.0f);
+    }
+    uint uvIdx = yIdx / 2;
+    uvPlane[uvIdx * 2] = ushort(32768.0f + u * 28672.0f);
+    uvPlane[uvIdx * 2 + 1] = ushort(32768.0f + v * 28672.0f);
+}
+
 static inline float3 box_sample_rgb(device const float* src,
                                     constant DownscaleParams& p,
                                     uint ox, uint oy) {
@@ -225,19 +279,7 @@ kernel void downscale_rgba_to_uyvy(device const float* src [[buffer(0)]],
 
     float3 rgb1 = box_sample_rgb(src, p, x0, gid.y);
     float3 rgb2 = (x0 + 1 < p.outWidth) ? box_sample_rgb(src, p, x0 + 1, gid.y) : rgb1;
-
-    float y1 = 0.2126f * rgb1.r + 0.7152f * rgb1.g + 0.0722f * rgb1.b;
-    float y2 = 0.2126f * rgb2.r + 0.7152f * rgb2.g + 0.0722f * rgb2.b;
-    float3 avg = (rgb1 + rgb2) * 0.5f;
-    float u = -0.1146f * avg.r - 0.3854f * avg.g + 0.5f * avg.b;
-    float v = 0.5f * avg.r - 0.4542f * avg.g - 0.0458f * avg.b;
-
-    dst[gid.y * (p.outWidth / 2) + gid.x] = uchar4(
-        uchar((u + 0.5f) * 255.0f),
-        uchar(y1 * 255.0f),
-        uchar((v + 0.5f) * 255.0f),
-        uchar(y2 * 255.0f)
-    );
+    emit_uyvy(dst, p.outWidth, gid, rgb1, rgb2);
 }
 
 // One thread emits two output pixels of P216: planar Y at [0, outW*outH),
@@ -252,24 +294,103 @@ kernel void downscale_rgba_to_p216(device const float* src [[buffer(0)]],
 
     float3 rgb1 = box_sample_rgb(src, p, x0, gid.y);
     float3 rgb2 = (x0 + 1 < p.outWidth) ? box_sample_rgb(src, p, x0 + 1, gid.y) : rgb1;
+    emit_p216(dst, p.outWidth, p.outHeight, gid, x0, rgb1, rgb2);
+}
 
-    float y1 = 0.2627f * rgb1.r + 0.6780f * rgb1.g + 0.0593f * rgb1.b;
-    float y2 = 0.2627f * rgb2.r + 0.6780f * rgb2.g + 0.0593f * rgb2.b;
-    float3 avg = (rgb1 + rgb2) * 0.5f;
-    float u = -0.1396f * avg.r - 0.3604f * avg.g + 0.5f * avg.b;
-    float v = 0.5f * avg.r - 0.4598f * avg.g - 0.0402f * avg.b;
+// ---------------------------------------------------------------------------
+// STMap warp variants (issue #7): the box grid is replaced by a map-driven
+// gather — each of the divisor^2 taps reads the STMap texel for that full-res
+// destination pixel and samples the source bilinearly there. Bit-for-bit the
+// CPU composition ndi_stmap::warpRGBABox + the flipping converters, which
+// make test-metal checks. mapUV is interleaved (u,v) floats, row 0 = top,
+// v = 0 = source bottom (Fusion/Nuke STMap convention).
+// ---------------------------------------------------------------------------
 
-    device ushort* yPlane = dst;
-    device ushort* uvPlane = dst + p.outWidth * p.outHeight;
+struct WarpParams {
+    uint srcWidth;
+    uint srcHeight;
+    uint srcRowFloats;
+    uint outWidth;
+    uint outHeight;
+    uint divisor;
+    uint mapWidth;
+    uint mapHeight;
+};
 
-    uint yIdx = gid.y * p.outWidth + x0;
-    yPlane[yIdx] = ushort(4096.0f + y1 * 56064.0f);
-    if (x0 + 1 < p.outWidth) {
-        yPlane[yIdx + 1] = ushort(4096.0f + y2 * 56064.0f);
+// Bilinear source fetch with integer clamps on every index so even a
+// nonsense sample position (hostile map values) can never read out of
+// bounds. Mirrors ndi_stmap::detail::sampleBilinearClamped, rgb only.
+static inline float3 warp_fetch_rgb(device const float* src,
+                                    constant WarpParams& p,
+                                    float sx, float sy) {
+    int x0 = clamp(int(floor(sx)), 0, int(p.srcWidth) - 1);
+    int y0 = clamp(int(floor(sy)), 0, int(p.srcHeight) - 1);
+    int x1 = min(x0 + 1, int(p.srcWidth) - 1);
+    int y1 = min(y0 + 1, int(p.srcHeight) - 1);
+    float fx = clamp(sx - float(x0), 0.0f, 1.0f);
+    float fy = clamp(sy - float(y0), 0.0f, 1.0f);
+    device const float* s00 = src + uint(y0) * p.srcRowFloats + uint(x0) * 4u;
+    device const float* s10 = src + uint(y0) * p.srcRowFloats + uint(x1) * 4u;
+    device const float* s01 = src + uint(y1) * p.srcRowFloats + uint(x0) * 4u;
+    device const float* s11 = src + uint(y1) * p.srcRowFloats + uint(x1) * 4u;
+    float3 c00 = float3(s00[0], s00[1], s00[2]);
+    float3 c10 = float3(s10[0], s10[1], s10[2]);
+    float3 c01 = float3(s01[0], s01[1], s01[2]);
+    float3 c11 = float3(s11[0], s11[1], s11[2]);
+    float3 a = c00 + (c10 - c00) * fx;
+    float3 b = c01 + (c11 - c01) * fx;
+    return a + (b - a) * fy;
+}
+
+// Warped counterpart of box_sample_rgb; taps whose map value leaves [0,1]
+// are outside the lens image circle and stay black.
+static inline float3 warp_sample_rgb(device const float* src,
+                                     device const float* mapUV,
+                                     constant WarpParams& p,
+                                     uint ox, uint oy) {
+    float3 sum = float3(0.0f);
+    for (uint sy = 0; sy < p.divisor; ++sy) {
+        uint dstY = min((p.outHeight - 1u - oy) * p.divisor + sy, p.mapHeight - 1u);
+        uint mapRow = p.mapHeight - 1u - dstY;
+        for (uint sx = 0; sx < p.divisor; ++sx) {
+            uint dstX = min(ox * p.divisor + sx, p.mapWidth - 1u);
+            uint mi = (mapRow * p.mapWidth + dstX) * 2u;
+            float u = mapUV[mi];
+            float v = mapUV[mi + 1u];
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                sum += warp_fetch_rgb(src, p,
+                                      u * float(p.srcWidth) - 0.5f,
+                                      v * float(p.srcHeight) - 0.5f);
+            }
+        }
     }
-    uint uvIdx = yIdx / 2;
-    uvPlane[uvIdx * 2] = ushort(32768.0f + u * 28672.0f);
-    uvPlane[uvIdx * 2 + 1] = ushort(32768.0f + v * 28672.0f);
+    return clamp(sum / float(p.divisor * p.divisor), 0.0f, 1.0f);
+}
+
+kernel void warp_rgba_to_uyvy(device const float* src [[buffer(0)]],
+                              device uchar4* dst [[buffer(1)]],
+                              constant WarpParams& p [[buffer(2)]],
+                              device const float* mapUV [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint x0 = gid.x * 2;
+    if (x0 >= p.outWidth || gid.y >= p.outHeight) return;
+
+    float3 rgb1 = warp_sample_rgb(src, mapUV, p, x0, gid.y);
+    float3 rgb2 = (x0 + 1 < p.outWidth) ? warp_sample_rgb(src, mapUV, p, x0 + 1, gid.y) : rgb1;
+    emit_uyvy(dst, p.outWidth, gid, rgb1, rgb2);
+}
+
+kernel void warp_rgba_to_p216(device const float* src [[buffer(0)]],
+                              device ushort* dst [[buffer(1)]],
+                              constant WarpParams& p [[buffer(2)]],
+                              device const float* mapUV [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint x0 = gid.x * 2;
+    if (x0 >= p.outWidth || gid.y >= p.outHeight) return;
+
+    float3 rgb1 = warp_sample_rgb(src, mapUV, p, x0, gid.y);
+    float3 rgb2 = (x0 + 1 < p.outWidth) ? warp_sample_rgb(src, mapUV, p, x0 + 1, gid.y) : rgb1;
+    emit_p216(dst, p.outWidth, p.outHeight, gid, x0, rgb1, rgb2);
 }
 )";
 
@@ -395,6 +516,8 @@ void metal_gpu_shutdown(MetalGPUContextRef context) {
         for (auto& entry : context->fastPathByDevice) {
             [entry.second.uyvyPipeline release];
             [entry.second.p216Pipeline release];
+            if (entry.second.warpUyvyPipeline) [entry.second.warpUyvyPipeline release];
+            if (entry.second.warpP216Pipeline) [entry.second.warpP216Pipeline release];
             if (entry.second.staging) [entry.second.staging release];
         }
         context->fastPathByDevice.clear();
@@ -430,6 +553,8 @@ static MetalFastPathState* fastPathForDevice(MetalGPUContextRef context, id<MTLD
 
     id<MTLFunction> uyvyFunction = [library newFunctionWithName:@"downscale_rgba_to_uyvy"];
     id<MTLFunction> p216Function = [library newFunctionWithName:@"downscale_rgba_to_p216"];
+    id<MTLFunction> warpUyvyFunction = [library newFunctionWithName:@"warp_rgba_to_uyvy"];
+    id<MTLFunction> warpP216Function = [library newFunctionWithName:@"warp_rgba_to_p216"];
     MetalFastPathState state = {};
     if (uyvyFunction && p216Function) {
         state.uyvyPipeline = [device newComputePipelineStateWithFunction:uyvyFunction error:&error];
@@ -437,8 +562,27 @@ static MetalFastPathState* fastPathForDevice(MetalGPUContextRef context, id<MTLD
             state.p216Pipeline = [device newComputePipelineStateWithFunction:p216Function error:&error];
         }
     }
+    // Warp pipelines fail independently: without them warp submits refuse
+    // (callers fall back to the CPU warp) while the plain downscale keeps
+    // streaming.
+    if (state.p216Pipeline && warpUyvyFunction && warpP216Function) {
+        NSError* warpError = nil;
+        state.warpUyvyPipeline = [device newComputePipelineStateWithFunction:warpUyvyFunction error:&warpError];
+        if (state.warpUyvyPipeline) {
+            state.warpP216Pipeline = [device newComputePipelineStateWithFunction:warpP216Function error:&warpError];
+        }
+        if (!state.warpUyvyPipeline || !state.warpP216Pipeline) {
+            METAL_LOG("Fast path: failed to create STMap warp pipelines: %{public}s",
+                      warpError ? [[warpError localizedDescription] UTF8String] : "unknown");
+            if (state.warpUyvyPipeline) [state.warpUyvyPipeline release];
+            state.warpUyvyPipeline = nil;
+            state.warpP216Pipeline = nil;
+        }
+    }
     if (uyvyFunction) [uyvyFunction release];
     if (p216Function) [p216Function release];
+    if (warpUyvyFunction) [warpUyvyFunction release];
+    if (warpP216Function) [warpP216Function release];
     [library release];
 
     if (!state.uyvyPipeline || !state.p216Pipeline) {
@@ -446,11 +590,63 @@ static MetalFastPathState* fastPathForDevice(MetalGPUContextRef context, id<MTLD
                   error ? [[error localizedDescription] UTF8String] : "missing kernel function");
         if (state.uyvyPipeline) [state.uyvyPipeline release];
         if (state.p216Pipeline) [state.p216Pipeline release];
+        if (state.warpUyvyPipeline) [state.warpUyvyPipeline release];
+        if (state.warpP216Pipeline) [state.warpP216Pipeline release];
         return nullptr;
     }
 
     auto result = context->fastPathByDevice.emplace(key, state);
     return &result.first->second;
+}
+
+// Pipeline for one conversion: the plain fused downscale, or the STMap warp
+// variant when a map is bound. nil = this combination can't run on the device.
+static id<MTLComputePipelineState> convertPipeline(MetalFastPathState* fastPath, bool warp, bool p216)
+{
+    if (warp) {
+        return p216 ? fastPath->warpP216Pipeline : fastPath->warpUyvyPipeline;
+    }
+    return p216 ? fastPath->p216Pipeline : fastPath->uyvyPipeline;
+}
+
+// Bind the geometry params (and for warp the map buffer) for either kernel
+// family. Buffer indices: 0=src, 1=dst, 2=params, 3=map (warp only).
+static void encodeConvertParams(id<MTLComputeCommandEncoder> encoder,
+                                int srcWidth, int srcHeight, int srcRowFloats,
+                                int divisor, int outWidth, int outHeight,
+                                id<MTLBuffer> mapBuffer, int mapWidth, int mapHeight)
+{
+    if (mapBuffer) {
+        MetalWarpParams params;
+        params.srcWidth = (uint32_t)srcWidth;
+        params.srcHeight = (uint32_t)srcHeight;
+        params.srcRowFloats = (uint32_t)srcRowFloats;
+        params.outWidth = (uint32_t)outWidth;
+        params.outHeight = (uint32_t)outHeight;
+        params.divisor = (uint32_t)divisor;
+        params.mapWidth = (uint32_t)mapWidth;
+        params.mapHeight = (uint32_t)mapHeight;
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        [encoder setBuffer:mapBuffer offset:0 atIndex:3];
+    } else {
+        MetalDownscaleParams params;
+        params.srcWidth = (uint32_t)srcWidth;
+        params.srcHeight = (uint32_t)srcHeight;
+        params.srcRowFloats = (uint32_t)srcRowFloats;
+        params.outWidth = (uint32_t)outWidth;
+        params.outHeight = (uint32_t)outHeight;
+        params.divisor = (uint32_t)divisor;
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+    }
+}
+
+// A usable map buffer holds mapWidth*mapHeight interleaved (u,v) float pairs.
+static bool validWarpMap(id<MTLBuffer> mapBuffer, int mapWidth, int mapHeight)
+{
+    if (!mapBuffer || mapWidth <= 0 || mapHeight <= 0) return false;
+    const size_t neededBytes =
+        static_cast<size_t>(mapWidth) * static_cast<size_t>(mapHeight) * 2 * sizeof(float);
+    return mapBuffer.length >= neededBytes;
 }
 
 static id<MTLBuffer> ensureStagingBuffer(MetalFastPathState* fastPath, id<MTLDevice> device, size_t byteCount)
@@ -470,8 +666,10 @@ static id<MTLBuffer> ensureStagingBuffer(MetalFastPathState* fastPath, id<MTLDev
     return fastPath->staging;
 }
 
-static bool runDownscaleKernel(MetalGPUContextRef context, void* commandQueue, void* srcMetalBuffer,
-                               int srcWidth, int srcHeight, int srcRowFloats, int divisor,
+static bool runConvertKernel(MetalGPUContextRef context, void* commandQueue, void* srcMetalBuffer,
+                               int srcWidth, int srcHeight, int srcRowFloats,
+                               void* mapMetalBuffer, int mapWidth, int mapHeight,
+                               int divisor,
                                int outWidth, int outHeight,
                                bool p216, void* cpuOut, size_t outBytes, const char* label)
 {
@@ -480,6 +678,11 @@ static bool runDownscaleKernel(MetalGPUContextRef context, void* commandQueue, v
     // back to the CPU path (pre-fast-path behavior for such sources).
     if (srcWidth <= 0 || srcHeight <= 0 || srcRowFloats < srcWidth * 4 ||
         divisor <= 0 || outWidth < 2 || (outWidth % 2) != 0 || outHeight <= 0) {
+        return false;
+    }
+    id<MTLBuffer> mapBuffer = static_cast<id<MTLBuffer>>(mapMetalBuffer);
+    const bool warp = (mapMetalBuffer != nullptr);
+    if (warp && !validWarpMap(mapBuffer, mapWidth, mapHeight)) {
         return false;
     }
 
@@ -503,6 +706,8 @@ static bool runDownscaleKernel(MetalGPUContextRef context, void* commandQueue, v
 
         MetalFastPathState* fastPath = fastPathForDevice(context, device);
         if (!fastPath) return false;
+        id<MTLComputePipelineState> pipeline = convertPipeline(fastPath, warp, p216);
+        if (!pipeline) return false;
 
         id<MTLBuffer> staging = ensureStagingBuffer(fastPath, device, outBytes);
         if (!staging) {
@@ -510,20 +715,13 @@ static bool runDownscaleKernel(MetalGPUContextRef context, void* commandQueue, v
             return false;
         }
 
-        MetalDownscaleParams params;
-        params.srcWidth = (uint32_t)srcWidth;
-        params.srcHeight = (uint32_t)srcHeight;
-        params.srcRowFloats = (uint32_t)srcRowFloats;
-        params.outWidth = (uint32_t)outWidth;
-        params.outHeight = (uint32_t)outHeight;
-        params.divisor = (uint32_t)divisor;
-
         id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        [encoder setComputePipelineState:(p216 ? fastPath->p216Pipeline : fastPath->uyvyPipeline)];
+        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:srcBuffer offset:0 atIndex:0];
         [encoder setBuffer:staging offset:0 atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        encodeConvertParams(encoder, srcWidth, srcHeight, srcRowFloats,
+                            divisor, outWidth, outHeight, warp ? mapBuffer : nil, mapWidth, mapHeight);
 
         MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
         MTLSize threadgroupsPerGrid = MTLSizeMake(
@@ -563,8 +761,8 @@ bool metal_gpu_buffer_downscale_to_uyvy(MetalGPUContextRef context,
                                         unsigned char* uyvyOut)
 {
     const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2;
-    return runDownscaleKernel(context, commandQueue, srcMetalBuffer,
-                              srcWidth, srcHeight, srcRowFloats, divisor,
+    return runConvertKernel(context, commandQueue, srcMetalBuffer,
+                              srcWidth, srcHeight, srcRowFloats, nullptr, 0, 0, divisor,
                               outWidth, outHeight, false, uyvyOut, outBytes, "UYVY");
 }
 
@@ -577,27 +775,69 @@ bool metal_gpu_buffer_downscale_to_p216(MetalGPUContextRef context,
                                         unsigned short* p216Out)
 {
     const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2 * sizeof(unsigned short);
-    return runDownscaleKernel(context, commandQueue, srcMetalBuffer,
-                              srcWidth, srcHeight, srcRowFloats, divisor,
+    return runConvertKernel(context, commandQueue, srcMetalBuffer,
+                              srcWidth, srcHeight, srcRowFloats, nullptr, 0, 0, divisor,
                               outWidth, outHeight, true, p216Out, outBytes, "P216");
 }
 
+bool metal_gpu_buffer_warp_to_uyvy(MetalGPUContextRef context,
+                                   void* commandQueue,
+                                   void* srcMetalBuffer,
+                                   int srcWidth, int srcHeight, int srcRowFloats,
+                                   void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                   int divisor,
+                                   int outWidth, int outHeight,
+                                   unsigned char* uyvyOut)
+{
+    if (!mapMetalBuffer) return false;
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2;
+    return runConvertKernel(context, commandQueue, srcMetalBuffer,
+                              srcWidth, srcHeight, srcRowFloats,
+                              mapMetalBuffer, mapWidth, mapHeight, divisor,
+                              outWidth, outHeight, false, uyvyOut, outBytes, "warp UYVY");
+}
+
+bool metal_gpu_buffer_warp_to_p216(MetalGPUContextRef context,
+                                   void* commandQueue,
+                                   void* srcMetalBuffer,
+                                   int srcWidth, int srcHeight, int srcRowFloats,
+                                   void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                   int divisor,
+                                   int outWidth, int outHeight,
+                                   unsigned short* p216Out)
+{
+    if (!mapMetalBuffer) return false;
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2 * sizeof(unsigned short);
+    return runConvertKernel(context, commandQueue, srcMetalBuffer,
+                              srcWidth, srcHeight, srcRowFloats,
+                              mapMetalBuffer, mapWidth, mapHeight, divisor,
+                              outWidth, outHeight, true, p216Out, outBytes, "warp P216");
+}
+
 // Non-blocking variant (issue #5, v1.6.0): encode + commit only. See the
-// header contract. Validation mirrors runDownscaleKernel so both paths refuse
+// header contract. Validation mirrors runConvertKernel so both paths refuse
 // the same sources; refusals are typed (BUSY vs INVALID) because the caller's
 // correct reaction differs — drop vs fall back to the blocking readback.
-metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
-                                               void* commandQueue,
-                                               void* srcMetalBuffer,
-                                               int srcWidth, int srcHeight, int srcRowFloats,
-                                               int divisor,
-                                               int outWidth, int outHeight,
-                                               bool p216,
-                                               metal_downscale_done_fn done, void* user)
+// mapMetalBuffer selects the STMap warp kernels (issue #7); null = plain
+// downscale.
+static metal_submit_status submitConvertInternal(MetalGPUContextRef context,
+                                                 void* commandQueue,
+                                                 void* srcMetalBuffer,
+                                                 int srcWidth, int srcHeight, int srcRowFloats,
+                                                 void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                                 int divisor,
+                                                 int outWidth, int outHeight,
+                                                 bool p216,
+                                                 metal_downscale_done_fn done, void* user)
 {
     if (!context || !srcMetalBuffer || !done) return METAL_SUBMIT_INVALID;
     if (srcWidth <= 0 || srcHeight <= 0 || srcRowFloats < srcWidth * 4 ||
         divisor <= 0 || outWidth < 2 || (outWidth % 2) != 0 || outHeight <= 0) {
+        return METAL_SUBMIT_INVALID;
+    }
+    id<MTLBuffer> mapBuffer = static_cast<id<MTLBuffer>>(mapMetalBuffer);
+    const bool warp = (mapMetalBuffer != nullptr);
+    if (warp && !validWarpMap(mapBuffer, mapWidth, mapHeight)) {
         return METAL_SUBMIT_INVALID;
     }
     const size_t outBytes = static_cast<size_t>(outWidth) * outHeight * 2 *
@@ -619,6 +859,8 @@ metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
 
         MetalFastPathState* fastPath = fastPathForDevice(context, device);
         if (!fastPath) return METAL_SUBMIT_INVALID;
+        id<MTLComputePipelineState> pipeline = convertPipeline(fastPath, warp, p216);
+        if (!pipeline) return METAL_SUBMIT_INVALID;
 
         // Claim a free slot; none free = GPU behind or consumer backlogged —
         // the caller drops this frame (backpressure by dropping, never blocking).
@@ -647,20 +889,13 @@ metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
             }
         }
 
-        MetalDownscaleParams params;
-        params.srcWidth = (uint32_t)srcWidth;
-        params.srcHeight = (uint32_t)srcHeight;
-        params.srcRowFloats = (uint32_t)srcRowFloats;
-        params.outWidth = (uint32_t)outWidth;
-        params.outHeight = (uint32_t)outHeight;
-        params.divisor = (uint32_t)divisor;
-
         id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        [encoder setComputePipelineState:(p216 ? fastPath->p216Pipeline : fastPath->uyvyPipeline)];
+        [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:srcBuffer offset:0 atIndex:0];
         [encoder setBuffer:slot->buffer offset:0 atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        encodeConvertParams(encoder, srcWidth, srcHeight, srcRowFloats,
+                            divisor, outWidth, outHeight, warp ? mapBuffer : nil, mapWidth, mapHeight);
 
         MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
         MTLSize threadgroupsPerGrid = MTLSizeMake(
@@ -685,6 +920,38 @@ metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
         [commandBuffer commit]; // no wait — that's the whole point
         return METAL_SUBMIT_OK;
     }
+}
+
+metal_submit_status metal_gpu_downscale_submit(MetalGPUContextRef context,
+                                               void* commandQueue,
+                                               void* srcMetalBuffer,
+                                               int srcWidth, int srcHeight, int srcRowFloats,
+                                               int divisor,
+                                               int outWidth, int outHeight,
+                                               bool p216,
+                                               metal_downscale_done_fn done, void* user)
+{
+    return submitConvertInternal(context, commandQueue, srcMetalBuffer,
+                                 srcWidth, srcHeight, srcRowFloats,
+                                 nullptr, 0, 0, divisor,
+                                 outWidth, outHeight, p216, done, user);
+}
+
+metal_submit_status metal_gpu_warp_submit(MetalGPUContextRef context,
+                                          void* commandQueue,
+                                          void* srcMetalBuffer,
+                                          int srcWidth, int srcHeight, int srcRowFloats,
+                                          void* mapMetalBuffer, int mapWidth, int mapHeight,
+                                          int divisor,
+                                          int outWidth, int outHeight,
+                                          bool p216,
+                                          metal_downscale_done_fn done, void* user)
+{
+    if (!mapMetalBuffer) return METAL_SUBMIT_INVALID;
+    return submitConvertInternal(context, commandQueue, srcMetalBuffer,
+                                 srcWidth, srcHeight, srcRowFloats,
+                                 mapMetalBuffer, mapWidth, mapHeight, divisor,
+                                 outWidth, outHeight, p216, done, user);
 }
 
 void metal_gpu_downscale_release(MetalGPUContextRef context, void* slot)
@@ -782,6 +1049,33 @@ void* metal_gpu_create_shared_buffer(MetalGPUContextRef context, const void* ini
             ? [context->device newBufferWithBytes:initialData length:byteCount options:MTLResourceStorageModeShared]
             : [context->device newBufferWithLength:byteCount options:MTLResourceStorageModeShared];
         return (void*)buffer; // retained (new*); release with metal_gpu_release_buffer
+    }
+}
+
+void* metal_gpu_create_shared_buffer_for_queue(MetalGPUContextRef context, void* commandQueue,
+                                               const void* initialData, size_t byteCount)
+{
+    if (byteCount == 0) return nullptr;
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = commandQueue
+            ? static_cast<id<MTLCommandQueue>>(commandQueue)
+            : (context ? context->commandQueue : nil);
+        if (!queue) return nullptr;
+        id<MTLDevice> device = queue.device;
+        id<MTLBuffer> buffer = initialData
+            ? [device newBufferWithBytes:initialData length:byteCount options:MTLResourceStorageModeShared]
+            : [device newBufferWithLength:byteCount options:MTLResourceStorageModeShared];
+        return (void*)buffer; // retained (new*); release with metal_gpu_release_buffer
+    }
+}
+
+void* metal_gpu_queue_device(MetalGPUContextRef context, void* commandQueue)
+{
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = commandQueue
+            ? static_cast<id<MTLCommandQueue>>(commandQueue)
+            : (context ? context->commandQueue : nil);
+        return queue ? (void*)queue.device : nullptr;
     }
 }
 
