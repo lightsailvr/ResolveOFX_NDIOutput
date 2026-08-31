@@ -1,0 +1,7 @@
+{
+  "name": "resolveofx-ndioutput",
+  "description": "Windows build dependencies for the NDI Output OFX plugin (zlib for the EXR/STMap reader)",
+  "dependencies": [
+    "zlib"
+  ]
+}

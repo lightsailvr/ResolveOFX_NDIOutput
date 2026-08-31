@@ -1,177 +1,160 @@
-cmake_minimum_required(VERSION 3.18)
-project(NDIOutput LANGUAGES CXX CUDA)
+# Windows build harness for the NDI Output OFX plugin (spec decision 8:
+# CMake + VS2022; docs/windows-port-spec.md). The Makefile remains the macOS
+# harness; BUILD.md is the contract between the two.
+#
+# CPU-only for now — the CUDA module (ticket #22) will add
+# enable_language(CUDA) and the kernel sources behind the same GPU-module
+# contract the Metal module implements.
+#
+# Configure + build (see BUILD.md, Windows section):
+#   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+#         -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+#   cmake --build build --config Release
+#   ctest --test-dir build -C Release --output-on-failure
+#   cmake --install build --config Release --prefix stage
 
-# Set C++ standard
+cmake_minimum_required(VERSION 3.21)
+project(NDIOutput LANGUAGES CXX)
+
+if(NOT WIN32)
+    message(FATAL_ERROR
+        "CMake drives the Windows build only; use the Makefile on macOS "
+        "(see BUILD.md).")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Set CUDA standard
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Version management
-file(READ "VERSION" VERSION_STRING)
-string(STRIP "${VERSION_STRING}" VERSION_STRING)
-
-# Platform-specific settings
-if(WIN32)
-    # Windows-specific settings
-    set(NDI_SDK_PATH "C:/Program Files/NDI/NDI 6 Advanced SDK" CACHE PATH "Path to NDI Advanced SDK")
-    set(NDI_INCLUDE "${NDI_SDK_PATH}/Include")
-    set(NDI_LIB "${NDI_SDK_PATH}/Lib/x64/Processing.NDI.Lib.x64.lib")
-    
-    # CUDA settings for Windows
-    find_package(CUDAToolkit REQUIRED)
-    
-    # Compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
-    
-    # Define Windows macros
-    add_definitions(-D_WIN32 -DWIN32 -D_WINDOWS)
-    
-elseif(APPLE)
-    # macOS-specific settings
-    set(NDI_SDK_PATH "/Library/NDI Advanced SDK for Apple" CACHE PATH "Path to NDI Advanced SDK")
-    set(NDI_INCLUDE "${NDI_SDK_PATH}/include")
-    set(NDI_LIB "${NDI_SDK_PATH}/lib/macOS/libndi_advanced.dylib")
-    
-    # Compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden")
-    
-    # Metal framework
-    find_library(METAL_FRAMEWORK Metal)
-    find_library(METALKIT_FRAMEWORK MetalKit)
-    find_library(FOUNDATION_FRAMEWORK Foundation)
-    
-else()
-    # Linux-specific settings
-    set(NDI_SDK_PATH "/usr/local/include/ndi" CACHE PATH "Path to NDI SDK")
-    set(NDI_INCLUDE "${NDI_SDK_PATH}")
-    set(NDI_LIB "ndi")
-    
-    # Compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden")
+# --- Version guard -----------------------------------------------------------
+# VERSION and the #defines in src/NDIOutputPlugin.cpp are synced by
+# scripts/set_version.sh / increment_version.sh; the source is authoritative
+# for the compiled plugin (defining kPluginVersionString here as well was the
+# old scaffold's redefinition collision). Fail configure on drift instead.
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" NDI_VERSION_FILE)
+string(STRIP "${NDI_VERSION_FILE}" NDI_VERSION_FILE)
+file(STRINGS "${CMAKE_SOURCE_DIR}/src/NDIOutputPlugin.cpp" NDI_VERSION_LINE
+     REGEX "#define kPluginVersionString")
+string(REGEX MATCH "\"([0-9]+\\.[0-9]+\\.[0-9]+)\"" _unused "${NDI_VERSION_LINE}")
+set(NDI_VERSION_SOURCE "${CMAKE_MATCH_1}")
+if(NOT NDI_VERSION_FILE STREQUAL NDI_VERSION_SOURCE)
+    message(FATAL_ERROR
+        "VERSION file says ${NDI_VERSION_FILE} but src/NDIOutputPlugin.cpp "
+        "defines kPluginVersionString ${NDI_VERSION_SOURCE}. Run "
+        "scripts/set_version.sh to re-sync (never edit either by hand).")
 endif()
 
-# Include directories
-include_directories(
+# --- Dependencies ------------------------------------------------------------
+# zlib via vcpkg (spec decision 8): pass the vcpkg toolchain file; vcpkg.json
+# pins the dependency list.
+find_package(ZLIB REQUIRED)
+
+# NDI Advanced SDK: use the real installation when present (required for any
+# binary that will actually stream; release builds must use an SDK <= 30 days
+# old). Without it — hosted CI, where the access-gated SDK cannot live — fall
+# back to the vendored MIT-licensed headers plus a stub import library built
+# from the checked-in export list, which proves the plugin compiles and links
+# without shipping a byte of NDI code.
+set(NDI_SDK_PATH "C:/Program Files/NDI/NDI 6 Advanced SDK"
+    CACHE PATH "Path to the NDI Advanced SDK")
+set(NDI_DLL_NAME "Processing.NDI.Lib.Advanced.x64")
+
+if(EXISTS "${NDI_SDK_PATH}/Include/Processing.NDI.Lib.h")
+    message(STATUS "NDI: using installed Advanced SDK at ${NDI_SDK_PATH}")
+    set(NDI_INCLUDE_DIR "${NDI_SDK_PATH}/Include")
+    set(NDI_LINK_LIB "${NDI_SDK_PATH}/Lib/x64/${NDI_DLL_NAME}.lib")
+    set(NDI_USING_STUB FALSE)
+else()
+    message(STATUS "NDI: SDK not found - linking against the stub import library (CI mode)")
+    set(NDI_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/ndi/include")
+    set(NDI_USING_STUB TRUE)
+
+    # Generate one empty function per exported name; the .def attached to the
+    # stub target turns them into exports, and linking the target gives the
+    # plugin a normal import library for ${NDI_DLL_NAME}.dll.
+    set(NDI_DEF_FILE "${CMAKE_SOURCE_DIR}/third_party/ndi/${NDI_DLL_NAME}.def")
+    file(STRINGS "${NDI_DEF_FILE}" NDI_DEF_LINES)
+    set(NDI_STUB_SOURCE "// Generated from ${NDI_DLL_NAME}.def - do not edit.\n")
+    set(NDI_IN_EXPORTS FALSE)
+    foreach(_line IN LISTS NDI_DEF_LINES)
+        string(STRIP "${_line}" _line)
+        if(_line STREQUAL "EXPORTS")
+            set(NDI_IN_EXPORTS TRUE)
+        elseif(NDI_IN_EXPORTS AND _line MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+            string(APPEND NDI_STUB_SOURCE "void ${_line}(void) {}\n")
+        endif()
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/ndi_stub.c" "${NDI_STUB_SOURCE}")
+
+    add_library(ndi_stub SHARED "${CMAKE_BINARY_DIR}/ndi_stub.c" "${NDI_DEF_FILE}")
+    set_target_properties(ndi_stub PROPERTIES
+        OUTPUT_NAME "${NDI_DLL_NAME}"
+        PREFIX "")
+endif()
+
+# --- Shared compile settings -------------------------------------------------
+# /utf-8: sources hold UTF-8 string literals (log emoji, path tests); without
+# it MSVC decodes them through the local ANSI code page.
+add_compile_options(/W3 /utf-8 /MP)
+add_compile_definitions(_CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+
+# --- The plugin --------------------------------------------------------------
+add_library(NDIOutput SHARED src/NDIOutputPlugin.cpp)
+set_target_properties(NDIOutput PROPERTIES
+    OUTPUT_NAME "NDIOutput"
+    SUFFIX ".ofx"
+    PREFIX "")
+target_include_directories(NDIOutput PRIVATE
     openfx/include
-    ${NDI_INCLUDE}
     src
-)
+    "${NDI_INCLUDE_DIR}")
+target_link_libraries(NDIOutput PRIVATE ZLIB::ZLIB)
 
-# Source files
-set(SOURCES
-    src/NDIOutputPlugin.cpp
-)
-
-# Platform-specific source files
-if(WIN32)
-    list(APPEND SOURCES src/CudaGPUAcceleration.cu)
-elseif(APPLE)
-    list(APPEND SOURCES src/MetalGPUAcceleration.mm)
-endif()
-
-# Create the plugin library
-if(WIN32)
-    add_library(NDIOutput SHARED ${SOURCES})
-    set_target_properties(NDIOutput PROPERTIES
-        SUFFIX ".ofx"
-        PREFIX ""
-    )
-elseif(APPLE)
-    add_library(NDIOutput MODULE ${SOURCES})
-    set_target_properties(NDIOutput PROPERTIES
-        BUNDLE TRUE
-        BUNDLE_EXTENSION "ofx.bundle"
-        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Info.plist"
-    )
+# Delay-load the NDI DLL (spec decision 12): Windows' loader never searches a
+# DLL's own folder for load-time imports of another DLL, so a static import
+# would make the plugin silently fail to load on machines without an NDI
+# runtime. Delay-loading defers resolution to first call; the module-relative
+# AddDllDirectory call lands with the first-stream ticket (#21).
+if(NDI_USING_STUB)
+    target_link_libraries(NDIOutput PRIVATE ndi_stub)
 else()
-    add_library(NDIOutput SHARED ${SOURCES})
-    set_target_properties(NDIOutput PROPERTIES
-        SUFFIX ".ofx"
-        PREFIX ""
-    )
+    target_link_libraries(NDIOutput PRIVATE "${NDI_LINK_LIB}")
+endif()
+target_link_libraries(NDIOutput PRIVATE delayimp)
+target_link_options(NDIOutput PRIVATE "/DELAYLOAD:${NDI_DLL_NAME}.dll")
+
+# --- Portable unit tests (LEARNINGS.md Tier 0; `make test` on macOS) --------
+enable_testing()
+set(NDI_PORTABLE_TESTS
+    test_render_probe
+    test_stream_resolution
+    test_stereo_pair
+    test_platform_paths
+    test_stmap
+    test_brawmap)
+foreach(_t IN LISTS NDI_PORTABLE_TESTS)
+    add_executable(${_t} tests/${_t}.cpp)
+    target_include_directories(${_t} PRIVATE src)
+    add_test(NAME ${_t} COMMAND ${_t})
+    # Fixture paths in the tests are relative to the repo root.
+    set_tests_properties(${_t} PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endforeach()
+target_link_libraries(test_stmap PRIVATE ZLIB::ZLIB)
+target_link_libraries(test_brawmap PRIVATE ZLIB::ZLIB)
+
+# --- Install: the OFX bundle tree (spec decision 16) -------------------------
+# NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx, installed under
+# C:\Program Files\Common Files\OFX\Plugins (the flat install in the old
+# scaffold was wrong). The NDI runtime DLL and its licenses file ride along
+# when the real SDK is present (spec decisions 11 and 13); the installer
+# ticket (#23) owns end-user packaging.
+set(NDI_BUNDLE_BIN_DIR "NDIOutput.ofx.bundle/Contents/Win64")
+install(TARGETS NDIOutput RUNTIME DESTINATION "${NDI_BUNDLE_BIN_DIR}")
+if(NOT NDI_USING_STUB)
+    install(FILES
+        "${NDI_SDK_PATH}/Bin/x64/${NDI_DLL_NAME}.dll"
+        "${NDI_SDK_PATH}/Bin/x64/Processing.NDI.Lib.Licenses.txt"
+        DESTINATION "${NDI_BUNDLE_BIN_DIR}")
 endif()
 
-# Link libraries
-if(WIN32)
-    target_link_libraries(NDIOutput
-        ${NDI_LIB}
-        CUDA::cudart
-        CUDA::cuda_driver
-    )
-elseif(APPLE)
-    target_link_libraries(NDIOutput
-        ${NDI_LIB}
-        ${METAL_FRAMEWORK}
-        ${METALKIT_FRAMEWORK}
-        ${FOUNDATION_FRAMEWORK}
-    )
-else()
-    target_link_libraries(NDIOutput
-        ${NDI_LIB}
-        GL
-    )
-endif()
-
-# Compiler definitions
-target_compile_definitions(NDIOutput PRIVATE
-    kPluginVersionString="${VERSION_STRING}"
-)
-
-# CUDA-specific settings
-if(WIN32)
-    set_property(TARGET NDIOutput PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-    set_property(TARGET NDIOutput PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-    
-    # Set CUDA architecture (adjust based on target GPUs)
-    set_property(TARGET NDIOutput PROPERTY CUDA_ARCHITECTURES "52;61;75;86")
-endif()
-
-# Installation
-if(WIN32)
-    # Windows installation
-    install(TARGETS NDIOutput
-        DESTINATION "C:/Program Files/Common Files/OFX/Plugins"
-    )
-elseif(APPLE)
-    # macOS installation
-    install(TARGETS NDIOutput
-        DESTINATION "/Library/OFX/Plugins"
-    )
-else()
-    # Linux installation
-    install(TARGETS NDIOutput
-        DESTINATION "/usr/OFX/Plugins"
-    )
-endif()
-
-# Copy NDI library on Windows
-if(WIN32)
-    # Find NDI runtime DLL
-    find_file(NDI_DLL
-        NAMES "Processing.NDI.Lib.x64.dll"
-        PATHS "${NDI_SDK_PATH}/Bin/x64"
-        NO_DEFAULT_PATH
-    )
-    
-    if(NDI_DLL)
-        install(FILES ${NDI_DLL}
-            DESTINATION "C:/Program Files/Common Files/OFX/Plugins"
-        )
-    endif()
-endif()
-
-# Print configuration summary
-message(STATUS "NDI Output Plugin Configuration:")
-message(STATUS "  Version: ${VERSION_STRING}")
-message(STATUS "  Platform: ${CMAKE_SYSTEM_NAME}")
-message(STATUS "  NDI SDK Path: ${NDI_SDK_PATH}")
-if(WIN32)
-    message(STATUS "  CUDA Support: Enabled")
-    message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
-elseif(APPLE)
-    message(STATUS "  Metal Support: Enabled")
-endif() 
+message(STATUS "NDI Output ${NDI_VERSION_FILE} - Windows CPU-only build "
+               "(CUDA lands with ticket #22)")

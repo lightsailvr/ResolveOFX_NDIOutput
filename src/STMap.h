@@ -44,6 +44,8 @@
 
 #include <zlib.h>
 
+#include "PlatformPaths.h"
+
 namespace ndi_stmap {
 
 // Caps applied before any allocation so a hostile header can't OOM the host.
@@ -186,7 +188,7 @@ inline bool loadSTMapEXR(const char* path, STMapImage* out, std::string* error)
         return false;
     };
 
-    std::FILE* f = std::fopen(path, "rb");
+    std::FILE* f = ndi_path::fopenUtf8(path, "rb");
     if (!f) {
         return fail(std::string("cannot open '") + path + "'");
     }
