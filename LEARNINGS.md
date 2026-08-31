@@ -289,6 +289,20 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Windows CI — plugin + all 6 portable tests compile and pass under MSVC; macOS `make test` unchanged.
 **Rule:** include what you use (never trust transitive STL includes), and treat `/utf-8` as mandatory for any MSVC target whose sources hold non-ASCII literals.
 
+### 2026-08-30 — vcpkg's dynamic zlib loads fine everywhere except inside Resolve (ticket #21)
+**Symptom:** the staged bundle's `NDIOutput.ofx` failed a `LOAD_LIBRARY_SEARCH_SYSTEM32`-only load probe (error 126) — meaning Resolve's Effects Library scan would silently drop the plugin — while every unit test and CI job stayed green.
+**Root cause:** vcpkg's default `x64-windows` triplet builds zlib as a DLL (`z.dll`). Windows never searches a DLL's own folder for that DLL's load-time imports, so `z.dll` staged beside the plugin resolves in test runs (the test exe's directory IS searched) but never inside Resolve — the exact loader trap spec decision 12 dodges for the NDI DLL, reintroduced by the build system one dependency over.
+**Fix:** pin `VCPKG_TARGET_TRIPLET=x64-windows-static-md` before `project()` (zlib links static; the NDI runtime stays a DLL — its license requires shipping the vendor binary). Guarded forever by `test_plugin_delayload`, which loads the freshly built `.ofx` from a bare temp dir with a System32-only import search and fails on ANY stray load-time import.
+**Validated by:** Tier 0 — the probe failed before the triplet change and passes after; full suite green. (Found before the first Tier 1 install, which would otherwise have been a silent no-show.)
+**Rule:** an OFX plugin may have NO load-time imports outside System32 — verify with a `LOAD_LIBRARY_SEARCH_SYSTEM32` load of the built binary (that one flag simulates Resolve's scanner), not with tests whose own exe directory hides the problem.
+
+### 2026-08-30 — AddDllDirectory can't rescue a delay-loaded import; preload by full path instead (ticket #21)
+**Symptom:** (design, not a runtime failure) spec decision 12 sketched "delay-load + module-relative `AddDllDirectory`" for resolving the bundled NDI DLL. Implementing it showed the sketch doesn't work as written.
+**Root cause:** `AddDllDirectory` only affects loads that pass `LOAD_LIBRARY_SEARCH_USER_DIRS`, and the delay-load helper's implicit resolution is a plain by-name `LoadLibrary` with no flags. The only way to make it consult user directories is `SetDefaultDllDirectories` — which rewires DLL resolution for the ENTIRE process, i.e. for every subsequent load Resolve itself performs. A guest must never mutate its host's loader state.
+**Fix:** `src/NDIRuntimeLoader.h` instead loads the DLL itself, by full module-relative path (`GetModuleHandleExW(FROM_ADDRESS)` → `GetModuleFileNameW` → sibling path → `LoadLibraryExW`), before the first NDI call: the delay-load helper's later by-name lookup then hits the already-loaded module and never searches disk. System-search fallback keeps machines with a real NDI runtime working; total failure logs both Win32 error codes and leaves the plugin alive as a pass-through (an unresolved delay-load call would instead raise SEH inside Resolve).
+**Validated by:** Tier 0 — `test_ndi_loader` (path derivation + fallback plumbing) and `test_plugin_delayload` (import stays delay-loaded and lazy) green; Tier 1–2 verification on the no-NDI machine pending.
+**Rule:** inside someone else's process, resolve your own delay-loaded DLLs by preloading them from a full path — never via process-global search-path mutation (`SetDefaultDllDirectories`, `SetDllDirectory`, PATH edits).
+
 ---
 
 ## Template for new entries

@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port restarting on branch `windows-port`, **does not build yet** (see [status](#windows-cuda--status-restarting-on-windows-port))
+- **Windows** — port in progress on branch `windows-port`: CPU-only build + tests green in CI, first-stream plumbing landed (ticket #21); CUDA pending (see [status](#windows--status-cpu-only-build-green-in-ci-cuda-pending-ticket-22))
 
 ---
 
@@ -147,7 +147,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ctest` runs the same portable unit suite as `make test` on macOS (plus `test_platform_paths`, the UTF-8→UTF-16 path-shim tests). CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+`ctest` runs the same portable unit suite as `make test` on macOS (plus `test_plugin_delayload`, Windows-only: loads the built `.ofx` with a System32-only import search — what Resolve's plugin scanner amounts to — so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library). CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
 
 ### Install (Tier 1)
 
@@ -155,9 +155,20 @@ ctest --test-dir build -C Release --output-on-failure
 cmake --install build --config Release --prefix stage
 ```
 
-produces the spec bundle tree `stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx` (with `Processing.NDI.Lib.Advanced.x64.dll` + its licenses file beside the binary when the real SDK is present). Copy `NDIOutput.ofx.bundle` into `C:\Program Files\Common Files\OFX\Plugins\` (elevated), fully restart Resolve, and verify the stream in **Studio Monitor** (free NDI Tools) — ideally from a second machine, so the firewall prompt is part of the test. The NDI import is **delay-loaded** (Windows' default search order never finds a DLL sitting next to the `.ofx`; the module-relative `AddDllDirectory` call lands with ticket #21).
+produces the spec bundle tree `stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx` (with `Processing.NDI.Lib.Advanced.x64.dll` + its licenses file beside the binary when the real SDK is present — a stub-linked CI-style build stages no DLL and will not stream). Then, from an **elevated** PowerShell (UAC prompts spawned by automation shells can auto-cancel; open the terminal elevated yourself):
 
-Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (same delete-with-Resolve-closed rescan procedure as macOS).
+```powershell
+.\scripts\install_windows.ps1              # copies the bundle into C:\Program Files\Common Files\OFX\Plugins
+.\scripts\install_windows.ps1 -ResetCache  # same, plus force a full plugin-cache re-scan
+```
+
+The script refuses to run while Resolve is open (no OFX hot reload). Fully restart Resolve afterwards and verify the stream in **Studio Monitor** (free NDI Tools) — **from a second machine**, so firewall behavior is part of the test.
+
+**How the NDI runtime resolves (ticket #21):** the DLL ships inside the bundle, but Windows never searches a DLL's own folder for its load-time imports — a plain import would silently drop the plugin from the Effects Library on any machine without a system NDI runtime. So the import is **delay-loaded** (CMakeLists.txt) and the plugin **preloads the DLL by full module-relative path** before the first NDI call (`src/NDIRuntimeLoader.h`), falling back to a system-wide NDI runtime, and disabling streaming (plugin still loads, passes frames through) if neither exists. `test_plugin_delayload` guards all of this in CI, including that no other load-time import outside System32 ever creeps in (see LEARNINGS.md: the `z.dll` trap). **Release-bar check:** verify once on a machine with *no* NDI software installed and nothing NDI-related on `PATH` — that machine is who the bundled DLL exists for.
+
+**Firewall:** the first NDI send triggers the Windows Firewall prompt for the *Resolve* process. Allow on private networks; decline (or a silently-dropped prompt, e.g. non-interactive sessions) leaves the source discoverable but the video unreachable from other machines — the classic "Studio Monitor lists it but shows black" symptom. Verify reachability from a second machine, not localhost.
+
+Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (note the extra `Support\` level vs macOS; same delete-with-Resolve-closed rescan procedure, or `-ResetCache` above). If the plugin doesn't appear in the Effects Library: reset the cache first, then watch the load in DebugView (below) — the loader logs which NDI runtime path it resolved (bundle, system, or NOT FOUND with both Win32 error codes).
 
 ### Logs on Windows
 
@@ -173,7 +184,8 @@ Same rule as macOS: any Windows build change updates this section in the same PR
 
 ## Receiving the stream (test receivers)
 
-- **NDI Video Monitor** (installed at `/Applications/NDI Video Monitor.app`) — quickest visual check
+- **NDI Studio Monitor** (Windows, part of free [NDI Tools](https://ndi.video/tools/)) — the Windows-loop receiver; run it on a second machine so the firewall is part of the test
+- **NDI Video Monitor** (installed at `/Applications/NDI Video Monitor.app`) — quickest visual check on macOS
 - **OBS Studio** with the NDI plugin
 - NDI Advanced SDK example receivers in `/Library/NDI Advanced SDK for Apple/examples/C++/` (`NDIlib_Recv`, `NDIlib_Recv_HDR`, `NDIlib_Jitter_Measure`, `NDIlib_Latency_Test`) — useful for programmatic/HDR validation
 
