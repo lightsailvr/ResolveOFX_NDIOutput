@@ -14,7 +14,8 @@
 #   cmake --install build --config Release --prefix stage
 
 cmake_minimum_required(VERSION 3.21)
-project(NDIOutput LANGUAGES CXX)
+# C is enabled for the generated NDI stub (ndi_stub.c, CI mode below).
+project(NDIOutput LANGUAGES C CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR
