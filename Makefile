@@ -54,6 +54,8 @@ test:
 	./build/test_stereo_pair
 	$(CXX) -Isrc tests/test_platform_paths.cpp -o build/test_platform_paths
 	./build/test_platform_paths
+	$(CXX) -Isrc tests/test_ndi_loader.cpp -o build/test_ndi_loader
+	./build/test_ndi_loader
 	$(CXX) -Isrc tests/test_stmap.cpp -o build/test_stmap -lz
 	./build/test_stmap
 	$(CXX) -Isrc tests/test_brawmap.cpp -o build/test_brawmap -lz

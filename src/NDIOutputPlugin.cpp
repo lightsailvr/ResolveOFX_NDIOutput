@@ -52,6 +52,7 @@ static void ndiWinLog(const char* fmt, ...);
 #include <algorithm>
 
 #include "BRAWLensMap.h"
+#include "NDIRuntimeLoader.h"
 #include "PlatformPaths.h"
 #include "RenderProbe.h"
 #include "STMap.h"
@@ -798,6 +799,37 @@ struct SenderHub {
 static std::mutex gHubRegistryMutex;
 static std::map<std::string, SenderHub*> gHubRegistry;
 
+#ifdef _WIN32
+// The NDI import is delay-loaded (CMakeLists.txt /DELAYLOAD): resolution
+// happens at the first NDI call, and an unresolvable DLL there raises the
+// delay-load helper's SEH exception inside Resolve. So before any NDI call,
+// load the runtime shipped inside the bundle from the plugin's own directory
+// (module-relative; the loader never searches there on its own), falling back
+// to a system-wide NDI runtime. On total failure NDI stays off and the
+// plugin keeps working as a pass-through. See NDIRuntimeLoader.h.
+static bool ensureNDIRuntimeLoaded()
+{
+    static const bool loaded = []() {
+        const ndi_loader::PreloadResult r =
+            ndi_loader::preloadNDIRuntime(L"Processing.NDI.Lib.Advanced.x64.dll");
+        if (r.loaded && r.fromBundle) {
+            NDI_LOG("NDI runtime loaded from the bundle: %ls", r.bundlePath.c_str());
+        } else if (r.loaded) {
+            NDI_LOG("NDI runtime not beside the plugin (%ls, Win32 error %lu); "
+                    "using the system-installed runtime",
+                    r.bundlePath.c_str(), r.bundleError);
+        } else {
+            NDI_LOG("NDI runtime NOT FOUND: bundle attempt %ls failed "
+                    "(Win32 error %lu), system search failed (Win32 error %lu) "
+                    "- streaming disabled",
+                    r.bundlePath.c_str(), r.bundleError, r.systemError);
+        }
+        return r.loaded;
+    }();
+    return loaded;
+}
+#endif // _WIN32
+
 // NDIlib_initialize is refcounted inside the SDK and safe to call once and
 // keep; see the hub comment for why NDIlib_destroy must never be called.
 static bool ensureNDILibInitialized()
@@ -806,6 +838,11 @@ static bool ensureNDILibInitialized()
     static bool initialized = false;
     std::lock_guard<std::mutex> lock(initMutex);
     if (!initialized) {
+#ifdef _WIN32
+        if (!ensureNDIRuntimeLoaded()) {
+            return false;
+        }
+#endif
         initialized = NDIlib_initialize();
         if (initialized) {
             NDI_LOG("NDI library initialized (process-wide, kept for process lifetime)");

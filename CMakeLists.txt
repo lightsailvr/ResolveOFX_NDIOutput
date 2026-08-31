@@ -14,6 +14,19 @@
 #   cmake --install build --config Release --prefix stage
 
 cmake_minimum_required(VERSION 3.21)
+
+# zlib must link STATICALLY. The plugin is a DLL living in a folder Windows
+# never searches when resolving its load-time imports, so any dynamic
+# dependency staged beside it (vcpkg's default z.dll) makes the whole plugin
+# fail to load inside Resolve - the same loader trap the delay-loaded NDI DLL
+# exists to dodge. zlib can simply be static; the NDI runtime cannot (the SDK
+# license requires shipping the vendor DLL). static-md keeps the CRT dynamic,
+# matching the /MD default of the rest of the build. Must be set before
+# project() for the vcpkg toolchain to see it.
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "vcpkg triplet")
+endif()
+
 # C is enabled for the generated NDI stub (ndi_stub.c, CI mode below).
 project(NDIOutput LANGUAGES C CXX)
 
@@ -113,15 +126,20 @@ target_link_libraries(NDIOutput PRIVATE ZLIB::ZLIB)
 # Delay-load the NDI DLL (spec decision 12): Windows' loader never searches a
 # DLL's own folder for load-time imports of another DLL, so a static import
 # would make the plugin silently fail to load on machines without an NDI
-# runtime. Delay-loading defers resolution to first call; the module-relative
-# AddDllDirectory call lands with the first-stream ticket (#21).
+# runtime. Delay-loading defers resolution to first call; before that call the
+# plugin preloads the DLL from its own directory (src/NDIRuntimeLoader.h,
+# ticket #21), and test_plugin_delayload below keeps the import delay-loaded
+# forever.
 if(NDI_USING_STUB)
     target_link_libraries(NDIOutput PRIVATE ndi_stub)
 else()
     target_link_libraries(NDIOutput PRIVATE "${NDI_LINK_LIB}")
 endif()
 target_link_libraries(NDIOutput PRIVATE delayimp)
-target_link_options(NDIOutput PRIVATE "/DELAYLOAD:${NDI_DLL_NAME}.dll")
+# /WX: LNK4199 ("/DELAYLOAD ignored; no imports found") is a silent revert to
+# a load-time NDI import - exactly the plugin-vanishes failure. Make any
+# linker warning on this target fatal so it can never ship quietly.
+target_link_options(NDIOutput PRIVATE "/DELAYLOAD:${NDI_DLL_NAME}.dll" "/WX")
 
 # --- Portable unit tests (LEARNINGS.md Tier 0; `make test` on macOS) --------
 enable_testing()
@@ -130,6 +148,7 @@ set(NDI_PORTABLE_TESTS
     test_stream_resolution
     test_stereo_pair
     test_platform_paths
+    test_ndi_loader
     test_stmap
     test_brawmap)
 foreach(_t IN LISTS NDI_PORTABLE_TESTS)
@@ -141,6 +160,17 @@ foreach(_t IN LISTS NDI_PORTABLE_TESTS)
 endforeach()
 target_link_libraries(test_stmap PRIVATE ZLIB::ZLIB)
 target_link_libraries(test_brawmap PRIVATE ZLIB::ZLIB)
+
+# Delay-load smoke test (Windows-only, so not in the portable list): loads
+# the freshly built .ofx with a System32-only import search - what Resolve's
+# plugin scanner amounts to - and fails on any load-time import that would
+# make the plugin silently vanish from the Effects Library. wmain needs the
+# wide entry point.
+add_executable(test_plugin_delayload tests/test_plugin_delayload.cpp)
+target_include_directories(test_plugin_delayload PRIVATE openfx/include)
+target_link_options(test_plugin_delayload PRIVATE "/ENTRY:wmainCRTStartup")
+add_test(NAME test_plugin_delayload
+         COMMAND test_plugin_delayload "$<TARGET_FILE:NDIOutput>")
 
 # --- Install: the OFX bundle tree (spec decision 16) -------------------------
 # NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx, installed under

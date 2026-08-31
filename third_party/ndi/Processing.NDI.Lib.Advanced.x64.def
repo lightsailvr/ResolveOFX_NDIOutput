@@ -3,7 +3,11 @@
 ; a stub import library so CI can LINK the plugin without the access-gated
 ; SDK; the stub DLL contains no NDI code and is never shipped or loaded.
 ; Regenerate: python scripts/dump_ndi_exports.py <path-to-dll>
-LIBRARY Processing.NDI.Lib.Advanced.x64
+; The .dll extension is load-bearing: the import library records this exact
+; string as the DLL to import from, and /DELAYLOAD only matches on string
+; equality - without the extension the linker ignores the flag (LNK4199) and
+; the NDI import silently reverts to load-time in stub builds.
+LIBRARY "Processing.NDI.Lib.Advanced.x64.dll"
 EXPORTS
     NDIlib_1D058E94_50A1_4EDD_8EC1_F462375D6D2D
     NDIlib_7E95AE6A_8F7D_437C_99CF_6405FAA0EB22
