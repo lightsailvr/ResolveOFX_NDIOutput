@@ -49,7 +49,7 @@ bool cuda_gpu_is_available(void);
 // color conversion, reading the float RGBA frame the host left on the device
 // and writing the small converted frame to CPU memory. Byte-identical to the
 // CPU composition ndi_stream::downscaleRGBABox + the flipping CPU converters
-// (tests/test_cuda_downscale.cpp; the module compiles with -fmad=false so
+// (tests/test_cuda_downscale.cpp; the module compiles with --fmad=false so
 // GPU arithmetic matches the CPU's operation-for-operation). cudaStream ==
 // NULL uses a context-owned stream (tests). Output dimensions come from
 // ndi_stream::outputDims(). Not thread-safe per context — callers serialize

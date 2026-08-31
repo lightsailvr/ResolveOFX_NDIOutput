@@ -7,7 +7,7 @@
 // Byte-identity: every kernel reproduces the CPU reference composition
 // (ndi_stream::downscaleRGBABox / ndi_stmap::warpRGBABox followed by the
 // flipping converters) operation-for-operation, in the same order, and the
-// translation unit compiles with -fmad=false (CMakeLists.txt) so nvcc cannot
+// translation unit compiles with --fmad=false (CMakeLists.txt) so nvcc cannot
 // contract the multiply-adds MSVC leaves separate. tests/test_cuda_downscale
 // holds the outputs to memcmp equality with the CPU oracles.
 //
@@ -368,13 +368,14 @@ static void dispatcherLoop(CudaGPUContext* context)
         }
         // The host function ran, so everything enqueued before it — kernel and
         // D2H copy — has completed. A failed kernel surfaces on the event.
-        const bool ok = (cudaEventQuery(slot->evEnd) == cudaSuccess);
+        const cudaError_t evStatus = cudaEventQuery(slot->evEnd);
+        const bool ok = (evStatus == cudaSuccess);
         float gpuMs = 0.0f;
         if (ok && cudaEventElapsedTime(&gpuMs, slot->evStart, slot->evEnd) != cudaSuccess) {
             gpuMs = 0.0f;
         }
         if (!ok) {
-            CUDA_LOG("Fast path async: kernel failed: %s", cudaGetErrorString(cudaEventQuery(slot->evEnd)));
+            CUDA_LOG("Fast path async: kernel failed: %s", cudaGetErrorString(evStatus));
         }
         // Invoked outside every module lock: done may (indirectly) call
         // cuda_gpu_downscale_release.
@@ -596,7 +597,7 @@ static bool runConvertKernel(CudaGPUContextRef context, void* cudaStream, void* 
         return false;
     }
     if (!srcBufferLargeEnough(srcDeviceBuffer, srcHeight, srcRowFloats)) {
-        CUDA_LOG("Fast path: source buffer too small");
+        CUDA_LOG("Blocking convert: source buffer too small");
         return false;
     }
     cudaStream_t stream = resolveStream(context, cudaStream);
@@ -611,7 +612,7 @@ static bool runConvertKernel(CudaGPUContextRef context, void* cudaStream, void* 
             context->stagingDevCap = 0;
         }
         if (cudaMalloc(&context->stagingDev, outBytes) != cudaSuccess) {
-            CUDA_LOG("Fast path: failed to allocate %zu-byte staging buffer", outBytes);
+            CUDA_LOG("Blocking convert: failed to allocate %zu-byte staging buffer", outBytes);
             context->stagingDev = nullptr;
             return false;
         }
@@ -623,7 +624,7 @@ static bool runConvertKernel(CudaGPUContextRef context, void* cudaStream, void* 
     launchConvertKernel(stream, srcDeviceBuffer, context->stagingDev, mapDeviceBuffer, p, p216);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        CUDA_LOG("Fast path: kernel launch failed: %s", cudaGetErrorString(err));
+        CUDA_LOG("Blocking convert: kernel launch failed: %s", cudaGetErrorString(err));
         return false;
     }
     err = cudaMemcpyAsync(cpuOut, context->stagingDev, outBytes, cudaMemcpyDeviceToHost, stream);
@@ -631,13 +632,13 @@ static bool runConvertKernel(CudaGPUContextRef context, void* cudaStream, void* 
         err = cudaStreamSynchronize(stream);
     }
     if (err != cudaSuccess) {
-        CUDA_LOG("Fast path: readback failed: %s", cudaGetErrorString(err));
+        CUDA_LOG("Blocking convert: readback failed: %s", cudaGetErrorString(err));
         return false;
     }
 
     const auto endTime = std::chrono::high_resolution_clock::now();
     const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-    CUDA_LOG("Fast path %s: %dx%d -> %dx%d (divisor %d) in %lld us (%.2f ms)",
+    CUDA_LOG("Blocking convert %s: %dx%d -> %dx%d (divisor %d) in %lld us (%.2f ms)",
              label, srcWidth, srcHeight, outWidth, outHeight, divisor,
              static_cast<long long>(duration.count()), duration.count() / 1000.0);
     return true;
@@ -777,6 +778,7 @@ static cuda_submit_status submitConvertInternal(CudaGPUContextRef context,
     cudaEventRecord(slot->evStart, stream);
     launchConvertKernel(stream, srcDeviceBuffer, slot->devBuffer, mapDeviceBuffer, p, p216);
     cudaError_t err = cudaGetLastError();
+    const bool kernelLaunched = (err == cudaSuccess);
     if (err == cudaSuccess) err = cudaEventRecord(slot->evEnd, stream);
     if (err == cudaSuccess) {
         err = cudaMemcpyAsync(slot->hostBuffer, slot->devBuffer, outBytes,
@@ -785,11 +787,17 @@ static cuda_submit_status submitConvertInternal(CudaGPUContextRef context,
     if (err == cudaSuccess) err = cudaLaunchHostFunc(stream, slotCompletedHostFn, slot);
     if (err != cudaSuccess) {
         // Enqueue failed partway: no completion will fire. Practically this
-        // means a broken context (launches only fail synchronously for
-        // configuration errors); free the slot so the stream can fall back.
-        CUDA_LOG("Fast path async: enqueue failed: %s", cudaGetErrorString(err));
-        std::lock_guard<std::mutex> lock(context->asyncMutex);
-        slot->busy = false;
+        // means a broken context (these calls only fail synchronously for
+        // configuration errors). Before a successful launch nothing can touch
+        // the slot's buffers, so it may be reused; after one, the pending
+        // kernel/copy still targets them — RETIRE the slot (busy forever)
+        // rather than free buffers a straggler will write.
+        CUDA_LOG("Fast path async: enqueue failed%s: %s",
+                 kernelLaunched ? " - retiring slot" : "", cudaGetErrorString(err));
+        if (!kernelLaunched) {
+            std::lock_guard<std::mutex> lock(context->asyncMutex);
+            slot->busy = false;
+        }
         return CUDA_SUBMIT_INVALID;
     }
     return CUDA_SUBMIT_OK;

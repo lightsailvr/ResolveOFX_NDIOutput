@@ -124,6 +124,8 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
+**Still owed from issue #22 (Tier 1–2, human on the workstation):** GPU-native log lines during real playback with no CPU-fallback lines, 8K stereo rates comparable to macOS, and the render-call probe matrix re-run (Render Cache / proxy modes / stereo per-eye instances) before trusting stereo pairing on Windows — findings to LEARNINGS.md when they happen. Tier 0 (build + all tests, kernel identity on the workstation GPU) is what this section's status line covers.
+
 ### Prerequisites
 
 - **Visual Studio 2022** with the "Desktop development with C++" workload (MSVC v143 + Windows SDK)
