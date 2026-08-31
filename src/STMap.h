@@ -199,7 +199,9 @@ inline bool loadSTMapEXR(const char* path, STMapImage* out, std::string* error)
         std::fseek(f, 0, SEEK_END);
         const long fileSize = std::ftell(f);
         std::fseek(f, 0, SEEK_SET);
-        if (fileSize > 0 && fileSize <= (1L << 31)) {
+        // 1LL, not 1L: long is 32-bit on Windows, where 1L << 31 goes
+        // negative and would reject every file as unreadable.
+        if (fileSize > 0 && fileSize <= (1LL << 31)) {
             bytes.resize(static_cast<size_t>(fileSize));
             readOk = (std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size());
         }
