@@ -137,6 +137,8 @@ The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and p
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
 ```
 
+(`$VCPKG_ROOT` = your vcpkg checkout; the GitHub runner preinstalls one and exposes it as `VCPKG_INSTALLATION_ROOT`, which is what the workflow passes.)
+
 ```bash
 cmake --build build --config Release --parallel
 ```
@@ -163,7 +165,7 @@ Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OF
 
 ### CI
 
-[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and `feature/win-*` branches (and PRs into `windows-port`): configure + CPU-only build on `windows-2022`, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64-cpu-only` artifact. CI has no GPU and no Resolve — Tiers 1–2 stay human, on real hardware.
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: configure + CPU-only build on `windows-2022`, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64-cpu-only` artifact. CI has no GPU and no Resolve — Tiers 1–2 stay human, on real hardware.
 
 Same rule as macOS: any Windows build change updates this section in the same PR.
 

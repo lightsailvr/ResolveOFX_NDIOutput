@@ -105,8 +105,11 @@ static void ndiWinLog(const char* fmt, ...)
         return;
     }
     size_t len = static_cast<size_t>(n);
-    if (len > sizeof(buf) - 2) {
-        len = sizeof(buf) - 2; // vsnprintf truncated; keep what fits
+    if (len > sizeof(buf) - 3) {
+        // vsnprintf truncated: it wrote sizeof(buf)-3 chars plus its own NUL
+        // at [sizeof(buf)-3]; the newline must overwrite that NUL, not land
+        // after it (an embedded NUL would cut the line short in both sinks).
+        len = sizeof(buf) - 3;
     }
     buf[len] = '\n';
     buf[len + 1] = '\0';
