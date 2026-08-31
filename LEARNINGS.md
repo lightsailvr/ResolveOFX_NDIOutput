@@ -265,8 +265,29 @@ Facts the GPU fast path is built on, from `/Library/Application Support/Blackmag
 **Validated by:** Tier 1–2 pass (Matt, 2026-08-30): fields swap live in the inspector when STMap Layout / Camera Clip Source change, with no reselect needed, and saved projects restore the correct set.
 **Rule:** Resolve repaints on runtime `kOfxParamPropSecret` edits to instance params — hide inapplicable params instead of stacking every mode's fields.
 
-### OPEN — Windows/CUDA build failing (as of 2026-08-28)
-Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
+### 2026-08-30 — CLOSED: the May-2025 Windows/CUDA scaffold was deleted, not diagnosed (ticket #20)
+The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted nothing, MinGW .bat that could never work — nvcc requires MSVC as host compiler) predated the plugin's modern architecture and was **deleted per spec decision 7** (docs/windows-port-spec.md); git history keeps it. The Windows build restarted on good bones on branch `windows-port`: CPU-only compile + the portable unit suite are green in CI on every push (`.github/workflows/windows.yml`), so the build can no longer rot unobserved. CUDA returns properly with ticket #22.
+
+### 2026-08-30 — `1L << 31` is negative on Windows: STMap size cap rejected every EXR
+**Symptom:** (CI, first MSVC run of the portable suite) all `test_stmap` file-based cases failed with the reader's "cannot read … (empty, unreadable, or over 2 GiB)" soft-fail — for 5 KB fixture files that macOS read fine.
+**Root cause:** `loadSTMapEXR` capped file size with `fileSize <= (1L << 31)`. `long` is 32-bit on Windows (LLP64), so `1L << 31` evaluates to a negative value and the guard rejected every file. macOS (LP64, 64-bit `long`) never saw it.
+**Fix:** `1LL << 31` (src/STMap.h; branch `feature/win-ci-compile`, ticket #20).
+**Validated by:** Windows CI — `test_stmap` 100% green under MSVC; macOS `make test` unchanged.
+**Rule:** never assume `long` is 64-bit — on Windows it is 32; use `long long`/`int64_t` (and `1LL` shifts) for any byte-size or offset math that must survive both platforms.
+
+### 2026-08-30 — CI can link against the access-gated NDI SDK via vendored MIT headers + a stub import library
+**Symptom:** (ticket #20 design) hosted CI must compile *and link* the plugin, but the NDI **Advanced** SDK download is access-gated and its import library is not redistributable — no SDK can live on the runner.
+**Root cause:** n/a — distribution constraint, not a bug.
+**Fix:** the SDK's `Processing.NDI.*.h` headers each carry their own per-file MIT license ("applies to this file ONLY"), so the needed 13 are vendored under `third_party/ndi/include/`; the DLL's export-name list (extracted by `scripts/dump_ndi_exports.py`, a ~50-line PE parser) is checked in as a `.def`, and CMake generates one empty C function per export to build a stub DLL whose import library the linker consumes. The stub ships nowhere and never loads; builds on a machine with the real SDK use it automatically. Two sub-gotchas: the generated stub is C, so `project()` must enable `C` alongside `CXX` (CMake dies with "cannot determine linker language" otherwise), and the import must be `/DELAYLOAD`ed anyway per spec decision 12.
+**Validated by:** Windows CI green: full plugin compile + link with zero NDI bits on the runner.
+**Rule:** headers' per-file licenses can differ from their SDK's — read them before assuming a gated SDK blocks CI; a `.def`-generated stub import library is all MSVC needs to prove a link.
+
+### 2026-08-30 — First MSVC pass over "portable" code: the small fix list
+**Symptom:** (CI, ticket #20) code that built clean under clang for years needed four kinds of touch-up under MSVC.
+**Root cause:** libc++ transitively includes what MSVC's STL doesn't (`<cmath>` via `<algorithm>`); POSIX `mkdir`/`0755` doesn't exist (`_mkdir` in `<direct.h>`); `M_PI` needs `_USE_MATH_DEFINES`; UTF-8 string literals (log emoji) need `/utf-8` or MSVC decodes source bytes through the ANSI code page.
+**Fix:** explicit includes + a `_mkdir` shim in the one test that makes a directory; `/utf-8 _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS` centralized in CMakeLists.txt.
+**Validated by:** Windows CI — plugin + all 6 portable tests compile and pass under MSVC; macOS `make test` unchanged.
+**Rule:** include what you use (never trust transitive STL includes), and treat `/utf-8` as mandatory for any MSVC target whose sources hold non-ASCII literals.
 
 ---
 
