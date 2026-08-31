@@ -42,7 +42,6 @@ static void expectTrue(bool actual, const char* name)
 }
 
 static const wchar_t kNdiDllName[] = L"Processing.NDI.Lib.Advanced.x64.dll";
-static const wchar_t kBackslash[] = {0x5C, 0};
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -64,7 +63,7 @@ int wmain(int argc, wchar_t** argv)
         std::fprintf(stderr, "CreateDirectoryW failed (%lu)\n", GetLastError());
         return 2;
     }
-    const std::wstring ofx = dir + kBackslash + L"NDIOutput.ofx";
+    const std::wstring ofx = dir + L"\\NDIOutput.ofx";
     if (!CopyFileW(argv[1], ofx.c_str(), FALSE)) {
         std::fprintf(stderr, "CopyFileW %ls -> %ls failed (%lu)\n",
                      argv[1], ofx.c_str(), GetLastError());

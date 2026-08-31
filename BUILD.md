@@ -147,7 +147,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ctest` runs the same portable unit suite as `make test` on macOS (plus `test_plugin_delayload`, Windows-only: loads the built `.ofx` with a System32-only import search — what Resolve's plugin scanner amounts to — so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library). CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+`ctest` runs the same portable unit suite as `make test` on macOS — including `test_platform_paths` (UTF-8→UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus `test_plugin_delayload`, Windows-only: it loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
 
 ### Install (Tier 1)
 
