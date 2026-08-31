@@ -158,9 +158,11 @@ cmake --install build --config Release --prefix stage
 produces the spec bundle tree `stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx` (with `Processing.NDI.Lib.Advanced.x64.dll` + its licenses file beside the binary when the real SDK is present — a stub-linked CI-style build stages no DLL and will not stream). Then, from an **elevated** PowerShell (UAC prompts spawned by automation shells can auto-cancel; open the terminal elevated yourself):
 
 ```powershell
-.\scripts\install_windows.ps1              # copies the bundle into C:\Program Files\Common Files\OFX\Plugins
-.\scripts\install_windows.ps1 -ResetCache  # same, plus force a full plugin-cache re-scan
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1              # copies the bundle into C:\Program Files\Common Files\OFX\Plugins
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1 -ResetCache  # same, plus force a full plugin-cache re-scan
 ```
+
+(The `-ExecutionPolicy Bypass -File` wrapper is required on any machine with the default `Restricted` policy — a bare `.\scripts\install_windows.ps1` fails with "running scripts is disabled on this system". It's per-invocation; don't change the policy system-wide.)
 
 The script refuses to run while Resolve is open (no OFX hot reload). Fully restart Resolve afterwards and verify the stream in **Studio Monitor** (free NDI Tools) — **from a second machine**, so firewall behavior is part of the test.
 
