@@ -136,7 +136,10 @@ else()
     target_link_libraries(NDIOutput PRIVATE "${NDI_LINK_LIB}")
 endif()
 target_link_libraries(NDIOutput PRIVATE delayimp)
-target_link_options(NDIOutput PRIVATE "/DELAYLOAD:${NDI_DLL_NAME}.dll")
+# /WX: LNK4199 ("/DELAYLOAD ignored; no imports found") is a silent revert to
+# a load-time NDI import - exactly the plugin-vanishes failure. Make any
+# linker warning on this target fatal so it can never ship quietly.
+target_link_options(NDIOutput PRIVATE "/DELAYLOAD:${NDI_DLL_NAME}.dll" "/WX")
 
 # --- Portable unit tests (LEARNINGS.md Tier 0; `make test` on macOS) --------
 enable_testing()
