@@ -1,0 +1,56 @@
+# Windows compile-proof CI (ticket #20; spec decision 9): configure + build
+# the plugin CPU-only under MSVC, run the portable unit suite, and upload a
+# spec-correct bundle tree. Hosted runners have no GPU and no Resolve, so
+# Tiers 1-2 of the testing loop stay human (BUILD.md, Windows section).
+#
+# The NDI Advanced SDK is access-gated and never lives in CI: the build links
+# a stub import library generated from the checked-in export list
+# (third_party/ndi/), so the artifact proves compile + link, not streaming.
+name: windows
+
+on:
+  push:
+    branches:
+      - windows-port
+      - "feature/win-**"
+  pull_request:
+    branches:
+      - windows-port
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (CMake + vcpkg toolchain)
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+
+      - name: Build (Release, CPU-only)
+        run: cmake --build build --config Release --parallel
+
+      - name: Run portable unit tests (MSVC)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Stage the OFX bundle tree
+        run: cmake --install build --config Release --prefix stage
+
+      - name: Verify spec bundle layout
+        run: |
+          $ofx = "stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx"
+          if (-not (Test-Path $ofx)) {
+            Write-Error "Bundle layout wrong: $ofx missing"
+            exit 1
+          }
+          Get-ChildItem -Recurse stage | Select-Object FullName
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NDIOutput-win64-cpu-only
+          path: stage/
+          if-no-files-found: error

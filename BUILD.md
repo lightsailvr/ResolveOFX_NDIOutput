@@ -120,13 +120,52 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows (CUDA) — STATUS: restarting on `windows-port`
+## Windows — STATUS: CPU-only build green in CI; CUDA pending (ticket #22)
 
-The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predates the plugin's modern architecture (sender hub, async pump, fused GPU pipeline, STMap warp) — the port is being **redone, not repaired**, on the long-lived `windows-port` branch. Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research behind them: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
+The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
-Toolchain (pinned by the spec): **Visual Studio 2022** (C++ workload) + **CUDA Toolkit 12.9** (nvcc requires MSVC as host compiler — the MinGW script is a dead end and gets deleted) + CMake + vcpkg (zlib) + the **Windows NDI Advanced SDK** (HDR needs Advanced; the download is access-gated, request early). Nothing can be cross-compiled from macOS: Windows builds happen on a Windows machine or on `windows-2022` CI (compile-only — Tiers 1–2 still need real hardware).
+### Prerequisites
 
-Packaging (per the OFX spec): `C:\Program Files\Common Files\OFX\Plugins\NDIOutput.ofx.bundle\Contents\Win64\NDIOutput.ofx`, with `Processing.NDI.Lib.x64.dll` bundled beside the binary and **delay-loaded** via a module-relative DLL-directory add — Windows' default search order never finds a DLL sitting next to the `.ofx`, so a plain import silently fails to load on machines without an NDI runtime. Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (same delete-to-rescan procedure as macOS). Stream check: **Studio Monitor** from the free NDI Tools for Windows.
+- **Visual Studio 2022** with the "Desktop development with C++" workload (MSVC v143 + Windows SDK)
+- **CMake** ≥ 3.21 and **vcpkg** (supplies zlib via [vcpkg.json](vcpkg.json))
+- **Windows NDI 6 Advanced SDK** installed at `C:\Program Files\NDI\NDI 6 Advanced SDK` (or pass `-DNDI_SDK_PATH=...`). HDR needs Advanced; the download is access-gated, request early. Without it the build automatically links a **stub import library** built from [third_party/ndi/](third_party/ndi/) — good for compile-proof only; a streaming binary needs the real SDK.
+- **CUDA Toolkit 12.9** — not needed yet; required once the CUDA pipeline lands (nvcc requires MSVC as host compiler; that constraint killed the old MinGW script). Nothing can be cross-compiled from macOS.
+
+### Build (Tier 0)
+
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+```
+
+(`$VCPKG_ROOT` = your vcpkg checkout; the GitHub runner preinstalls one and exposes it as `VCPKG_INSTALLATION_ROOT`, which is what the workflow passes.)
+
+```bash
+cmake --build build --config Release --parallel
+```
+
+```bash
+ctest --test-dir build -C Release --output-on-failure
+```
+
+`ctest` runs the same portable unit suite as `make test` on macOS (plus `test_platform_paths`, the UTF-8→UTF-16 path-shim tests). CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+
+### Install (Tier 1)
+
+```bash
+cmake --install build --config Release --prefix stage
+```
+
+produces the spec bundle tree `stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx` (with `Processing.NDI.Lib.Advanced.x64.dll` + its licenses file beside the binary when the real SDK is present). Copy `NDIOutput.ofx.bundle` into `C:\Program Files\Common Files\OFX\Plugins\` (elevated), fully restart Resolve, and verify the stream in **Studio Monitor** (free NDI Tools) — ideally from a second machine, so the firewall prompt is part of the test. The NDI import is **delay-loaded** (Windows' default search order never finds a DLL sitting next to the `.ofx`; the module-relative `AddDllDirectory` call lands with ticket #21).
+
+Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (same delete-with-Resolve-closed rescan procedure as macOS).
+
+### Logs on Windows
+
+`NDI_LOG` routes to `OutputDebugStringA` — watch live with [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview) (filter `NDI Plugin:`) or WinDbg. Setting `NDI_OUTPUT_LOG_FILE` to a writable path before launching Resolve additionally appends every line there.
+
+### CI
+
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: configure + CPU-only build on `windows-2022`, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64-cpu-only` artifact. CI has no GPU and no Resolve — Tiers 1–2 stay human, on real hardware.
 
 Same rule as macOS: any Windows build change updates this section in the same PR.
 

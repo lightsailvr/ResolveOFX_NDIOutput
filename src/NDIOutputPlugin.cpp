@@ -32,6 +32,13 @@
 // For dynamic strings a human must be able to read in `log stream`/`log show`:
 // os_log can redact plain %s arguments as <private> depending on system config.
 #define NDI_LOG_TEXT(str) os_log(OS_LOG_DEFAULT, "NDI Plugin: %{public}s", str)
+#elif defined(_WIN32)
+// Windows sink: OutputDebugStringA for live capture (DebugView/WinDbg), plus
+// an append-only file sink when NDI_OUTPUT_LOG_FILE names a path. Resolve on
+// Windows has no console, so printf would go nowhere.
+static void ndiWinLog(const char* fmt, ...);
+#define NDI_LOG(fmt, ...) ndiWinLog("NDI Plugin: " fmt, ##__VA_ARGS__)
+#define NDI_LOG_TEXT(str) ndiWinLog("NDI Plugin: %s", str)
 #else
 #define NDI_LOG(fmt, ...) printf("NDI Plugin: " fmt "\n", ##__VA_ARGS__)
 #define NDI_LOG_TEXT(str) printf("NDI Plugin: %s\n", str)
@@ -42,11 +49,10 @@
 #include "ofxMemory.h"
 #include "ofxMultiThread.h"
 
-#include <sys/stat.h>
-
 #include <algorithm>
 
 #include "BRAWLensMap.h"
+#include "PlatformPaths.h"
 #include "RenderProbe.h"
 #include "STMap.h"
 #include "StereoPair.h"
@@ -60,34 +66,19 @@
 #endif
 
 #ifdef _WIN32
-#include "CudaGPUAcceleration.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <cstdarg>
+#include <cstdlib>
 #endif
 
-// GPU acceleration headers (forward declarations only)
-#ifdef __APPLE__
-// Forward declarations for Metal types to avoid Objective-C in C++
-#ifdef __OBJC__
-#include <Metal/Metal.h>
-#include <MetalKit/MetalKit.h>
-#endif
-#include <OpenGL/OpenGL.h>
-#include <OpenGL/gl3.h>
-#elif defined(_WIN32) || defined(__WIN32__) || defined(WIN32) || defined(_WIN64) || defined(__WIN64__) || defined(WIN64)
-#include <d3d11.h>
-#include <dxgi.h>
-#else
-#include <GL/gl.h>
-#include <GL/glext.h>
-#endif
-
-// NDI Advanced SDK includes
-#ifdef __APPLE__
+// NDI Advanced SDK
 #include <Processing.NDI.Lib.h>
-#elif defined(_WIN32) || defined(__WIN32__) || defined(WIN32) || defined(_WIN64) || defined(__WIN64__) || defined(WIN64)
-#include <Processing.NDI.Lib.h>
-#else
-#include <Processing.NDI.Lib.h>
-#endif
 
 #if defined __APPLE__ || defined __linux__ || defined __FreeBSD__
 #  define EXPORT __attribute__((visibility("default")))
@@ -96,6 +87,44 @@
 #else
 #  error Not building on your operating system quite yet
 #endif
+
+#ifdef _WIN32
+// NDI_LOG sink for Windows. Live capture: run DebugView (Sysinternals) or
+// attach WinDbg — OutputDebugStringA lines carry the "NDI Plugin: " prefix.
+// Optional file sink: set NDI_OUTPUT_LOG_FILE to a writable path before
+// launching Resolve and lines are appended there too (fwrite on one FILE* is
+// thread-safe in the MSVC CRT; render threads log concurrently).
+static void ndiWinLog(const char* fmt, ...)
+{
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(buf, sizeof(buf) - 2, fmt, args);
+    va_end(args);
+    if (n < 0) {
+        return;
+    }
+    size_t len = static_cast<size_t>(n);
+    if (len > sizeof(buf) - 3) {
+        // vsnprintf truncated: it wrote sizeof(buf)-3 chars plus its own NUL
+        // at [sizeof(buf)-3]; the newline must overwrite that NUL, not land
+        // after it (an embedded NUL would cut the line short in both sinks).
+        len = sizeof(buf) - 3;
+    }
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+    OutputDebugStringA(buf);
+
+    static std::FILE* sink = []() -> std::FILE* {
+        const char* path = std::getenv("NDI_OUTPUT_LOG_FILE");
+        return (path && *path) ? ndi_path::fopenUtf8(path, "ab") : nullptr;
+    }();
+    if (sink) {
+        std::fwrite(buf, 1, len + 1, sink);
+        std::fflush(sink);
+    }
+}
+#endif // _WIN32
 
 // Plugin constants
 #define kPluginName "NDIOutput"
@@ -251,21 +280,12 @@ OfxMemorySuiteV1        *gMemoryHost = 0;
 OfxMultiThreadSuiteV1   *gThreadHost = 0;
 OfxMessageSuiteV1       *gMessageSuite = 0;
 
-// GPU Processing Context
+// GPU Processing Context. Metal on macOS today; the CUDA module (Windows
+// port ticket #22) will add its context here behind the same GPU-module
+// contract. Until then non-Apple platforms run the CPU path.
 struct GPUContext {
 #ifdef __APPLE__
     MetalGPUContextRef metalContext;
-#elif defined(_WIN32)
-    CudaGPUContextRef cudaContext;
-    void* d3dDevice;
-    void* d3dContext;
-    void* colorConversionShader;
-    void* frameBuffer;
-#else
-    // OpenGL context for Linux
-    unsigned int framebuffer;
-    unsigned int colorConversionProgram;
-    unsigned int frameTexture;
 #endif
     bool initialized;
     std::mutex gpuMutex;
@@ -322,13 +342,7 @@ static std::map<std::string, std::weak_ptr<StmapEntry>> gStmapCache;
 
 static bool stmapFileStat(const char* path, long long* mtime, long long* size)
 {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        return false;
-    }
-    *mtime = static_cast<long long>(st.st_mtime);
-    *size = static_cast<long long>(st.st_size);
-    return true;
+    return ndi_path::statUtf8(path, mtime, size);
 }
 
 // Fetch the STMap at `path`, loading it only when no instance already holds a
@@ -1372,48 +1386,13 @@ static bool initializeGPUContext(NDIInstanceData* data)
     }
     
     NDI_LOG("Metal GPU acceleration initialized successfully\n");
-    
-#elif defined(_WIN32)
-    // Try CUDA first, then fallback to D3D11
-    if (cuda_gpu_is_available()) {
-        NDI_LOG("Initializing CUDA GPU acceleration...");
-        data->gpuContext->cudaContext = cuda_gpu_init();
-        if (data->gpuContext->cudaContext) {
-            NDI_LOG("CUDA GPU acceleration initialized successfully");
-            NDI_LOG("Device: %s", cuda_gpu_get_device_name(data->gpuContext->cudaContext));
-            
-            size_t free_mem, total_mem;
-            if (cuda_gpu_get_memory_info(data->gpuContext->cudaContext, &free_mem, &total_mem)) {
-                NDI_LOG("CUDA Memory: %.1f MB free / %.1f MB total", 
-                       free_mem / (1024.0f * 1024.0f), 
-                       total_mem / (1024.0f * 1024.0f));
-            }
-        } else {
-            NDI_LOG("Failed to initialize CUDA GPU acceleration, trying D3D11...");
-        }
-    } else {
-        NDI_LOG("CUDA not available, trying D3D11...");
-    }
-    
-    // Fallback to D3D11 if CUDA failed
-    if (!data->gpuContext->cudaContext) {
-        HRESULT hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-            0, nullptr, 0, D3D11_SDK_VERSION,
-            (ID3D11Device**)&data->gpuContext->d3dDevice,
-            nullptr, (ID3D11DeviceContext**)&data->gpuContext->d3dContext);
-        
-        if (FAILED(hr)) {
-            NDI_LOG("Failed to create D3D11 device");
-            return false;
-        }
-        
-        NDI_LOG("D3D11 GPU acceleration initialized as fallback");
-    }
+
 #else
-    // Initialize OpenGL for Linux
-    // Note: This would require proper OpenGL context setup
-    NDI_LOG("OpenGL GPU acceleration available\n");
+    // No GPU-native path here yet: the CUDA module (Windows port ticket #22)
+    // lands behind the same contract. Returning false makes the caller fall
+    // back to the CPU conversion path.
+    NDI_LOG("GPU-native path not available on this platform yet - using the CPU path");
+    return false;
 #endif
 
     data->gpuContext->initialized = true;
@@ -1433,20 +1412,6 @@ static void shutdownGPUContext(NDIInstanceData* data)
     if (data->gpuContext->metalContext) {
         metal_gpu_shutdown(data->gpuContext->metalContext);
         data->gpuContext->metalContext = nullptr;
-    }
-#elif defined(_WIN32)
-    // Shutdown CUDA if it was initialized
-    if (data->gpuContext->cudaContext) {
-        cuda_gpu_shutdown(data->gpuContext->cudaContext);
-        data->gpuContext->cudaContext = nullptr;
-    }
-    
-    // Shutdown D3D11 if it was initialized
-    if (data->gpuContext->d3dContext) {
-        ((ID3D11DeviceContext*)data->gpuContext->d3dContext)->Release();
-    }
-    if (data->gpuContext->d3dDevice) {
-        ((ID3D11Device*)data->gpuContext->d3dDevice)->Release();
     }
 #endif
 
@@ -1491,50 +1456,13 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
     } else {
         NDI_LOG("⚠️ Metal context not available, falling back to CPU\n");
     }
-    
+
     // Fallback to CPU if Metal fails
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    
-#elif defined(_WIN32)
-    // Try CUDA first if available
-    if (data->gpuContext->cudaContext) {
-        NDI_LOG("🚀 Attempting CUDA GPU acceleration...");
-        
-        bool success = cuda_gpu_convert_rgba_to_uyvy(
-            data->gpuContext->cudaContext,
-            static_cast<const float*>(rgbaData),
-            data->uyvyFrameBuffer.data(),
-            width,
-            height
-        );
-        
-        if (success) {
-            NDI_LOG("✅ CUDA GPU acceleration SUCCESS!");
-            return;
-        } else {
-            NDI_LOG("❌ CUDA GPU conversion failed, falling back to CPU");
-        }
-    }
-    
-    // D3D11 implementation for RGBA to UYVY conversion (fallback)
-    if (data->gpuContext->d3dDevice && data->gpuContext->d3dContext) {
-        ID3D11Device* device = (ID3D11Device*)data->gpuContext->d3dDevice;
-        ID3D11DeviceContext* context = (ID3D11DeviceContext*)data->gpuContext->d3dContext;
-        
-        // Create buffers and execute compute shader
-        // ... D3D11 compute shader execution ...
-        NDI_LOG("D3D11 GPU conversion available, using CPU fallback for now");
-    }
-    
-    // Fallback to CPU if both GPU methods failed
-    convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    
+
 #else
-    // OpenGL implementation for Linux
-    // ... OpenGL compute shader execution ...
-    NDI_LOG("OpenGL GPU conversion available, using CPU fallback for now\n");
+    // No GPU-native conversion here yet (Windows port ticket #22 adds CUDA).
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    return;
 #endif
 }
 
@@ -1876,26 +1804,6 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
             NDI_LOG("Metal GPU HDR conversion completed");
         } else {
             NDI_LOG("Metal GPU HDR conversion failed, falling back to CPU");
-        }
-    }
-#elif defined(_WIN32)
-    if (data->gpuAcceleration && data->gpuContext && data->gpuContext->initialized && data->gpuContext->cudaContext) {
-        // For HDR, we need to convert to 16-bit limited range
-        float scale = 65472.0f; // 16-bit limited range
-        
-        gpuSuccess = cuda_gpu_convert_rgba_to_hdr(
-            data->gpuContext->cudaContext,
-            srcData,
-            dstData,
-            width,
-            height,
-            scale
-        );
-        
-        if (gpuSuccess) {
-            NDI_LOG("CUDA GPU HDR conversion completed");
-        } else {
-            NDI_LOG("CUDA GPU HDR conversion failed, falling back to CPU");
         }
     }
 #endif

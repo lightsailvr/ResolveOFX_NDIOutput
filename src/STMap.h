@@ -35,6 +35,7 @@
 */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +45,8 @@
 
 #include <zlib.h>
 
+#include "PlatformPaths.h"
+
 namespace ndi_stmap {
 
 // Caps applied before any allocation so a hostile header can't OOM the host.
@@ -51,6 +54,9 @@ namespace ndi_stmap {
 constexpr int kMaxMapDim = 16384;
 constexpr long long kMaxMapTexels = 1LL << 26;
 constexpr int kMaxChannels = 64;
+// 1LL, not 1L: long is 32-bit on Windows, where 1L << 31 goes negative and
+// would reject every file as unreadable.
+constexpr long long kMaxFileBytes = 1LL << 31;
 
 struct STMapImage {
     int width = 0;
@@ -186,7 +192,7 @@ inline bool loadSTMapEXR(const char* path, STMapImage* out, std::string* error)
         return false;
     };
 
-    std::FILE* f = std::fopen(path, "rb");
+    std::FILE* f = ndi_path::fopenUtf8(path, "rb");
     if (!f) {
         return fail(std::string("cannot open '") + path + "'");
     }
@@ -196,7 +202,7 @@ inline bool loadSTMapEXR(const char* path, STMapImage* out, std::string* error)
         std::fseek(f, 0, SEEK_END);
         const long fileSize = std::ftell(f);
         std::fseek(f, 0, SEEK_SET);
-        if (fileSize > 0 && fileSize <= (1L << 31)) {
+        if (fileSize > 0 && fileSize <= kMaxFileBytes) {
             bytes.resize(static_cast<size_t>(fileSize));
             readOk = (std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size());
         }
