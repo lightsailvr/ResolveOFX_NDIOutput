@@ -310,6 +310,34 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0 both modes — a forced stub configure (`-DNDI_SDK_PATH=C:/nonexistent`) reproduced the CI failure locally, then linked clean and passed 8/8 after the fix; real-SDK build unchanged, no warnings under `/WX`.
 **Rule:** in a hand-fed `.def`, always write the `LIBRARY` name with its `.dll` extension, and pair every `/DELAYLOAD` with linker-warnings-as-errors — LNK4199 is a silent functional regression, not a style nit.
 
+### 2026-08-31 — "No CUDA toolset found": point the VS generator at the toolkit with -T cuda=<path> (ticket #22)
+**Symptom:** `enable_language(CUDA)` failed configure with `No CUDA toolset found` although `nvcc --version` worked and the toolkit was fully installed.
+**Root cause:** the Visual Studio generator finds CUDA through MSBuild integration files (`CUDA 12.9.props/.targets`) that must live inside the VS installation (`MSBuild\...\BuildCustomizations`). The toolkit ships them under `extras\visual_studio_integration\MSBuildExtensions`, but copying them into VS is an admin-only installer step that never ran on this machine — and UAC prompts spawned from an automation shell auto-cancel, so an agent can't run it.
+**Fix:** pass the toolset explicitly: `-T "cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"` — CMake then loads the integration straight from the toolkit, no admin, no VS mutation. CI uses the same recipe (`-T "cuda=$env:CUDA_PATH"` after the toolkit-install action), so both paths are integration-copy-independent. Documented in BUILD.md as the always-pass option (harmless when the integration IS installed).
+**Validated by:** Tier 0 — configure + full CUDA build + 9/9 ctest locally; CI on this branch.
+**Rule:** with the VS generator, treat `-T cuda=<toolkit root>` as part of the standard configure line — never depend on the CUDA VS integration having been copied into Visual Studio.
+
+### 2026-08-31 — cudart_static's LIBCMT defaultlib is fatal under the plugin's /WX link (ticket #22)
+**Symptom:** first CUDA link of the plugin died with `LNK4098: defaultlib 'LIBCMT' conflicts` promoted to `LNK1218` — by the very `/WX` that guards the delay-load import (LEARNINGS 2026-08-31 above).
+**Root cause:** `cudart_static.lib` is built `/MT` and embeds a `/DEFAULTLIB:LIBCMT` directive; the plugin builds `/MD` (vcpkg `static-md` triplet), so two CRTs land on the link line. Static cudart is non-negotiable — a `cudart64_*.dll` beside the plugin would re-run the `z.dll` loader trap.
+**Fix:** `/NODEFAULTLIB:LIBCMT` on the CUDA-linking targets (CMakeLists.txt) — the standard pairing for cudart_static in an `/MD` build; its CRT needs resolve from the dynamic runtime.
+**Validated by:** Tier 0 — clean `/WX` link, all 9 tests green, `test_plugin_delayload` confirms no new load-time imports (cudart_static loads the driver's `nvcuda.dll` dynamically, so non-NVIDIA machines still load the plugin and fall back to CPU).
+**Rule:** static CUDA runtime + dynamic CRT always needs `/NODEFAULTLIB:LIBCMT`; keep `/WX` and add the exclusion rather than letting any linker warning slide.
+
+### 2026-08-31 — CUDA kernels CAN be byte-identical to CPU float code: kill FMA, mirror the operation order (ticket #22)
+**Symptom:** the ticket demanded CUDA outputs memcmp-equal to the shared CPU references — a stricter bar than the Metal test's rounding tolerance (±2 UYVY / ±64 P216) — and it wasn't obvious GPU float math could meet it.
+**Root cause of the usual mismatch:** nvcc contracts `a*b+c` into fused multiply-adds by default (different rounding than separate mul+add), while MSVC at the default `/arch` emits no FMA at all; different summation orders compound it. Neither hardware nor IEEE 754 is the obstacle — both sides round identically once the operation sequence matches.
+**Fix:** compile the CUDA translation units with `--fmad=false` and write the kernels to replicate the CPU references operation-for-operation (same summation order in the box filter, same expression trees in the converters and bilinear warp, same clamp shapes). Cost is noise — the kernels are memory-bound.
+**Validated by:** Tier 0 — `test_cuda_downscale`: 25/25 checks exactly byte-identical on an RTX 4090 (which also exercises the Ampere-PTX JIT forward path, spec decision 8), including identity-STMap ≡ plain-downscale.
+**Rule:** when a GPU kernel must reproduce CPU reference bytes, disable FMA contraction for those translation units and treat the reference's operation order as part of the contract — tolerance windows are a smell, not a necessity.
+
+### 2026-08-31 — cudaLaunchHostFunc callbacks may not call CUDA APIs; timing needs a dispatcher hop (ticket #22)
+**Symptom:** (design constraint, caught before it shipped) the GPU-module contract's `done` callback carries `gpuMs` from CUDA events, but the host-function callback that signals completion is documented as forbidden from making ANY CUDA API call — including `cudaEventElapsedTime`.
+**Root cause:** CUDA host functions execute on the runtime's internal callback thread mid-stream; API calls from there are undefined/not permitted (and the host function also blocks all later work on that stream until it returns — Resolve's own included).
+**Fix:** `src/CudaGPUAcceleration.cu` keeps the host function near-free (push slot pointer, wake a thread) and adds a module-owned dispatcher thread that reads the event timings (legal off the callback thread — the events have already completed) and invokes `done`. Mirrors where Metal's completion handler runs; the seam contract is unchanged.
+**Validated by:** Tier 0 — async submit tests (output bit-equal to blocking path, slot-ring backpressure, 4-in-flight) green.
+**Rule:** never touch the CUDA API from a `cudaLaunchHostFunc` callback — treat it purely as a signal and do the CUDA-facing work (event queries, timing) on your own thread.
+
 ---
 
 ## Template for new entries

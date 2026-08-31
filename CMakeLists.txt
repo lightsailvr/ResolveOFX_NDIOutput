@@ -1,13 +1,18 @@
 # Windows build harness for the NDI Output OFX plugin (spec decision 8:
-# CMake + VS2022; docs/windows-port-spec.md). The Makefile remains the macOS
-# harness; BUILD.md is the contract between the two.
+# CMake + VS2022 + CUDA Toolkit 12.9; docs/windows-port-spec.md). The
+# Makefile remains the macOS harness; BUILD.md is the contract between the
+# two.
 #
-# CPU-only for now — the CUDA module (ticket #22) will add
-# enable_language(CUDA) and the kernel sources behind the same GPU-module
-# contract the Metal module implements.
+# The CUDA module (ticket #22) implements the same GPU-module contract the
+# Metal module does; -DNDI_ENABLE_CUDA=OFF builds the CPU-only plugin (no
+# GPU-native path, no CUDA toolkit needed).
 #
-# Configure + build (see BUILD.md, Windows section):
+# Configure + build (see BUILD.md, Windows section). The -T option points the
+# VS generator's CUDA toolset straight at the toolkit — needed whenever the
+# CUDA VS integration was never copied into Visual Studio (an admin step the
+# toolkit installer performs but a bare nvcc install does not):
 #   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+#         -T "cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9" ^
 #         -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
 #   cmake --build build --config Release
 #   ctest --test-dir build -C Release --output-on-failure
@@ -38,6 +43,20 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- CUDA (ticket #22; spec decisions 4, 5, 8) -------------------------------
+# Architectures (spec decision 8): Pascal + Turing + Ampere as real targets
+# plus Ampere PTX so newer GPUs (Ada, Hopper, ...) JIT forward. Must be set
+# before enable_language(CUDA).
+option(NDI_ENABLE_CUDA "Build the CUDA GPU-native pipeline" ON)
+if(NDI_ENABLE_CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "60-real;75-real;86-real;86-virtual")
+    endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
 
 # --- Version guard -----------------------------------------------------------
 # VERSION and the #defines in src/NDIOutputPlugin.cpp are synced by
@@ -107,9 +126,19 @@ endif()
 
 # --- Shared compile settings -------------------------------------------------
 # /utf-8: sources hold UTF-8 string literals (log emoji, path tests); without
-# it MSVC decodes them through the local ANSI code page.
-add_compile_options(/W3 /utf-8 /MP)
+# it MSVC decodes them through the local ANSI code page. MSVC flags are scoped
+# to C/C++ — nvcc rejects them on its own command line — and reach CUDA host
+# code via -Xcompiler.
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/W3;/utf-8;/MP>")
+add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+
+# Byte-identity flag (ticket #22): the CUDA kernels must produce bytes equal
+# to the shared CPU references, so nvcc may not contract the multiply-adds
+# MSVC leaves separate (MSVC generates no FMA at the default /arch). The
+# kernels are memory-bound; the cost is noise. test_cuda_downscale is the
+# enforcement.
+set(NDI_CUDA_EXACT_MATH "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 
 # --- The plugin --------------------------------------------------------------
 add_library(NDIOutput SHARED src/NDIOutputPlugin.cpp)
@@ -117,6 +146,23 @@ set_target_properties(NDIOutput PROPERTIES
     OUTPUT_NAME "NDIOutput"
     SUFFIX ".ofx"
     PREFIX "")
+if(NDI_ENABLE_CUDA)
+    target_sources(NDIOutput PRIVATE src/CudaGPUAcceleration.cu)
+    # NDI_HAS_CUDA gates the plugin's GPU-native seam (NDIOutputPlugin.cpp);
+    # without it the same source builds the CPU-only plugin.
+    target_compile_definitions(NDIOutput PRIVATE NDI_HAS_CUDA)
+    target_compile_options(NDIOutput PRIVATE ${NDI_CUDA_EXACT_MATH})
+    # cudart must link STATICALLY: a cudart64_*.dll staged beside the plugin
+    # would hit the same loader trap as z.dll (Windows never searches the
+    # plugin's folder for its load-time imports) and silently empty the
+    # Effects Library. test_plugin_delayload enforces this stays true.
+    set_target_properties(NDIOutput PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    # cudart_static.lib embeds /DEFAULTLIB:LIBCMT (it is built /MT); in this
+    # /MD build that raises LNK4098, which the plugin's /WX would make fatal.
+    # Dropping LIBCMT is the standard pairing for cudart_static + /MD — its
+    # CRT needs resolve from the dynamic runtime.
+    target_link_options(NDIOutput PRIVATE "/NODEFAULTLIB:LIBCMT")
+endif()
 target_include_directories(NDIOutput PRIVATE
     openfx/include
     src
@@ -161,6 +207,24 @@ endforeach()
 target_link_libraries(test_stmap PRIVATE ZLIB::ZLIB)
 target_link_libraries(test_brawmap PRIVATE ZLIB::ZLIB)
 
+# CUDA kernel-identity test (ticket #22): the fused kernels must be
+# byte-identical to the shared CPU references. Compiles the module in
+# directly, like test_metal_downscale does on macOS; runs on any machine with
+# a CUDA device and skips cleanly without one (hosted CI compiles it, the
+# Windows workstation executes it — LEARNINGS.md Tier 0).
+if(NDI_ENABLE_CUDA)
+    add_executable(test_cuda_downscale
+        tests/test_cuda_downscale.cpp
+        src/CudaGPUAcceleration.cu)
+    target_include_directories(test_cuda_downscale PRIVATE src)
+    target_compile_options(test_cuda_downscale PRIVATE ${NDI_CUDA_EXACT_MATH})
+    set_target_properties(test_cuda_downscale PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    target_link_options(test_cuda_downscale PRIVATE "/NODEFAULTLIB:LIBCMT") # see the plugin's note
+    target_link_libraries(test_cuda_downscale PRIVATE ZLIB::ZLIB)
+    add_test(NAME test_cuda_downscale COMMAND test_cuda_downscale)
+    set_tests_properties(test_cuda_downscale PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
+
 # Delay-load smoke test (Windows-only, so not in the portable list): loads
 # the freshly built .ofx with a System32-only import search - what Resolve's
 # plugin scanner amounts to - and fails on any load-time import that would
@@ -187,5 +251,10 @@ if(NOT NDI_USING_STUB)
         DESTINATION "${NDI_BUNDLE_BIN_DIR}")
 endif()
 
-message(STATUS "NDI Output ${NDI_VERSION_FILE} - Windows CPU-only build "
-               "(CUDA lands with ticket #22)")
+if(NDI_ENABLE_CUDA)
+    message(STATUS "NDI Output ${NDI_VERSION_FILE} - Windows build with the "
+                   "CUDA GPU-native pipeline (ticket #22)")
+else()
+    message(STATUS "NDI Output ${NDI_VERSION_FILE} - Windows CPU-only build "
+                   "(NDI_ENABLE_CUDA=OFF)")
+endif()

@@ -1,7 +1,9 @@
-# Windows compile-proof CI (ticket #20; spec decision 9): configure + build
-# the plugin CPU-only under MSVC, run the portable unit suite, and upload a
-# spec-correct bundle tree. Hosted runners have no GPU and no Resolve, so
-# Tiers 1-2 of the testing loop stay human (BUILD.md, Windows section).
+# Windows compile-proof CI (tickets #20/#22; spec decision 9): configure +
+# build the plugin — including the CUDA translation units — under MSVC + CUDA
+# Toolkit 12.9, run the portable unit suite, and upload a spec-correct bundle
+# tree. Hosted runners have no GPU and no Resolve, so test_cuda_downscale
+# skips itself (compile-proof only) and Tiers 1-2 of the testing loop stay
+# human (BUILD.md, Windows section).
 #
 # The NDI Advanced SDK is access-gated and never lives in CI: the build links
 # a stub import library generated from the checked-in export list
@@ -25,12 +27,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure (CMake + vcpkg toolchain)
+      # nvcc + cudart are what the compile needs; visual_studio_integration
+      # supplies the MSBuild files the VS generator's CUDA toolset loads. The
+      # configure step points CMake straight at the toolkit (-T cuda=...) so
+      # the build never depends on the integration being copied into the VS
+      # installation itself — the same recipe BUILD.md documents for a
+      # workstation without admin rights.
+      - name: Install CUDA Toolkit 12.9 (compile only)
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: Configure (CMake + vcpkg toolchain + CUDA)
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -T "cuda=$env:CUDA_PATH"
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
 
-      - name: Build (Release, CPU-only)
+      - name: Build (Release, CUDA included)
         run: cmake --build build --config Release --parallel
 
       - name: Run portable unit tests (MSVC)
@@ -51,6 +67,6 @@ jobs:
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NDIOutput-win64-cpu-only
+          name: NDIOutput-win64
           path: stage/
           if-no-files-found: error
