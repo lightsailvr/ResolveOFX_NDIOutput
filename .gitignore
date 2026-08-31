@@ -10,6 +10,7 @@
 
 # CMake build trees (Windows/CUDA build)
 /build/
+/stage/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
