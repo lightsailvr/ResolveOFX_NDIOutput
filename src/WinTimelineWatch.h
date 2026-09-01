@@ -251,9 +251,11 @@ inline PythonDiscovery discoverPython()
     if (best < candidates.size()) {
         return {candidates[best].exePath, candidates[best].source};
     }
+    // SearchPathW returning >= the buffer size means "didn't fit" and the
+    // buffer contents are undefined — treat as not found.
     wchar_t found[MAX_PATH];
-    if (SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, found, nullptr) > 0 &&
-        GetFileAttributesW(found) != INVALID_FILE_ATTRIBUTES) {
+    const DWORD n = SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, found, nullptr);
+    if (n > 0 && n < MAX_PATH && GetFileAttributesW(found) != INVALID_FILE_ATTRIBUTES) {
         return {found, "PATH search"};
     }
     return {};
@@ -278,10 +280,12 @@ struct HelperProcess {
 inline bool spawnHelperProcess(const std::wstring& cmdLine, HelperProcess* out,
                                std::string* error)
 {
-    auto fail = [&](const char* what) {
+    // Callers capture GetLastError() BEFORE any cleanup: CloseHandle and
+    // friends overwrite it, and this seam's whole job is honest error codes.
+    auto fail = [&](const char* what, DWORD lastError) {
         if (error) {
             *error = std::string(what) + " (Win32 error " +
-                     std::to_string(GetLastError()) + ")";
+                     std::to_string(lastError) + ")";
         }
         return false;
     };
@@ -292,7 +296,7 @@ inline bool spawnHelperProcess(const std::wstring& cmdLine, HelperProcess* out,
 
     HANDLE readEnd = nullptr, writeEnd = nullptr;
     if (!CreatePipe(&readEnd, &writeEnd, &inheritable, 0)) {
-        return fail("CreatePipe failed");
+        return fail("CreatePipe failed", GetLastError());
     }
     // Only the write end may cross into the child.
     SetHandleInformation(readEnd, HANDLE_FLAG_INHERIT, 0);
@@ -301,9 +305,10 @@ inline bool spawnHelperProcess(const std::wstring& cmdLine, HelperProcess* out,
                              FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
                              OPEN_EXISTING, 0, nullptr);
     if (nul == INVALID_HANDLE_VALUE) {
+        const DWORD lastError = GetLastError();
         CloseHandle(readEnd);
         CloseHandle(writeEnd);
-        return fail("opening NUL failed");
+        return fail("opening NUL failed", lastError);
     }
 
     SIZE_T attrSize = 0;
@@ -312,14 +317,22 @@ inline bool spawnHelperProcess(const std::wstring& cmdLine, HelperProcess* out,
     LPPROC_THREAD_ATTRIBUTE_LIST attrs =
         reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
     HANDLE inheritList[2] = {writeEnd, nul};
-    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) ||
-        !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   inheritList, sizeof(inheritList), nullptr,
-                                   nullptr)) {
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize)) {
+        const DWORD lastError = GetLastError();
         CloseHandle(readEnd);
         CloseHandle(writeEnd);
         CloseHandle(nul);
-        return fail("building the handle-inheritance list failed");
+        return fail("building the handle-inheritance list failed", lastError);
+    }
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inheritList, sizeof(inheritList), nullptr,
+                                   nullptr)) {
+        const DWORD lastError = GetLastError();
+        DeleteProcThreadAttributeList(attrs);  // Initialize succeeded above
+        CloseHandle(readEnd);
+        CloseHandle(writeEnd);
+        CloseHandle(nul);
+        return fail("setting the handle-inheritance list failed", lastError);
     }
 
     STARTUPINFOEXW si = {};
@@ -343,8 +356,7 @@ inline bool spawnHelperProcess(const std::wstring& cmdLine, HelperProcess* out,
     CloseHandle(nul);
     if (!ok) {
         CloseHandle(readEnd);
-        SetLastError(createError);
-        return fail("CreateProcessW failed");
+        return fail("CreateProcessW failed", createError);
     }
     CloseHandle(pi.hThread);
     out->process = pi.hProcess;

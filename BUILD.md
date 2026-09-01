@@ -189,7 +189,7 @@ The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v
 
 The helper finds Resolve's scripting environment without configuration: the scripting modules load from `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules`, and the plugin derives the `fusionscript.dll` path from the *running* `Resolve.exe` (the watcher spawns from inside Resolve's process) and hands it to the helper, so non-default install directories work.
 
-Every failure is soft and named in the log (DebugView filter `NDI Plugin: TimelineWatch:`): no Python found, helper script missing from the bundle, spawn failure, scripting disabled, module-import failure. The helper respawns with 30 s backoff; Manual Path mode is unaffected throughout, and Stream Status carries the watcher's health detail when Auto mode has no usable clip.
+Every failure is soft and named in the log (DebugView filter `NDI Plugin: TimelineWatch:`): no Python found, helper script missing from the bundle, spawn failure, scripting disabled, module-import failure. The helper respawns with 30 s backoff; Manual Path mode is unaffected throughout. When Auto mode has no usable clip, Stream Status shows the generic camera-metadata passthrough message (same text as macOS) and the *log* carries the watcher's health detail alongside it.
 
 ### Logs on Windows
 
