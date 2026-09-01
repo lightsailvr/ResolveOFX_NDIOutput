@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (#22), native Browse dialogs (#24), Timeline (Auto) clip watcher (#25, one-click via Resolve's own fuscript since v1.14.1), Camera Metadata projection (#26), and the Inno Setup installer + release wiring (#23) in the build — see the Windows STATUS section below for what remains human-verified
+- **Windows** — port integrated into this tree (PR #37, 2026-09-01), not yet a public release: CUDA GPU-native pipeline with kernel identity tests (#22), native Browse dialogs (#24), Timeline (Auto) clip watcher (#25, one-click via Resolve's own fuscript since v1.14.1), Camera Metadata projection (#26), and the Inno Setup installer + release wiring (#23) in the build — see the Windows STATUS section below for what remains human-verified
 
 ---
 
@@ -251,7 +251,7 @@ NDI_TEST_BRAW_CLIP='C:\clips\B001_10151156_C001.braw' ./build/Release/test_braw_
 
 ### CI
 
-[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. It then builds the installer from that (stub) tree and runs `scripts/test_windows_installer.ps1` — a real silent install/uninstall cycle on the runner, which is elevated and has no Resolve — uploading `dist/` as `NDIOutput-win64-installer`. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `dev`, `master`, and any `feature/`-prefixed branch (glob `feature/**`), on PRs into `dev`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. It then builds the installer from that (stub) tree and runs `scripts/test_windows_installer.ps1` — a real silent install/uninstall cycle on the runner, which is elevated and has no Resolve — uploading `dist/` as `NDIOutput-win64-installer`. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
 
 Same rule as macOS: any Windows build change updates this section in the same PR.
 
