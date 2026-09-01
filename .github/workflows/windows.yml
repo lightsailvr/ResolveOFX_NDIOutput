@@ -14,11 +14,12 @@ name: windows
 on:
   push:
     branches:
-      - windows-port
-      - "feature/win-**"
+      - dev
+      - master
+      - "feature/**"
   pull_request:
     branches:
-      - windows-port
+      - dev
   workflow_dispatch:
 
 jobs:

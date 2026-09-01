@@ -1,6 +1,6 @@
 # Spec: Windows Port of the NDI Output OFX Plugin
 
-**Status:** approved plan · **Branch:** `windows-port` (long-lived integration branch off `dev`) · **Date:** 2026-08-30
+**Status:** approved plan · **Branch:** `dev` — the `windows-port` integration branch merged 2026-09-01 (PR #37); decision 2 amended below · **Date:** 2026-08-30
 **Source research:** [2026-08-30-windows-port-feasibility.md](2026-08-30-windows-port-feasibility.md) — every decision below traces to a verified finding there.
 **Tickets:** GitHub issues (labels `windows` + triage labels), each referencing this spec and the `windows-port` branch — spec issue #18; work tickets #19 (workstation, human), #20 (CI compile), #21 (first stream), #22 (CUDA pipeline), #23 (installer), #24–#26 (parity tail). Blocking edges are native GitHub dependencies; work the frontier (any open ticket whose blockers are all closed).
 
@@ -44,7 +44,7 @@ Ship a first-class Windows version of the plugin as part of the same product: on
 **Product shape**
 
 1. **One codebase, one version — Windows gets its own build pipeline, never its own versioning.** `VERSION` and `CHANGELOG.md` stay unified; release artifacts are platform-suffixed. Rationale: a separately-versioned Windows line would fork the product's identity, double the release bookkeeping, and let the platforms drift; the plugin already displays a single version parameter. A release may ship with one platform lagging (noted in release notes) — that is a release-notes fact, not a version fork.
-2. **Branch model:** `windows-port` is a long-lived integration branch off `dev`. Windows work happens on `feature/win-<name>` branches off `windows-port`, merged into `windows-port` by PR once the Windows testing loop passes. When the port meets this spec's release bar, `windows-port` merges into `dev` by PR like any feature; releases remain `dev` → `master`, only on Matt's explicit instruction. Never commit to `master` (unchanged).
+2. **Branch model:** `windows-port` is a long-lived integration branch off `dev`. Windows work happens on `feature/win-<name>` branches off `windows-port`, merged into `windows-port` by PR once the Windows testing loop passes. When the port meets this spec's release bar, `windows-port` merges into `dev` by PR like any feature; releases remain `dev` → `master`, only on Matt's explicit instruction. Never commit to `master` (unchanged). *Amended 2026-09-01 (Matt, PR #37): `windows-port` merged into `dev` before the release bar, because the long-lived branch was producing duplicate version bumps and duplicate files against macOS features; Windows work now goes on `feature/win-<name>` off `dev`, and the release bar gates `dev` → `master` instead.*
 3. **Release bar for the first Windows release:** installer-to-visible-stream on a fresh machine, GPU-native CUDA path at 8K stereo, and the deferred-features list stated in release notes.
 
 **GPU strategy**
