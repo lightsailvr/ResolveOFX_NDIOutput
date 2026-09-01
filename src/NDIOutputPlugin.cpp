@@ -89,6 +89,20 @@ static void ndiWinLog(const char* fmt, ...);
 #include <windows.h>
 #include <cstdarg>
 #include <cstdlib>
+#include "WinFileDialog.h"
+#endif
+
+// Native browse-dialog seam (ticket #24): both desktop platforms pop a
+// native open dialog from the browse push-buttons, behind one contract
+// (UTF-8 in/out; cancel and every failure return false with the buffer
+// untouched). Aliased like the GPU modules so the param plumbing below
+// compiles identically on both.
+#if defined(__APPLE__)
+#define NDI_HAS_BROWSE_DIALOGS 1
+#define native_open_file_dialog mac_open_file_dialog
+#elif defined(_WIN32)
+#define NDI_HAS_BROWSE_DIALOGS 1
+#define native_open_file_dialog win_open_file_dialog
 #endif
 
 // NDI Advanced SDK
@@ -202,7 +216,8 @@ static void ndiWinLog(const char* fmt, ...)
 
 // Native browse buttons: Resolve renders filePath string params as plain
 // text fields with no browse control (verified 2026-08-30), so the plugin
-// pops its own NSOpenPanel from push-button params (macOS only).
+// pops its own native open dialog from push-button params — NSOpenPanel on
+// macOS, IFileOpenDialog on Windows (the browse-dialog seam above).
 #define kParamSTMapPackedBrowse "stmapPackedBrowse"
 #define kParamSTMapPackedBrowseLabel "Browse for STMap..."
 #define kParamSTMapPackedBrowseHint "Pick the packed side-by-side STMap EXR with a file dialog and fill the path field above."
@@ -719,8 +734,8 @@ struct NDIInstanceData {
     OfxParamHandle stmapRightParam;
     OfxParamHandle brawSourceParam;
     OfxParamHandle brawClipParam;
-#ifdef __APPLE__
-    // Browse buttons (Apple-only, like their definitions) — cached so
+#ifdef NDI_HAS_BROWSE_DIALOGS
+    // Browse buttons (gated like their definitions) — cached so
     // updateParamVisibility can flip their secret state with the path fields.
     OfxParamHandle stmapPackedBrowseParam;
     OfxParamHandle stmapLeftBrowseParam;
@@ -2627,7 +2642,7 @@ static void updateParamVisibility(NDIInstanceData* data)
     setParamSecret(data->stmapRightParam, packed);
     const bool autoClip = (data->brawSourceChoice == 0);
     setParamSecret(data->brawClipParam, autoClip);
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     setParamSecret(data->stmapPackedBrowseParam, !packed);
     setParamSecret(data->stmapLeftBrowseParam, packed);
     setParamSecret(data->stmapRightBrowseParam, packed);
@@ -2797,7 +2812,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWSource, &myData->brawSourceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWClip, &myData->brawClipParam, 0);
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     gParamHost->paramGetHandle(paramSet, kParamSTMapPackedBrowse, &myData->stmapPackedBrowseParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLeftBrowse, &myData->stmapLeftBrowseParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapRightBrowse, &myData->stmapRightBrowseParam, 0);
@@ -2865,8 +2880,8 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         
         NDI_LOG("Parameter changed: %s", paramName);
 
-#ifdef __APPLE__
-        // Browse buttons: pop the native open panel and write the picked path
+#ifdef NDI_HAS_BROWSE_DIALOGS
+        // Browse buttons: pop the native open dialog and write the picked path
         // into the matching STMap field, then fall through — the reads below
         // pick the new value up and refreshSTMaps loads the map. Cancel (or
         // any dialog failure) changes nothing.
@@ -2880,7 +2895,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
             char* currentPath = nullptr;
             gParamHost->paramGetValue(pathParam, &currentPath);
             char picked[4096];
-            if (mac_open_file_dialog(isPacked ? "Choose the packed side-by-side STMap EXR"
+            if (native_open_file_dialog(isPacked ? "Choose the packed side-by-side STMap EXR"
                                     : isLeft  ? "Choose the left-eye STMap EXR"
                                               : "Choose the right-eye STMap EXR",
                                      "exr", currentPath, picked, sizeof(picked))) {
@@ -2892,7 +2907,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
             char* currentPath = nullptr;
             gParamHost->paramGetValue(myData->brawClipParam, &currentPath);
             char picked[4096];
-            if (mac_open_file_dialog("Choose any BRAW clip shot on the URSA Cine Immersive",
+            if (native_open_file_dialog("Choose any BRAW clip shot on the URSA Cine Immersive",
                                      "braw", currentPath, picked, sizeof(picked))) {
                 gParamHost->paramSetValue(myData->brawClipParam, picked);
                 NDI_LOG_TEXT((std::string("Camera clip browse picked: '") + picked + "'").c_str());
@@ -3375,9 +3390,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapPackedProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapPackedProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the packed STMap browse button - in Projection group (native
-    // panel; Resolve draws no browse control on filePath string params)
+    // dialog; Resolve draws no browse control on filePath string params)
     OfxPropertySetHandle stmapPackedBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapPackedBrowse, &stmapPackedBrowseProps);
     gPropHost->propSetString(stmapPackedBrowseProps, kOfxPropLabel, 0, kParamSTMapPackedBrowseLabel);
@@ -3398,7 +3413,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapLeftProps, kOfxParamPropSecret, 0, 1); // hidden in packed layout (the default)
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the left-eye browse button - in Projection group
     OfxPropertySetHandle stmapLeftBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapLeftBrowse, &stmapLeftBrowseProps);
@@ -3421,7 +3436,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapRightProps, kOfxParamPropSecret, 0, 1); // hidden in packed layout (the default)
     gPropHost->propSetString(stmapRightProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the right-eye browse button - in Projection group
     OfxPropertySetHandle stmapRightBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapRightBrowse, &stmapRightBrowseProps);
@@ -3462,7 +3477,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(brawClipProps, kOfxParamPropSecret, 0, 1);
     gPropHost->propSetString(brawClipProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the camera clip browse button - in Projection group
     OfxPropertySetHandle brawClipBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamBRAWClipBrowse, &brawClipBrowseProps);

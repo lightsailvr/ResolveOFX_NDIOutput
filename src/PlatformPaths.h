@@ -72,6 +72,44 @@ inline bool utf8ToWide(const char* utf8, std::wstring* out)
     return true;
 }
 
+// Strict UTF-16 (in wchar_t units) -> UTF-8, the reverse of utf8ToWide: the
+// Windows browse dialog gets its picked path from COM as UTF-16 and the OFX
+// string param wants UTF-8 (ticket #24). Returns false on a lone surrogate —
+// mangled WTF-8 in a param value would fail later in fopenUtf8 anyway.
+inline bool wideToUtf8(const wchar_t* wide, std::string* out)
+{
+    out->clear();
+    for (const wchar_t* s = wide; *s; ++s) {
+        unsigned int cp = static_cast<unsigned int>(*s) & 0xFFFF;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            const unsigned int low = static_cast<unsigned int>(s[1]) & 0xFFFF;
+            if (low < 0xDC00 || low > 0xDFFF) {
+                return false; // high surrogate without its pair
+            }
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+            ++s;
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            return false; // low surrogate without a preceding high
+        }
+        if (cp < 0x80) {
+            out->push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out->push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return true;
+}
+
 } // namespace detail
 
 // fopen that survives non-ASCII paths on Windows.
