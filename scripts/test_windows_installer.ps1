@@ -117,9 +117,11 @@ Check "/VERYSILENT install exits 0 (got $($p.ExitCode))" ($p.ExitCode -eq 0)
 
 $ofx = Join-Path $bundle "Contents\Win64\NDIOutput.ofx"
 $readme = Join-Path $bundle "Contents\Resources\README.txt"
+$watcherLua = Join-Path $bundle "Contents\Resources\ndi_timeline_watch.lua"
 $watcher = Join-Path $bundle "Contents\Resources\ndi_timeline_watch.py"
 Check "plugin at Contents\Win64\NDIOutput.ofx" (Test-Path $ofx)
-Check "timeline watcher staged in Contents\Resources" (Test-Path $watcher)
+Check "Lua watcher helper (primary, fuscript) staged" (Test-Path $watcherLua)
+Check "Python watcher helper (fallback) staged" (Test-Path $watcher)
 Check "attribution readme beside the payload" (Test-Path $readme)
 
 # A release build must additionally land the NDI runtime and the third-party
