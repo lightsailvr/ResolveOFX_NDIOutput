@@ -359,6 +359,20 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0.5 — full-chain `test_braw_reader` run against the sample URSA Cine Immersive clip on the workstation; semantic diff against the checked-in fixture clean.
 **Rule:** cross-platform parity checks on SDK-returned text blobs compare parsed values, not bytes — byte-count differences alone prove nothing.
 
+### 2026-09-01 - Inno's uninstaller re-execs from %TEMP%, so waiting on the process proves nothing (ticket #23)
+**Symptom:** (caught at design time) the obvious way to automate the uninstall half of the acceptance test — `Start-Process <unins000.exe> -Wait`, then assert the bundle tree is gone — is a race, not a test.
+**Root cause:** Inno's uninstaller copies itself to `%TEMP%` and relaunches from there so it can delete its own directory; the process the caller waited on exits as soon as the copy is running. Nothing is broken — the wait is simply on the wrong process.
+**Fix:** treat the uninstall as asynchronous in `scripts/test_windows_installer.ps1` — poll for the payload (and the Add-or-Remove-Programs entry) to disappear with a 90 s deadline instead of trusting `-Wait`. The documented `_?=<dir>` switch suppresses the self-copy, but then the uninstaller cannot remove itself, which would weaken the very assertion the test exists for.
+**Validated by:** Tier 0 — the CI acceptance step on `windows-2022` (run 33470536321) drives a real `/VERYSILENT` install and uninstall; both post-uninstall assertions pass.
+**Rule:** never assert on Inno uninstall results straight after the process exits — poll for the effect, and reach for `_?=` only when you do not care that the uninstaller survives.
+
+### 2026-09-01 - A CI-built installer carries a plugin that loads but never streams; name it so nobody can ship it (ticket #23)
+**Symptom:** (caught at design time) the CI installer is built from the stub-linked tree — no NDI Advanced SDK exists in CI — and installs a perfectly loadable plugin whose streaming is dead. Its filename would otherwise be identical to a real release artifact.
+**Root cause:** the stub import library exists precisely so CI can prove compile + link without the access-gated SDK; the resulting artifact is a pipeline proof, not a product, and nothing about the file says so.
+**Fix:** `scripts/package_windows_release.ps1` fails preflight when the NDI runtime DLL and its licenses file are absent; `-AllowStub` waives that one check but renames the outputs `...-STUB.exe`/`.zip` and says out loud what they are. `publish_github_release.sh` aborts if any `-STUB` artifact is sitting in the release directory.
+**Validated by:** Tier 0 — CI produces `NDIOutput-1.14.0-Windows-x64-STUB.exe` and the acceptance test installs/uninstalls it; the release path refuses that name.
+**Rule:** any artifact a CI job builds without the real redistributables gets a name that cannot be mistaken for a release, plus a guard in the publish path — a warning in a log is not a guard.
+
 ---
 
 ## Template for new entries

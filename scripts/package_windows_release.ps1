@@ -137,7 +137,8 @@ $sums = Join-Path $OutDir "SHA256SUMS-Windows.txt"
 $lines = foreach ($f in @($exeOut, $zipOut)) {
     "{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $f)
 }
-Set-Content -Path $sums -Value $lines -Encoding utf8
+# ASCII, not utf8: PowerShell 5.1 would prepend a BOM that trips `sha256sum -c`.
+Set-Content -Path $sums -Value $lines -Encoding ascii
 Write-Host "  checksums: $sums"
 
 Write-Host ""
