@@ -8,6 +8,12 @@
 # Refuses to upload anything unsigned or un-notarized: the pkg must pass
 # `xcrun stapler validate` first. Release notes come from the CHANGELOG.md
 # section matching the version (## [X.Y.Z]) unless --notes-file is given.
+#
+# One release event, per-platform artifacts (ticket #23): if the Windows
+# artifacts built by scripts/package_windows_release.ps1 on a Windows machine
+# have been copied into the same dist/v<VERSION>/ directory, they are attached
+# alongside the pkg and the notes grow a Windows install section. Without them
+# the release is macOS-only and says so.
 
 set -euo pipefail
 
@@ -35,6 +41,35 @@ done
 for f in "$PKG" "$ZIP" "$SUMS"; do
     [ -f "$f" ] || { echo "Missing $f — run ./scripts/package_release.sh first."; exit 1; }
 done
+
+# Windows artifacts are optional (they are built on a Windows machine and
+# copied in), but all-or-nothing: a half-attached platform is worse than none.
+WIN_EXE="$DIST/NDIOutput-$VERSION-Windows-x64.exe"
+WIN_ZIP="$DIST/NDIOutput-$VERSION-Windows-x64.zip"
+WIN_SUMS="$DIST/SHA256SUMS-Windows.txt"
+WIN_FILES=()
+win_present=0
+for f in "$WIN_EXE" "$WIN_ZIP" "$WIN_SUMS"; do
+    [ -f "$f" ] && win_present=$((win_present + 1))
+done
+if [ "$win_present" -eq 3 ]; then
+    WIN_FILES=("$WIN_EXE" "$WIN_ZIP" "$WIN_SUMS")
+    echo "Windows artifacts found — this will be a macOS + Windows release."
+elif [ "$win_present" -eq 0 ]; then
+    echo "No Windows artifacts in $DIST — releasing macOS only."
+else
+    echo "Only $win_present of 3 Windows artifacts present in $DIST:"
+    for f in "$WIN_EXE" "$WIN_ZIP" "$WIN_SUMS"; do
+        [ -f "$f" ] || echo "  missing: $f"
+    done
+    echo "Copy all three from the Windows machine (scripts/package_windows_release.ps1), or remove them."
+    exit 1
+fi
+# A STUB build is the CI pipeline proof — it loads but never streams.
+if ls "$DIST"/*-STUB.* >/dev/null 2>&1; then
+    echo "STUB artifacts present in $DIST — those never ship. Remove them and package against the real NDI SDK."
+    exit 1
+fi
 
 echo "Validating notarization staple on $PKG..."
 xcrun stapler validate "$PKG" || {
@@ -70,11 +105,37 @@ cat >> "$NOTES" <<'EOF'
 
 ---
 
-### Install
+### Install — macOS
 
 Download `NDIOutput-*-macOS.pkg`, double-click, done. Restart DaVinci Resolve, then find the plugin on the Color page under **OpenFX → LSVR → NDIOutput**. Requires macOS 13+ (Apple Silicon or Intel); the NDI runtime is included.
 
 The `.zip` contains the bare signed plugin bundle for manual installs into `/Library/OFX/Plugins`.
+EOF
+
+if [ "$win_present" -eq 3 ]; then
+    cat >> "$NOTES" <<'EOF'
+
+### Install — Windows
+
+Download `NDIOutput-*-Windows-x64.exe` and run it (quit DaVinci Resolve first — the installer refuses to replace a loaded plugin). Restart Resolve, then find the plugin on the Color page under **OpenFX → LSVR → NDIOutput**. Requires 64-bit Windows 10/11; the NDI runtime is included.
+
+**This installer is not code-signed**, so Windows SmartScreen shows *"Windows protected your PC"*. Click **More info → Run anyway**. To verify the download instead of trusting a signature, compare its SHA-256 against `SHA256SUMS-Windows.txt`:
+
+```powershell
+Get-FileHash .\NDIOutput-<version>-Windows-x64.exe -Algorithm SHA256
+```
+
+Silent install for fleet deployment: `NDIOutput-<version>-Windows-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`. Uninstall from **Add or Remove Programs**.
+
+The `.zip` contains the bare plugin bundle for manual installs into `C:\Program Files\Common Files\OFX\Plugins`.
+
+The first NDI send raises a Windows Firewall prompt for Resolve — allow it on private networks, or the stream stays unreachable from other machines.
+EOF
+fi
+
+cat >> "$NOTES" <<'EOF'
+
+---
 
 NDI® is a registered trademark of Vizrt NDI AB — [ndi.video](https://ndi.video/)
 EOF
@@ -95,7 +156,7 @@ echo "Creating GitHub release $TAG${DRAFT_FLAG:+ (draft)}..."
 gh release create "$TAG" $DRAFT_FLAG \
     --title "$TAG" \
     --notes-file "$NOTES" \
-    "$PKG" "$ZIP" "$SUMS"
+    "$PKG" "$ZIP" "$SUMS" ${WIN_FILES[@]+"${WIN_FILES[@]}"}
 
 echo ""
 if [ "$PUBLISH" -eq 1 ]; then

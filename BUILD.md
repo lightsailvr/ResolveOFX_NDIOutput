@@ -118,9 +118,11 @@ Flags: `--skip-notarize` (local testing), `--skip-tests`, `--host-arch-only`, `-
 
 A release build differs from the dev build (universal, deployment target, bundled dylib), so run the Tiers 1–2 loop with the **pkg-installed** plugin before publishing.
 
+**Windows artifacts join the same release** (one `VERSION`, one `CHANGELOG.md`, one release event): build them on a Windows machine with `scripts/package_windows_release.ps1` (Windows section below), copy the three files into this machine's `dist/v<VERSION>/`, and `publish_github_release.sh` attaches them next to the pkg and grows a Windows install section in the notes. It is all-or-nothing — two of three files present is an error, and any `-STUB` artifact aborts the publish. With none present it releases macOS-only and says so.
+
 ---
 
-## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25), and Camera Metadata (BRAW) projection (#26) in the build; installer pending (#23)
+## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25), Camera Metadata (BRAW) projection (#26), and the installer + release wiring (#23) in the build; the fresh-machine installer pass is the Tier 1–2 work still owed
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
@@ -182,6 +184,31 @@ The script refuses to run while Resolve is open (no OFX hot reload). Fully resta
 
 Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (note the extra `Support\` level vs macOS; same delete-with-Resolve-closed rescan procedure, or `-ResetCache` above). If the plugin doesn't appear in the Effects Library: reset the cache first, then watch the load in DebugView (below) — the loader logs which NDI runtime path it resolved (bundle, system, or NOT FOUND with both Win32 error codes).
 
+### Installer and Windows release artifacts (ticket #23)
+
+`scripts/install_windows.ps1` above is the **dev** install (copy the stage tree). End users get an **Inno Setup 6** installer: [installer/NDIOutput.iss](installer/NDIOutput.iss), compiled by
+
+```powershell
+cmake --install build --config Release --prefix stage
+powershell -ExecutionPolicy Bypass -File .\scripts\package_windows_release.ps1
+```
+
+which writes `dist\v<VERSION>\`: `NDIOutput-<VERSION>-Windows-x64.exe` (installer), `...x64.zip` (bare bundle for manual installs), and `SHA256SUMS-Windows.txt` — the Windows counterpart of `package_release.sh`'s three macOS artifacts. Its preflight refuses to package a tree whose `VERSION` and `kPluginVersionString` disagree, that is missing the Timeline (Auto) helper, or that carries no NDI runtime DLL + `Processing.NDI.Lib.Licenses.txt` (the redistribution obligation, spec decision 13). `-AllowStub` waives only the last one, for stub-linked builds like CI's, and renames the output `...-STUB.exe`/`.zip` so a build that **loads but never streams** can't be mistaken for a release — `publish_github_release.sh` aborts if it sees one.
+
+What the installer does: installs the bundle tree to `C:\Program Files\Common Files\OFX\Plugins\NDIOutput.ofx.bundle` (admin, no directory page — the OFX host scans one location), wipes that tree first so a file from an older version never lingers, adds the attribution readme and the plugin license to `Contents\Resources`, and registers an Add-or-Remove-Programs entry whose uninstaller lives *outside* the bundle (`C:\Program Files\Light Sail VR\NDI Output`, removed on uninstall) so the bundle holds only plugin payload. It **refuses to run while Resolve is running** — a loaded plugin can't be replaced, and Restart Manager is disabled on purpose rather than offering to close Resolve mid-edit. `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` covers unattended fleet deployment (a running Resolve then just means a non-zero exit code).
+
+The installer is **unsigned** for v1, with the SmartScreen "More info → Run anyway" click-through documented in README.md, the installer readme, and the release notes (spec decision 18 — EV certificates no longer bypass SmartScreen). The upgrade path is Azure Artifact Signing when install-friction reports appear: add `SignTool=` to the Inno compiler config; no script change.
+
+**Automated acceptance test** (the machine-checkable half of the ticket):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_windows_installer.ps1
+```
+
+from an **elevated** PowerShell with Resolve closed. It drives a real `/VERYSILENT` install, asserts the plugin, the watcher helper and the attribution readme (trademark line + ndi.video link) landed, checks the ARP entry carries the right `DisplayVersion` and an uninstall string, then runs the uninstaller silently and asserts the bundle tree *and* the ARP entry are gone. It refuses to start if a bundle is already installed (it would remove your dev install at the end — `-Force` overrides). CI runs it on every push.
+
+**Tier 1–2 (human, still owed):** on a *fresh* machine — one with no NDI software and no dev checkout — download the installer from a draft release, click through SmartScreen, install, restart Resolve, and see the stream in Studio Monitor from a second machine; then uninstall and confirm the Effects Library entry is gone after a restart. That is the ticket's release bar; the automated test above does not replace it.
+
 ### Timeline (Auto) camera-clip watcher (ticket #25)
 
 The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns the bundled `Contents/Resources/ndi_timeline_watch.py` as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. Requirements on Windows:
@@ -213,7 +240,7 @@ NDI_TEST_BRAW_CLIP='C:\clips\B001_10151156_C001.braw' ./build/Release/test_braw_
 
 ### CI
 
-[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. It then builds the installer from that (stub) tree and runs `scripts/test_windows_installer.ps1` — a real silent install/uninstall cycle on the runner, which is elevated and has no Resolve — uploading `dist/` as `NDIOutput-win64-installer`. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
 
 Same rule as macOS: any Windows build change updates this section in the same PR.
 
