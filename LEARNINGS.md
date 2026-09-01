@@ -338,6 +338,13 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0 — async submit tests (output bit-equal to blocking path, slot-ring backpressure, 4-in-flight) green.
 **Rule:** never touch the CUDA API from a `cudaLaunchHostFunc` callback — treat it purely as a signal and do the CUDA-facing work (event queries, timing) on your own thread.
 
+### 2026-08-31 — The watcher's Windows scripting chain is verifiable standalone, before any plugin install (ticket #25)
+**Symptom:** verifying Timeline (Auto) on Windows looked like it needed the full Tier 1 loop (elevated install, Resolve restart, DebugView) just to learn whether Python/fusionscript/scripting-preference plumbing works at all.
+**Root cause (of the assumed friction):** external scripting is process-independent — `fusionscript.dll` connects to a *running* Resolve from any process, not just children of it. The helper script needs nothing from the plugin but the `fusionscript.dll` path it would pass as argv[1].
+**Fix:** run the helper directly while Resolve is open: `python src\ndi_timeline_watch.py "C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll"` — it prints the clip under the playhead per poll (or the exact `!`-prefixed failure reason). Verified live on the workstation: Store-installed Python 3.12 (which registers PEP 514 keys in HKCU, so registry discovery finds it) imported the modules from `%PROGRAMDATA%` and reported the open project's playhead clip.
+**Validated by:** Tier 0.5 — standalone helper run against live Resolve during ticket #25 development; the in-Resolve spawn path still owes its Tier 1–2 pass (BUILD.md).
+**Rule:** debug Resolve-scripting features with the helper run standalone first — it isolates the scripting chain from the spawn/pipe plumbing and needs no install or restart.
+
 ---
 
 ## Template for new entries

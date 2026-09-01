@@ -67,12 +67,12 @@ static void ndiWinLog(const char* fmt, ...);
 #include "STMap.h"
 #include "StereoPair.h"
 #include "StreamResolution.h"
+#include "TimelineClipWatcher.h"  // self-gates (defines NDI_TIMELINE_WATCH on macOS + Windows)
 
 #ifdef __APPLE__
 #include "BRAWImmersiveReader.h"
 #include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
-#include "TimelineClipWatcher.h"
 #endif
 
 #ifdef NDI_HAS_CUDA // defined by CMake when the CUDA module is in the build
@@ -2361,7 +2361,7 @@ static OfxStatus onLoad(void)
 
 static OfxStatus onUnLoad(void)
 {
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
     ndi_timelinewatch::shutdown();
 #endif
     return kOfxStatOK;
@@ -2400,7 +2400,7 @@ static void instanceRegistryRemove(NDIInstanceData* data)
         gInstanceRegistry.end());
 }
 
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
 // Runs on the watcher thread: re-source this instance's lens maps for the
 // clip now under the playhead. Sticky on anything unusable — a gap between
 // clips, a non-BRAW clip, a BRAW without calibration — the previous camera's
@@ -2478,7 +2478,7 @@ static void timelineClipChanged(const std::string& path)
         applyAutoLensClip(data, path);
     }
 }
-#endif // __APPLE__
+#endif // NDI_TIMELINE_WATCH
 
 // Bring the instance's loaded STMaps in line with the current parameter
 // values (issue #7). Called from createInstance and instanceChanged, never
@@ -2519,7 +2519,7 @@ static void refreshSTMaps(NDIInstanceData* data)
     }
     if (wantMetadata) {
         metadataClipPath = data->brawClipPathWanted;  // Manual Path source
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
         if (autoSource) {
             // Timeline (Auto): follow the playhead clip. The watcher keeps
             // pushing changes via timelineClipChanged; here we just take its
@@ -2573,7 +2573,7 @@ static void refreshSTMaps(NDIInstanceData* data)
                 status = kProjActive;
             } else {
                 status = kProjError;
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
                 std::string detail;
                 ndi_timelinewatch::healthy(&detail);
                 NDI_LOG_TEXT(("Equirect (Camera Metadata) auto: no usable clip under the "

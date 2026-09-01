@@ -143,7 +143,8 @@ set(NDI_CUDA_EXACT_MATH "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 # --- The plugin --------------------------------------------------------------
 add_library(NDIOutput SHARED
     src/NDIOutputPlugin.cpp
-    src/WinFileDialog.cpp)
+    src/WinFileDialog.cpp
+    src/WinTimelineWatch.cpp)
 set_target_properties(NDIOutput PROPERTIES
     OUTPUT_NAME "NDIOutput"
     SUFFIX ".ofx"
@@ -171,9 +172,10 @@ target_include_directories(NDIOutput PRIVATE
     "${NDI_INCLUDE_DIR}")
 target_link_libraries(NDIOutput PRIVATE ZLIB::ZLIB)
 # ole32 + shell32 + user32: the browse buttons' IFileOpenDialog and its
-# GUI-thread guard (ticket #24, src/WinFileDialog.cpp). System DLLs, so no
-# loader-trap concern.
-target_link_libraries(NDIOutput PRIVATE ole32 shell32 user32)
+# GUI-thread guard (ticket #24, src/WinFileDialog.cpp). advapi32: the
+# timeline watcher's PEP 514 Python discovery reads the registry (ticket
+# #25, src/WinTimelineWatch.h). System DLLs, so no loader-trap concern.
+target_link_libraries(NDIOutput PRIVATE ole32 shell32 user32 advapi32)
 
 # Delay-load the NDI DLL (spec decision 12): Windows' loader never searches a
 # DLL's own folder for load-time imports of another DLL, so a static import
@@ -203,7 +205,8 @@ set(NDI_PORTABLE_TESTS
     test_ndi_loader
     test_stmap
     test_brawmap
-    test_win_file_dialog)
+    test_win_file_dialog
+    test_timeline_watch)
 foreach(_t IN LISTS NDI_PORTABLE_TESTS)
     add_executable(${_t} tests/${_t}.cpp)
     target_include_directories(${_t} PRIVATE src)
@@ -213,6 +216,7 @@ foreach(_t IN LISTS NDI_PORTABLE_TESTS)
 endforeach()
 target_link_libraries(test_stmap PRIVATE ZLIB::ZLIB)
 target_link_libraries(test_brawmap PRIVATE ZLIB::ZLIB)
+target_link_libraries(test_timeline_watch PRIVATE advapi32)  # registry discovery
 
 # CUDA kernel-identity test (ticket #22): the fused kernels must be
 # byte-identical to the shared CPU references. Compiles the module in
@@ -251,6 +255,11 @@ add_test(NAME test_plugin_delayload
 # ticket (#23) owns end-user packaging.
 set(NDI_BUNDLE_BIN_DIR "NDIOutput.ofx.bundle/Contents/Win64")
 install(TARGETS NDIOutput RUNTIME DESTINATION "${NDI_BUNDLE_BIN_DIR}")
+# The Timeline (Auto) watcher helper rides in Contents/Resources, same spot
+# the macOS Makefile stages it (ticket #25; the watcher derives this path
+# from its own module location — see WinTimelineWatch.h bundleResourcePath).
+install(FILES src/ndi_timeline_watch.py
+        DESTINATION "NDIOutput.ofx.bundle/Contents/Resources")
 if(NOT NDI_USING_STUB)
     install(FILES
         "${NDI_SDK_PATH}/Bin/x64/${NDI_DLL_NAME}.dll"

@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (ticket #22) and native Browse dialogs (ticket #24) in the build; installer pending (see [status](#windows--status-cuda-gpu-native-pipeline-ticket-22-and-native-browse-dialogs-ticket-24-in-the-build-installer-pending-ticket-23))
+- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (ticket #22), native Browse dialogs (ticket #24), and the Timeline (Auto) clip watcher (ticket #25) in the build; installer pending (see [status](#windows--status-cuda-pipeline-22-browse-dialogs-24-and-the-timeline-auto-watcher-25-in-the-build-installer-pending-23))
 
 ---
 
@@ -120,13 +120,15 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows — STATUS: CUDA GPU-native pipeline (ticket #22) and native Browse dialogs (ticket #24) in the build; installer pending (ticket #23)
+## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), and the Timeline (Auto) watcher (#25) in the build; installer pending (#23)
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
 **Still owed from issue #22 (Tier 1–2, human on the workstation):** GPU-native log lines during real playback with no CPU-fallback lines, 8K stereo rates comparable to macOS, and the render-call probe matrix re-run (Render Cache / proxy modes / stereo per-eye instances) before trusting stereo pairing on Windows — findings to LEARNINGS.md when they happen. Tier 0 (build + all tests, kernel identity on the workstation GPU) is what this section's status line covers.
 
 **Still owed from issue #24 (Tier 1–2, human in Resolve):** the four Browse buttons appear next to their path fields, a picked file (including a non-ASCII path) lands in the field and the map/clip loads, and Cancel changes nothing — findings to LEARNINGS.md.
+
+**Still owed from issue #25 (Tier 1–2, human in Resolve):** with Camera Metadata + Timeline (Auto) selected and playback running, the DebugView log shows `TimelineWatch: playhead clip: '<path>'` lines following cuts across a multi-clip timeline; disabling external scripting (or renaming python) produces the documented soft-fail lines and Manual Path keeps working. (The end-to-end projection itself — clip path → lens maps → warped stream — additionally needs the BRAW reader port, ticket #26; until then Auto mode on Windows reports and logs the followed clip but map generation states "Camera-metadata projection is macOS-only for now".) The helper's scripting chain (module import from `%PROGRAMDATA%`, `fusionscript.dll` hand-off, playhead query against live Resolve) was verified standalone on the workstation 2026-08-31.
 
 ### Prerequisites
 
@@ -151,7 +153,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ctest` runs the portable unit suite from `make test` on macOS — including `test_platform_paths` (UTF-8⇄UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus two Windows-side additions the Makefile doesn't build: `test_win_file_dialog` (the browse dialog's pure logic, ticket #24) and `test_plugin_delayload`, which loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+`ctest` runs the portable unit suite from `make test` on macOS — including `test_platform_paths` (UTF-8⇄UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus three Windows-side additions the Makefile doesn't build: `test_win_file_dialog` (the browse dialog's pure logic, ticket #24), `test_timeline_watch` (the watcher's Python-discovery/quoting/path seams plus a live pipe-spawn smoke test, ticket #25), and `test_plugin_delayload`, which loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
 
 `test_cuda_downscale` (ticket #22) is the Windows counterpart of `make test-metal`: it holds the fused CUDA kernels **byte-identical** to the shared CPU references (`ndi_stream::downscaleRGBABox`, `ndi_stmap::warpRGBABox`, the flipping converters), including identity-STMap ≡ plain-downscale, plus the slot ring and passthrough/readback contracts. It needs a CUDA device — it runs for real on the workstation and skips cleanly on GPU-less machines (hosted CI compiles it, which is CI's whole job here). Byte-identity leans on `--fmad=false` for the CUDA translation units (CMakeLists.txt) — don't "optimize" that flag away.
 
@@ -177,6 +179,17 @@ The script refuses to run while Resolve is open (no OFX hot reload). Fully resta
 **Firewall:** the first NDI send triggers the Windows Firewall prompt for the *Resolve* process. Allow on private networks; decline (or a silently-dropped prompt, e.g. non-interactive sessions) leaves the source discoverable but the video unreachable from other machines — the classic "Studio Monitor lists it but shows black" symptom. Verify reachability from a second machine, not localhost.
 
 Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (note the extra `Support\` level vs macOS; same delete-with-Resolve-closed rescan procedure, or `-ResetCache` above). If the plugin doesn't appear in the Effects Library: reset the cache first, then watch the load in DebugView (below) — the loader logs which NDI runtime path it resolved (bundle, system, or NOT FOUND with both Win32 error codes).
+
+### Timeline (Auto) camera-clip watcher (ticket #25)
+
+The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns the bundled `Contents/Resources/ndi_timeline_watch.py` as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. Requirements on Windows:
+
+- **Resolve Studio with external scripting enabled** — Preferences → System → General → *External scripting using: Local*. Without it the helper connects to nothing and the log says `scriptapp('Resolve') returned nothing — is external scripting enabled?`.
+- **A 64-bit Python 3.** Discovery order (the plugin logs which one it picked): the **PEP 514 registry** — `Software\Python\PythonCore` under HKCU then HKLM, 64-bit view, skipping `-32`/`-arm64` tags, highest version wins — then a **PATH search** for `python.exe` as fallback. The python.org x64 installer is the recommended install (it registers under PEP 514 whether or not "Add to PATH" was checked); the Microsoft Store Python also registers and is verified working on the dev workstation (3.12). Resolve's own scripting docs assume a python.org install, so prefer that on user machines.
+
+The helper finds Resolve's scripting environment without configuration: the scripting modules load from `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules`, and the plugin derives the `fusionscript.dll` path from the *running* `Resolve.exe` (the watcher spawns from inside Resolve's process) and hands it to the helper, so non-default install directories work.
+
+Every failure is soft and named in the log (DebugView filter `NDI Plugin: TimelineWatch:`): no Python found, helper script missing from the bundle, spawn failure, scripting disabled, module-import failure. The helper respawns with 30 s backoff; Manual Path mode is unaffected throughout, and Stream Status carries the watcher's health detail when Auto mode has no usable clip.
 
 ### Logs on Windows
 
