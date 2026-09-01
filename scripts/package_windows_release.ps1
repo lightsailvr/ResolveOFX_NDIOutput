@@ -75,17 +75,21 @@ if (Test-Path $iss) { Note "installer script" } else { Miss $iss }
 
 # Inno Setup 6: PATH, then the default install locations, then the registry
 # key its own installer writes (spec decision 17; preinstalled on the CI image).
+# Per-user installs are covered too - Inno's own setup takes /CURRENTUSER, which
+# is how you get a compiler onto a machine where you have no admin rights.
 $iscc = ""
 $cmd = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
 if ($cmd) { $iscc = $cmd.Source }
 if ($iscc -eq "") {
     $candidates = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
     )
     foreach ($key in @(
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1")) {
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1")) {
         try {
             $loc = (Get-ItemProperty $key -ErrorAction Stop).InstallLocation
             if ($loc) { $candidates += (Join-Path $loc "ISCC.exe") }
