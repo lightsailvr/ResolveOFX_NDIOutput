@@ -21,13 +21,21 @@ A modern OpenFX plugin that sends video frames from DaVinci Resolve to NDI (Netw
 
 ## Requirements
 
-- macOS 13+ (Ventura or later), Apple Silicon or Intel
+- macOS 13+ (Ventura or later), Apple Silicon or Intel — or 64-bit Windows 10/11 (NVIDIA GPU for the GPU-native path; the CPU path is the automatic fallback)
 - DaVinci Resolve 17+ (tested with DaVinci Resolve 20)
-- Building from source additionally needs the NDI Advanced SDK 6.x at `/Library/NDI Advanced SDK for Apple/` ([download](https://ndi.video/for-developers/)) — the installer ships the NDI runtime inside the plugin, so end users need nothing else
+- Building from source additionally needs the NDI Advanced SDK 6.x — at `/Library/NDI Advanced SDK for Apple/` on macOS, `C:\Program Files\NDI\NDI 6 Advanced SDK` on Windows ([download](https://ndi.video/for-developers/)). The installers ship the NDI runtime inside the plugin, so end users need nothing else
 
 ## Installation
 
-**Users**: download `NDIOutput-<version>-macOS.pkg` from the [latest release](https://github.com/lightsailvr/ResolveOFX_NDIOutput/releases/latest) and double-click it (signed and notarized; installs to `/Library/OFX/Plugins`). Then restart DaVinci Resolve — OFX plugins are only scanned at startup.
+Grab the installer for your platform from the [latest release](https://github.com/lightsailvr/ResolveOFX_NDIOutput/releases/latest), then **restart DaVinci Resolve** — OFX plugins are only scanned at startup — and find the plugin on the Color page under **OpenFX → LSVR → NDIOutput**.
+
+**macOS**: download `NDIOutput-<version>-macOS.pkg` and double-click it (signed and notarized; installs to `/Library/OFX/Plugins`).
+
+**Windows** (from the first release whose assets include `NDIOutput-<version>-Windows-x64.exe` — the port is still on its `windows-port` branch until it clears the release bar in [BUILD.md](BUILD.md)): download that installer and run it (quit Resolve first — the installer refuses to replace a loaded plugin; installs to `C:\Program Files\Common Files\OFX\Plugins`). x64 only, not Windows on ARM. Uninstall from **Add or Remove Programs**; `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` installs unattended for fleet deployment (it exits non-zero without installing if Resolve is running).
+
+> **SmartScreen**: the Windows installer is **not code-signed**, so Windows shows *"Windows protected your PC"* the first time you run it. Click **More info**, then **Run anyway** — this is expected, not a malware verdict. To verify the download without relying on a signature, compare its SHA-256 against `SHA256SUMS-Windows.txt` on the release page: `Get-FileHash .\NDIOutput-<version>-Windows-x64.exe -Algorithm SHA256`.
+
+The first NDI send raises a firewall prompt for Resolve on Windows — allow it on private networks, or the source is discoverable but its video is unreachable from other machines.
 
 **From source**: full instructions (prerequisites, build, install, verification, troubleshooting, Windows status) live in **[BUILD.md](BUILD.md)**. The short version for macOS:
 

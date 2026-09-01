@@ -139,6 +139,62 @@ static void testBundleResourcePath()
     expectTrue(bundleResourcePath(L"", L"x.py").empty(), "empty module path yields empty");
 }
 
+static void testIsWindowsAppsAliasPath()
+{
+    using ndi_timelinewatch_win::isWindowsAppsAliasPath;
+
+    // The App Execution Alias stub Windows ships even with no Python
+    // installed: spawns fine, prints "Python was not found" to stderr (which
+    // the watcher routes to NUL) and exits — the silent helper-exit loop.
+    expectTrue(isWindowsAppsAliasPath(
+                   L"C:\\Users\\matt\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"),
+               "stock WindowsApps alias path detected");
+    expectTrue(isWindowsAppsAliasPath(
+                   L"C:\\USERS\\X\\APPDATA\\LOCAL\\MICROSOFT\\WINDOWSAPPS\\PYTHON.EXE"),
+               "detection is case-insensitive (NTFS paths are)");
+    expectTrue(isWindowsAppsAliasPath(
+                   L"C:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe"),
+               "python3.exe alias flavor detected too");
+
+    expectTrue(!isWindowsAppsAliasPath(L"C:\\Python311\\python.exe"),
+               "python.org install is not an alias");
+    expectTrue(!isWindowsAppsAliasPath(
+                   L"C:\\Program Files\\Python312\\python.exe"),
+               "machine-wide install is not an alias");
+    expectTrue(!isWindowsAppsAliasPath(
+                   L"C:\\Program Files\\WindowsApps\\PythonSoftwareFoundation."
+                   L"Python.3.12_3.12.2032.0_x64__qbz5n2kfra8p0\\python.exe"),
+               "the real Store package directory (Program Files\\WindowsApps) is "
+               "not the per-user alias directory");
+    expectTrue(!isWindowsAppsAliasPath(L""), "empty path is not an alias");
+}
+
+static void testFuscriptCommandLine()
+{
+    using ndi_timelinewatch_win::fuscriptCommandLine;
+
+    // The exact flag contract matters: -q suppresses the banner fuscript
+    // writes to STDOUT, which the line protocol would otherwise read as clip
+    // paths; -l lua selects the interpreter for the helper (verified against
+    // Resolve 20's fuscript on the workstation, 2026-09-01).
+    expectTrue(fuscriptCommandLine(L"C:\\R\\fuscript.exe", L"C:\\B\\watch.lua") ==
+                   L"C:\\R\\fuscript.exe -q -l lua C:\\B\\watch.lua",
+               "plain paths pass through with -q -l lua between them");
+    // Both real paths contain spaces (Program Files, Common Files) - they
+    // must be quoted for CreateProcessW's command-line parsing.
+    expectTrue(fuscriptCommandLine(L"C:\\Program Files\\Blackmagic Design\\"
+                                   L"DaVinci Resolve\\fuscript.exe",
+                                   L"C:\\Program Files\\Common Files\\OFX\\Plugins\\"
+                                   L"NDIOutput.ofx.bundle\\Contents\\Resources\\"
+                                   L"ndi_timeline_watch.lua") ==
+                   L"\"C:\\Program Files\\Blackmagic Design\\DaVinci Resolve\\"
+                   L"fuscript.exe\" -q -l lua "
+                   L"\"C:\\Program Files\\Common Files\\OFX\\Plugins\\"
+                   L"NDIOutput.ofx.bundle\\Contents\\Resources\\"
+                   L"ndi_timeline_watch.lua\"",
+               "spaced paths are quoted");
+}
+
 #ifdef _WIN32
 static void testDiscoverPython()
 {
@@ -208,6 +264,8 @@ int main()
     testPickBestPython();
     testQuoteArg();
     testBundleResourcePath();
+    testIsWindowsAppsAliasPath();
+    testFuscriptCommandLine();
 #ifdef _WIN32
     testDiscoverPython();
     testSpawnHelperProcess();

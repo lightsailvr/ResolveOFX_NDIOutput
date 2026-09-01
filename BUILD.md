@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (ticket #22), native Browse dialogs (ticket #24), and the Timeline (Auto) clip watcher (ticket #25) in the build; installer pending (see [status](#windows--status-cuda-pipeline-22-browse-dialogs-24-and-the-timeline-auto-watcher-25-in-the-build-installer-pending-23))
+- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (#22), native Browse dialogs (#24), Timeline (Auto) clip watcher (#25, one-click via Resolve's own fuscript since v1.14.1), Camera Metadata projection (#26), and the Inno Setup installer + release wiring (#23) in the build — see the Windows STATUS section below for what remains human-verified
 
 ---
 
@@ -118,9 +118,11 @@ Flags: `--skip-notarize` (local testing), `--skip-tests`, `--host-arch-only`, `-
 
 A release build differs from the dev build (universal, deployment target, bundled dylib), so run the Tiers 1–2 loop with the **pkg-installed** plugin before publishing.
 
+**Windows artifacts join the same release** (one `VERSION`, one `CHANGELOG.md`, one release event): build them on a Windows machine with `scripts/package_windows_release.ps1` (Windows section below), copy the three files into this machine's `dist/v<VERSION>/`, and `publish_github_release.sh` attaches them next to the pkg and grows a Windows install section in the notes. It is all-or-nothing — two of three files present is an error, and any `-STUB` artifact aborts the publish. With none present it releases macOS-only and says so.
+
 ---
 
-## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25), and Camera Metadata (BRAW) projection (#26) in the build; installer pending (#23)
+## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25, fuscript/Lua since v1.14.1), Camera Metadata (BRAW) projection (#26), and the installer + release wiring (#23, fresh-machine pass confirmed 2026-09-01) in the build
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
@@ -182,12 +184,48 @@ The script refuses to run while Resolve is open (no OFX hot reload). Fully resta
 
 Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (note the extra `Support\` level vs macOS; same delete-with-Resolve-closed rescan procedure, or `-ResetCache` above). If the plugin doesn't appear in the Effects Library: reset the cache first, then watch the load in DebugView (below) — the loader logs which NDI runtime path it resolved (bundle, system, or NOT FOUND with both Win32 error codes).
 
+### Installer and Windows release artifacts (ticket #23)
+
+`scripts/install_windows.ps1` above is the **dev** install (copy the stage tree). End users get an **Inno Setup 6** installer: [installer/NDIOutput.iss](installer/NDIOutput.iss), compiled by
+
+**Prerequisite — the Inno Setup 6 compiler** (preinstalled on the CI image; on a workstation, [jrsoftware.org/isdl.php](https://jrsoftware.org/isdl.php) or the vendor's GitHub releases). Its own installer takes `/CURRENTUSER`, which matters here: a per-user install needs no admin, and UAC prompts spawned from automation shells on this machine auto-cancel.
+
+```powershell
+.\innosetup-6.7.3.exe /VERYSILENT /CURRENTUSER /SUPPRESSMSGBOXES /NORESTART /SP-
+```
+
+lands `ISCC.exe` in `%LOCALAPPDATA%\Programs\Inno Setup 6` — one of the locations the packaging script searches (PATH, both Program Files, `%LOCALAPPDATA%`, and the HKLM/HKCU uninstall keys), so nothing needs configuring after.
+
+
+```powershell
+cmake --install build --config Release --prefix stage
+powershell -ExecutionPolicy Bypass -File .\scripts\package_windows_release.ps1
+```
+
+which writes `dist\v<VERSION>\`: `NDIOutput-<VERSION>-Windows-x64.exe` (installer), `...x64.zip` (bare bundle for manual installs), and `SHA256SUMS-Windows.txt` — the Windows counterpart of `package_release.sh`'s three macOS artifacts. Its preflight refuses to package a tree whose `VERSION` and `kPluginVersionString` disagree, that is missing the Timeline (Auto) helper, or that carries no NDI runtime DLL + `Processing.NDI.Lib.Licenses.txt` (the redistribution obligation, spec decision 13). `-AllowStub` waives only the last one, for stub-linked builds like CI's, and renames the output `...-STUB.exe`/`.zip` so a build that **loads but never streams** can't be mistaken for a release — `publish_github_release.sh` aborts if it sees one.
+
+What the installer does: installs the bundle tree to `C:\Program Files\Common Files\OFX\Plugins\NDIOutput.ofx.bundle` (admin, no directory page — the OFX host scans one location), wipes that tree first so a file from an older version never lingers, adds the attribution readme and the plugin license to `Contents\Resources`, and registers an Add-or-Remove-Programs entry whose uninstaller lives *outside* the bundle (`C:\Program Files\Light Sail VR\NDI Output`, removed on uninstall) so the bundle holds only plugin payload. It **refuses to run while Resolve is running** — a loaded plugin can't be replaced, and Restart Manager is disabled on purpose rather than offering to close Resolve mid-edit. `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` covers unattended fleet deployment (a running Resolve then just means a non-zero exit code).
+
+The installer is **unsigned** for v1, with the SmartScreen "More info → Run anyway" click-through documented in README.md, the installer readme, and the release notes (spec decision 18 — EV certificates no longer bypass SmartScreen). The upgrade path is Azure Artifact Signing when install-friction reports appear: add `SignTool=` to the Inno compiler config; no script change.
+
+**Automated acceptance test** (the machine-checkable half of the ticket):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_windows_installer.ps1
+```
+
+from an **elevated** PowerShell with Resolve closed. It drives a real `/VERYSILENT` install, asserts the plugin, the watcher helper and the attribution readme (trademark line + ndi.video link) landed, checks the ARP entry carries the right `DisplayVersion` and an uninstall string, then runs the uninstaller silently and asserts the bundle tree *and* the ARP entry are gone. It refuses to start if a bundle is already installed (it would remove your dev install at the end — `-Force` overrides). CI runs it on every push it covers (`windows-port`, `feature/win-**`, PRs into `windows-port`). Against a `-STUB` installer it skips the NDI-runtime assertions, which that build cannot satisfy by definition; against a real-SDK installer it additionally asserts the runtime DLL and the third-party licenses file landed beside the plugin.
+
+**Tier 1–2: confirmed by Matt 2026-09-01** on a fresh second machine — draft-release download, SmartScreen click-through, install, restart, stream visible in Studio Monitor, and (v1.14.1) Timeline (Auto) working live end to end via the fuscript Lua helper with nothing else installed. The one drill not explicitly re-confirmed by hand: uninstall → restart → Effects Library entry gone (CI's acceptance test covers the uninstall mechanics on every push).
+
 ### Timeline (Auto) camera-clip watcher (ticket #25)
 
-The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns the bundled `Contents/Resources/ndi_timeline_watch.py` as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. Requirements on Windows:
+The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns a bundled helper as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. **Primary helper (v1.14.1+): `Contents/Resources/ndi_timeline_watch.lua`, run by Resolve's own bundled script interpreter (`fuscript.exe -q -l lua`, found beside `Resolve.exe`)** — nothing to install, which is what makes Timeline (Auto) one-click. The Python helper (`ndi_timeline_watch.py`) remains as the automatic fallback when fuscript is missing beside the host executable (standalone test processes, exotic packagings); the log names which chain spawned. Requirement on Windows:
 
 - **Resolve Studio with external scripting enabled** — Preferences → System → General → *External scripting using: Local*. Without it the helper connects to nothing and the log says `scriptapp('Resolve') returned nothing — is external scripting enabled?`.
-- **A 64-bit Python 3.** Discovery order (the plugin logs which one it picked): the **PEP 514 registry** — `Software\Python\PythonCore` under HKCU then HKLM, 64-bit view, skipping `-32`/`-arm64` tags, highest version wins — then a **PATH search** for `python.exe` as fallback. The python.org x64 installer is the recommended install (it registers under PEP 514 whether or not "Add to PATH" was checked); the Microsoft Store Python also registers and is verified working on the dev workstation (3.12). Resolve's own scripting docs assume a python.org install, so prefer that on user machines.
+
+Python requirement — **fallback path only** (a machine where fuscript is unavailable):
+- **A 64-bit Python 3.** Discovery order (the plugin logs which one it picked): the **PEP 514 registry** — `Software\Python\PythonCore` under HKCU then HKLM, 64-bit view, skipping `-32`/`-arm64` tags, highest version wins — then a **PATH search** for `python.exe` as fallback. The PATH fallback **rejects the `%LOCALAPPDATA%\Microsoft\WindowsApps` App Execution Alias** — the stub Windows ships even with no Python installed, which spawns, dies, and would otherwise loop the helper silently (LEARNINGS 2026-09-01; a real Store Python registers under PEP 514 and is found by the registry sweep, so it is unaffected). The python.org x64 installer is the recommended install (it registers under PEP 514 whether or not "Add to PATH" was checked); the Microsoft Store Python also registers and is verified working on the dev workstation (3.12). Resolve's own scripting docs assume a python.org install, so prefer that on user machines. On a machine with no usable Python the log says so by name and the helper never spawns; when the helper does die, the log now carries its exit code.
 
 The helper finds Resolve's scripting environment without configuration: the scripting modules load from `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules`, and the plugin derives the `fusionscript.dll` path from the *running* `Resolve.exe` (the watcher spawns from inside Resolve's process) and hands it to the helper, so non-default install directories work.
 
@@ -213,7 +251,7 @@ NDI_TEST_BRAW_CLIP='C:\clips\B001_10151156_C001.braw' ./build/Release/test_braw_
 
 ### CI
 
-[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. It then builds the installer from that (stub) tree and runs `scripts/test_windows_installer.ps1` — a real silent install/uninstall cycle on the runner, which is elevated and has no Resolve — uploading `dist/` as `NDIOutput-win64-installer`. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
 
 Same rule as macOS: any Windows build change updates this section in the same PR.
 

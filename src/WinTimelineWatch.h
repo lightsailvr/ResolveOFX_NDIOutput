@@ -26,6 +26,7 @@
 #endif
 
 #include <cstdio>
+#include <cwctype>
 
 namespace ndi_timelinewatch_win {
 
@@ -239,6 +240,30 @@ struct PythonDiscovery {
     std::string source;    // human-readable provenance for the log
 };
 
+// Is this the per-user App Execution Alias directory? Stock Windows 10/11
+// ships %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe there even with NO
+// Python installed: it spawns fine, prints "Python was not found" to stderr
+// (which the watcher routes to NUL) and exits — a silent helper-exit loop.
+// Only the PATH fallback needs this test: an actually-installed Store Python
+// registers PEP 514 keys and is taken by the registry sweep, which never
+// reaches the alias. (The real Store package dir is under Program
+// Files\WindowsApps — distinct, and deliberately not matched here.)
+inline bool isWindowsAppsAliasPath(const std::wstring& path)
+{
+    static const wchar_t kAliasDir[] = L"\\microsoft\\windowsapps\\";
+    std::wstring lower(path);
+    for (wchar_t& c : lower) {
+        c = static_cast<wchar_t>(towlower(c));
+    }
+    const size_t pos = lower.find(kAliasDir);
+    if (pos == std::wstring::npos) {
+        return false;
+    }
+    // The per-user alias dir lives under AppData\Local; Program
+    // Files\WindowsApps (the real Store packages) must not match.
+    return lower.find(L"\\appdata\\local\\microsoft\\windowsapps\\") != std::wstring::npos;
+}
+
 // The documented discovery order (BUILD.md, Windows section): PEP 514
 // registry — HKCU then HKLM, 64-bit Python 3 only, highest version — then a
 // PATH search as the fallback for interpreters that never registered.
@@ -255,11 +280,30 @@ inline PythonDiscovery discoverPython()
     // buffer contents are undefined — treat as not found.
     wchar_t found[MAX_PATH];
     const DWORD n = SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, found, nullptr);
-    if (n > 0 && n < MAX_PATH && GetFileAttributesW(found) != INVALID_FILE_ATTRIBUTES) {
+    if (n > 0 && n < MAX_PATH && GetFileAttributesW(found) != INVALID_FILE_ATTRIBUTES &&
+        !isWindowsAppsAliasPath(found)) {
         return {found, "PATH search"};
     }
     return {};
 }
+
+#endif  // _WIN32
+
+// ---- fuscript command line --------------------------------------------------
+// The primary watcher interpreter is Resolve's OWN bundled fuscript.exe
+// (beside Resolve.exe) running the Lua helper — nothing to install, which is
+// what makes Timeline (Auto) one-click (ticket #23). Python cannot be
+// bundled instead: fusionscript.dll binds only a PEP 514 registry-REGISTERED
+// interpreter, never the process hosting it (LEARNINGS 2026-09-01). -q
+// suppresses the banner fuscript writes to stdout, which would otherwise be
+// read as clip paths by the line protocol (verified on Resolve 20).
+inline std::wstring fuscriptCommandLine(const std::wstring& fuscriptExe,
+                                        const std::wstring& luaScript)
+{
+    return quoteArg(fuscriptExe) + L" -q -l lua " + quoteArg(luaScript);
+}
+
+#ifdef _WIN32
 
 // ---- Process spawn ----------------------------------------------------------
 
