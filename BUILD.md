@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — CUDA port in progress, **does not build yet** (see [status](#windows-cuda--status-not-building-yet))
+- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (#22), native Browse dialogs (#24), Timeline (Auto) clip watcher (#25, one-click via Resolve's own fuscript since v1.14.1), Camera Metadata projection (#26), and the Inno Setup installer + release wiring (#23) in the build — see the Windows STATUS section below for what remains human-verified
 
 ---
 
@@ -30,7 +30,7 @@ make dev
 
 Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle, all object files, and the `build/` test-binary directory.
 
-The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks) and, on macOS, AppKit + UniformTypeIdentifiers (for the Browse buttons' native open panel, `src/MacFileDialog.mm`). All ship with the macOS SDK — no extra install. A future Windows build needs a zlib to match; the browse buttons are macOS-only.
+The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks) and, on macOS, AppKit + UniformTypeIdentifiers (for the Browse buttons' native open panel, `src/MacFileDialog.mm`). All ship with the macOS SDK — no extra install. The Windows build gets its zlib from vcpkg and its Browse dialogs from `src/WinFileDialog.cpp` (IFileOpenDialog; ole32 + shell32) — see the Windows section.
 
 The Camera Metadata projection (v1.10.0) compiles against [third_party/braw/](third_party/braw/) — the Blackmagic RAW API header and dispatch shim, vendored from Blackmagic RAW SDK 5.1 under their Boost-style license (notices intact; re-copy both files from `/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Include/` to update). **Nothing Blackmagic is linked or bundled**: the shim resolves `BlackmagicRawAPI.framework` at runtime from the host application's own bundle — inside Resolve that is Resolve's shipped copy (identical to the SDK's, verified 5.1/50100.40.160) — falling back to the standalone SDK install, and failing soft (passthrough + Stream Status message) when neither exists. Building the plugin therefore needs no Blackmagic install at all.
 
@@ -118,25 +118,149 @@ Flags: `--skip-notarize` (local testing), `--skip-tests`, `--host-arch-only`, `-
 
 A release build differs from the dev build (universal, deployment target, bundled dylib), so run the Tiers 1–2 loop with the **pkg-installed** plugin before publishing.
 
+**Windows artifacts join the same release** (one `VERSION`, one `CHANGELOG.md`, one release event): build them on a Windows machine with `scripts/package_windows_release.ps1` (Windows section below), copy the three files into this machine's `dist/v<VERSION>/`, and `publish_github_release.sh` attaches them next to the pkg and grows a Windows install section in the notes. It is all-or-nothing — two of three files present is an error, and any `-STUB` artifact aborts the publish. With none present it releases macOS-only and says so.
+
 ---
 
-## Windows (CUDA) — STATUS: not building yet
+## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25, fuscript/Lua since v1.14.1), Camera Metadata (BRAW) projection (#26), and the installer + release wiring (#23, fresh-machine pass confirmed 2026-09-01) in the build
 
-The Windows port (CMake + CUDA acceleration) was started in commit `50eacc1` and does not yet produce a working build. Track progress and findings in [LEARNINGS.md](LEARNINGS.md).
+The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
-What exists so far:
-- [CMakeLists.txt](CMakeLists.txt) — cross-platform build (Windows/CUDA, macOS/Metal, Linux stub)
-- [scripts/build_windows.bat](scripts/build_windows.bat) (MSVC) and [scripts/build_windows_mingw.bat](scripts/build_windows_mingw.bat) (MinGW)
-- [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu) — CUDA kernels mirroring the Metal path
-- [README_WINDOWS_CUDA.md](README_WINDOWS_CUDA.md) — target requirements and intended workflow
+**Still owed from issue #22 (Tier 1–2, human on the workstation):** GPU-native log lines during real playback with no CPU-fallback lines, 8K stereo rates comparable to macOS, and the render-call probe matrix re-run (Render Cache / proxy modes / stereo per-eye instances) before trusting stereo pairing on Windows — findings to LEARNINGS.md when they happen. Tier 0 (build + all tests, kernel identity on the workstation GPU) is what this section's status line covers.
 
-Requirements when resuming: Visual Studio 2019/2022 (C++ workload), CUDA Toolkit 11+, NDI 6 Advanced SDK at `C:\Program Files\NDI\NDI 6 Advanced SDK`. Install target is `C:\Program Files\Common Files\OFX\Plugins\`, plus `Processing.NDI.Lib.x64.dll` copied alongside the `.ofx`.
+**Still owed from issue #24 (Tier 1–2, human in Resolve):** the four Browse buttons appear next to their path fields, a picked file (including a non-ASCII path) lands in the field and the map/clip loads, and Cancel changes nothing — findings to LEARNINGS.md.
+
+**Issue #25 (Tier 1–2):** confirmed working in Resolve by Matt 2026-08-31 (U) — Camera Metadata + Timeline (Auto) end to end. The helper's scripting chain (module import from `%PROGRAMDATA%`, `fusionscript.dll` hand-off, playhead query against live Resolve) was additionally verified standalone on the workstation the same day. Still unexercised drills, worth a pass when convenient: the soft-fail lines with external scripting disabled (or python renamed) while Manual Path keeps working.
+
+**Issue #26 (Tier 1–2):** confirmed working in Resolve by Matt 2026-08-31 (U) — an URSA Cine Immersive timeline with Projection = Equirect (Camera Metadata) streams the warped equirect. Tier 0.5 the same day on the workstation: `test_braw_reader` against the real sample clip read the calibration through Resolve's own `BlackmagicRawAPI.dll` chain and generated maps, and the extracted calibration JSON is semantically identical to the macOS-extracted fixture — so projection output matches macOS by construction (both platforms share the goldens-tested generator in `src/BRAWLensMap.h`). Still unexercised, worth a pass when convenient: a formal A/B of a still against the same clip on macOS, and the no-BRAW-runtime soft-fail drill on a clean machine.
+
+### Prerequisites
+
+- **Visual Studio 2022** with the "Desktop development with C++" workload (MSVC v143 + Windows SDK)
+- **CMake** ≥ 3.22 and **vcpkg** (supplies zlib via [vcpkg.json](vcpkg.json))
+- **Windows NDI 6 Advanced SDK** installed at `C:\Program Files\NDI\NDI 6 Advanced SDK` (or pass `-DNDI_SDK_PATH=...`). HDR needs Advanced; the download is access-gated, request early. Without it the build automatically links a **stub import library** built from [third_party/ndi/](third_party/ndi/) — good for compile-proof only; a streaming binary needs the real SDK.
+- **CUDA Toolkit 12.9** (pinned; spec decision 8) — compiles the GPU-native pipeline (`src/CudaGPUAcceleration.cu`; nvcc requires MSVC as host compiler — that constraint killed the old MinGW script). Nothing can be cross-compiled from macOS. `-DNDI_ENABLE_CUDA=OFF` builds the CPU-only plugin without the toolkit (no GPU-native path — the documented non-NVIDIA behavior, not a shippable default).
+
+### Build (Tier 0)
+
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T "cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+```
+
+(`$VCPKG_ROOT` = your vcpkg checkout; the GitHub runner preinstalls one and exposes it as `VCPKG_INSTALLATION_ROOT`, which is what the workflow passes. The `-T "cuda=..."` toolset points the VS generator straight at the CUDA toolkit — required whenever the CUDA **Visual Studio integration** was never copied into the VS installation, an admin-only step the full toolkit installer performs but a scripted/partial install does not; without either, configure fails with `No CUDA toolset found`. Harmless when the integration IS installed, so just always pass it.)
+
+```bash
+cmake --build build --config Release --parallel
+```
+
+```bash
+ctest --test-dir build -C Release --output-on-failure
+```
+
+`ctest` runs the portable unit suite from `make test` on macOS — including `test_platform_paths` (UTF-8⇄UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus four Windows-side additions the Makefile doesn't build: `test_win_file_dialog` (the browse dialog's pure logic, ticket #24), `test_timeline_watch` (the watcher's Python-discovery/quoting/path seams plus a live pipe-spawn smoke test, ticket #25), `test_braw_reader` (the BRAW metadata reader's soft-fail contract, ticket #26 — see the Camera Metadata section below for its opt-in real-clip mode), and `test_plugin_delayload`, which loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+
+`test_cuda_downscale` (ticket #22) is the Windows counterpart of `make test-metal`: it holds the fused CUDA kernels **byte-identical** to the shared CPU references (`ndi_stream::downscaleRGBABox`, `ndi_stmap::warpRGBABox`, the flipping converters), including identity-STMap ≡ plain-downscale, plus the slot ring and passthrough/readback contracts. It needs a CUDA device — it runs for real on the workstation and skips cleanly on GPU-less machines (hosted CI compiles it, which is CI's whole job here). Byte-identity leans on `--fmad=false` for the CUDA translation units (CMakeLists.txt) — don't "optimize" that flag away.
+
+### Install (Tier 1)
+
+```bash
+cmake --install build --config Release --prefix stage
+```
+
+produces the spec bundle tree `stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx` (with `Processing.NDI.Lib.Advanced.x64.dll` + its licenses file beside the binary when the real SDK is present — a stub-linked CI-style build stages no DLL and will not stream). Then, from an **elevated** PowerShell (UAC prompts spawned by automation shells can auto-cancel; open the terminal elevated yourself):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1              # copies the bundle into C:\Program Files\Common Files\OFX\Plugins
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1 -ResetCache  # same, plus force a full plugin-cache re-scan
+```
+
+(The `-ExecutionPolicy Bypass -File` wrapper is required on any machine with the default `Restricted` policy — a bare `.\scripts\install_windows.ps1` fails with "running scripts is disabled on this system". It's per-invocation; don't change the policy system-wide.)
+
+The script refuses to run while Resolve is open (no OFX hot reload). Fully restart Resolve afterwards and verify the stream in **Studio Monitor** (free NDI Tools) — **from a second machine**, so firewall behavior is part of the test.
+
+**How the NDI runtime resolves (ticket #21):** the DLL ships inside the bundle, but Windows never searches a DLL's own folder for its load-time imports — a plain import would silently drop the plugin from the Effects Library on any machine without a system NDI runtime. So the import is **delay-loaded** (CMakeLists.txt) and the plugin **preloads the DLL by full module-relative path** before the first NDI call (`src/NDIRuntimeLoader.h`), falling back to a system-wide NDI runtime, and disabling streaming (plugin still loads, passes frames through) if neither exists. `test_plugin_delayload` guards all of this in CI, including that no other load-time import outside System32 ever creeps in (see LEARNINGS.md: the `z.dll` trap). **Release-bar check:** verify once on a machine with *no* NDI software installed and nothing NDI-related on `PATH` — that machine is who the bundled DLL exists for.
+
+**Firewall:** the first NDI send triggers the Windows Firewall prompt for the *Resolve* process. Allow on private networks; decline (or a silently-dropped prompt, e.g. non-interactive sessions) leaves the source discoverable but the video unreachable from other machines — the classic "Studio Monitor lists it but shows black" symptom. Verify reachability from a second machine, not localhost.
+
+Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml` (note the extra `Support\` level vs macOS; same delete-with-Resolve-closed rescan procedure, or `-ResetCache` above). If the plugin doesn't appear in the Effects Library: reset the cache first, then watch the load in DebugView (below) — the loader logs which NDI runtime path it resolved (bundle, system, or NOT FOUND with both Win32 error codes).
+
+### Installer and Windows release artifacts (ticket #23)
+
+`scripts/install_windows.ps1` above is the **dev** install (copy the stage tree). End users get an **Inno Setup 6** installer: [installer/NDIOutput.iss](installer/NDIOutput.iss), compiled by
+
+**Prerequisite — the Inno Setup 6 compiler** (preinstalled on the CI image; on a workstation, [jrsoftware.org/isdl.php](https://jrsoftware.org/isdl.php) or the vendor's GitHub releases). Its own installer takes `/CURRENTUSER`, which matters here: a per-user install needs no admin, and UAC prompts spawned from automation shells on this machine auto-cancel.
+
+```powershell
+.\innosetup-6.7.3.exe /VERYSILENT /CURRENTUSER /SUPPRESSMSGBOXES /NORESTART /SP-
+```
+
+lands `ISCC.exe` in `%LOCALAPPDATA%\Programs\Inno Setup 6` — one of the locations the packaging script searches (PATH, both Program Files, `%LOCALAPPDATA%`, and the HKLM/HKCU uninstall keys), so nothing needs configuring after.
+
+
+```powershell
+cmake --install build --config Release --prefix stage
+powershell -ExecutionPolicy Bypass -File .\scripts\package_windows_release.ps1
+```
+
+which writes `dist\v<VERSION>\`: `NDIOutput-<VERSION>-Windows-x64.exe` (installer), `...x64.zip` (bare bundle for manual installs), and `SHA256SUMS-Windows.txt` — the Windows counterpart of `package_release.sh`'s three macOS artifacts. Its preflight refuses to package a tree whose `VERSION` and `kPluginVersionString` disagree, that is missing the Timeline (Auto) helper, or that carries no NDI runtime DLL + `Processing.NDI.Lib.Licenses.txt` (the redistribution obligation, spec decision 13). `-AllowStub` waives only the last one, for stub-linked builds like CI's, and renames the output `...-STUB.exe`/`.zip` so a build that **loads but never streams** can't be mistaken for a release — `publish_github_release.sh` aborts if it sees one.
+
+What the installer does: installs the bundle tree to `C:\Program Files\Common Files\OFX\Plugins\NDIOutput.ofx.bundle` (admin, no directory page — the OFX host scans one location), wipes that tree first so a file from an older version never lingers, adds the attribution readme and the plugin license to `Contents\Resources`, and registers an Add-or-Remove-Programs entry whose uninstaller lives *outside* the bundle (`C:\Program Files\Light Sail VR\NDI Output`, removed on uninstall) so the bundle holds only plugin payload. It **refuses to run while Resolve is running** — a loaded plugin can't be replaced, and Restart Manager is disabled on purpose rather than offering to close Resolve mid-edit. `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART` covers unattended fleet deployment (a running Resolve then just means a non-zero exit code).
+
+The installer is **unsigned** for v1, with the SmartScreen "More info → Run anyway" click-through documented in README.md, the installer readme, and the release notes (spec decision 18 — EV certificates no longer bypass SmartScreen). The upgrade path is Azure Artifact Signing when install-friction reports appear: add `SignTool=` to the Inno compiler config; no script change.
+
+**Automated acceptance test** (the machine-checkable half of the ticket):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_windows_installer.ps1
+```
+
+from an **elevated** PowerShell with Resolve closed. It drives a real `/VERYSILENT` install, asserts the plugin, the watcher helper and the attribution readme (trademark line + ndi.video link) landed, checks the ARP entry carries the right `DisplayVersion` and an uninstall string, then runs the uninstaller silently and asserts the bundle tree *and* the ARP entry are gone. It refuses to start if a bundle is already installed (it would remove your dev install at the end — `-Force` overrides). CI runs it on every push it covers (`windows-port`, `feature/win-**`, PRs into `windows-port`). Against a `-STUB` installer it skips the NDI-runtime assertions, which that build cannot satisfy by definition; against a real-SDK installer it additionally asserts the runtime DLL and the third-party licenses file landed beside the plugin.
+
+**Tier 1–2: confirmed by Matt 2026-09-01** on a fresh second machine — draft-release download, SmartScreen click-through, install, restart, stream visible in Studio Monitor, and (v1.14.1) Timeline (Auto) working live end to end via the fuscript Lua helper with nothing else installed. The one drill not explicitly re-confirmed by hand: uninstall → restart → Effects Library entry gone (CI's acceptance test covers the uninstall mechanics on every push).
+
+### Timeline (Auto) camera-clip watcher (ticket #25)
+
+The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns a bundled helper as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. **Primary helper (v1.14.1+): `Contents/Resources/ndi_timeline_watch.lua`, run by Resolve's own bundled script interpreter (`fuscript.exe -q -l lua`, found beside `Resolve.exe`)** — nothing to install, which is what makes Timeline (Auto) one-click. The Python helper (`ndi_timeline_watch.py`) remains as the automatic fallback when fuscript is missing beside the host executable (standalone test processes, exotic packagings); the log names which chain spawned. Requirement on Windows:
+
+- **Resolve Studio with external scripting enabled** — Preferences → System → General → *External scripting using: Local*. Without it the helper connects to nothing and the log says `scriptapp('Resolve') returned nothing — is external scripting enabled?`.
+
+Python requirement — **fallback path only** (a machine where fuscript is unavailable):
+- **A 64-bit Python 3.** Discovery order (the plugin logs which one it picked): the **PEP 514 registry** — `Software\Python\PythonCore` under HKCU then HKLM, 64-bit view, skipping `-32`/`-arm64` tags, highest version wins — then a **PATH search** for `python.exe` as fallback. The PATH fallback **rejects the `%LOCALAPPDATA%\Microsoft\WindowsApps` App Execution Alias** — the stub Windows ships even with no Python installed, which spawns, dies, and would otherwise loop the helper silently (LEARNINGS 2026-09-01; a real Store Python registers under PEP 514 and is found by the registry sweep, so it is unaffected). The python.org x64 installer is the recommended install (it registers under PEP 514 whether or not "Add to PATH" was checked); the Microsoft Store Python also registers and is verified working on the dev workstation (3.12). Resolve's own scripting docs assume a python.org install, so prefer that on user machines. On a machine with no usable Python the log says so by name and the helper never spawns; when the helper does die, the log now carries its exit code.
+
+The helper finds Resolve's scripting environment without configuration: the scripting modules load from `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules`, and the plugin derives the `fusionscript.dll` path from the *running* `Resolve.exe` (the watcher spawns from inside Resolve's process) and hands it to the helper, so non-default install directories work.
+
+Every failure is soft and named in the log (DebugView filter `NDI Plugin: TimelineWatch:`): no Python found, helper script missing from the bundle, spawn failure, scripting disabled, module-import failure. The helper respawns with 30 s backoff; Manual Path mode is unaffected throughout. When Auto mode has no usable clip, Stream Status shows the generic camera-metadata passthrough message (same text as macOS) and the *log* carries the watcher's health detail alongside it.
+
+### Camera Metadata (BRAW) projection (ticket #26)
+
+The Windows counterpart of the macOS camera-metadata reader (macOS section above): `src/BRAWImmersiveReader.cpp` reads the Apple Immersive lens calibration out of URSA Cine Immersive clips and feeds the same platform-neutral map generator (`src/BRAWLensMap.h`) the macOS build uses, so the projection math — and therefore the output — is identical on both platforms.
+
+**Header generation (build step):** the Windows Blackmagic RAW SDK ships no C++ header — the API surface is defined in `BlackmagicRawAPI.idl`, vendored (with the SDK's dispatch shim, all under Blackmagic's Boost-style license, notices intact) in [third_party/braw/Win/](third_party/braw/Win/); re-copy all three files from `C:\Program Files (x86)\Blackmagic Design\Blackmagic RAW\Blackmagic RAW SDK\Win\Include\` to update. At build time **midl.exe** (part of the Windows SDK that comes with the VS workload — nothing extra to install) compiles the IDL into `build/braw_gen/BlackmagicRawAPI.h`; the VS generator drives this automatically because the `.idl` is a source of the `braw_reader` target, and a `VS_SETTINGS` source property in CMakeLists.txt pins the output directory so the include path is config-independent. Building therefore needs **no Blackmagic install at all** — CI proves it on every push.
+
+**How the BRAW runtime resolves:** nothing Blackmagic is linked or bundled. The vendored dispatch shim loads `BlackmagicRawAPI.dll` at runtime, trying in order: an exe-relative `BlackmagicRawAPI\` folder, then the exe's own folder — **inside Resolve's process the exe is `Resolve.exe`, so this binds `C:\Program Files\Blackmagic Design\DaVinci Resolve\BlackmagicRawAPI.dll`, Resolve's own shipped copy** — user machines need no separate Blackmagic install, and on this primary path version skew against the host is impossible. Standalone processes (the unit-test binary) fall back to explicit paths: the installed Blackmagic RAW SDK (`...\Blackmagic RAW SDK\Win\Libraries`), then a default-location Resolve. (Inside Resolve those fallbacks engage only if the host's own DLL is missing or unloadable — a broken install — where a separately-installed SDK could in principle differ in version; the reads are metadata-only and the attribute API is stable across 5.x.) When no runtime resolves anywhere, the feature soft-fails exactly like a bad STMap: passthrough + a Stream Status message, and the log names the failure. The DLL is loaded on the parameter-edit path (never render), and only when a Camera Metadata clip is actually read — the plugin's load-time imports are untouched (`test_plugin_delayload` enforces this).
+
+**Testing:** `test_braw_reader` always runs the soft-fail contract (missing file, garbage bytes, invalid UTF-8 → `false` + readable error, no crash) — it passes with or without a BRAW runtime on the machine, so hosted CI covers it. On a workstation, point `NDI_TEST_BRAW_CLIP` at a real URSA Cine Immersive clip to run the full chain (metadata → JSON parse → map generation), and optionally `NDI_TEST_BRAW_DUMP` at a path to write the raw calibration blob for diffing against `tests/fixtures/ursa_immersive_calibration.json`:
+
+```bash
+NDI_TEST_BRAW_CLIP='C:\clips\B001_10151156_C001.braw' ./build/Release/test_braw_reader.exe
+```
+
+### Logs on Windows
+
+`NDI_LOG` routes to `OutputDebugStringA` — watch live with [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview) (filter `NDI Plugin:`) or WinDbg. Setting `NDI_OUTPUT_LOG_FILE` to a writable path before launching Resolve additionally appends every line there.
+
+### CI
+
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. It then builds the installer from that (stub) tree and runs `scripts/test_windows_installer.ps1` — a real silent install/uninstall cycle on the runner, which is elevated and has no Resolve — uploading `dist/` as `NDIOutput-win64-installer`. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
+
+Same rule as macOS: any Windows build change updates this section in the same PR.
 
 ---
 
 ## Receiving the stream (test receivers)
 
-- **NDI Video Monitor** (installed at `/Applications/NDI Video Monitor.app`) — quickest visual check
+- **NDI Studio Monitor** (Windows, part of free [NDI Tools](https://ndi.video/tools/)) — the Windows-loop receiver; run it on a second machine so the firewall is part of the test
+- **NDI Video Monitor** (installed at `/Applications/NDI Video Monitor.app`) — quickest visual check on macOS
 - **OBS Studio** with the NDI plugin
 - NDI Advanced SDK example receivers in `/Library/NDI Advanced SDK for Apple/examples/C++/` (`NDIlib_Recv`, `NDIlib_Recv_HDR`, `NDIlib_Jitter_Measure`, `NDIlib_Latency_Test`) — useful for programmatic/HDR validation
 

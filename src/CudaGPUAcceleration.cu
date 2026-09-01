@@ -1,460 +1,956 @@
-#if defined(_WIN32) || defined(__WIN32__) || defined(WIN32) || defined(_WIN64) || defined(__WIN64__) || defined(WIN64)
+#ifdef _WIN32
+
+// CUDA implementation of the GPU-module contract (Windows port ticket #22).
+// See CudaGPUAcceleration.h for the seam documentation and
+// MetalGPUAcceleration.mm for the prior art this mirrors.
+//
+// Byte-identity: every kernel reproduces the CPU reference composition
+// (ndi_stream::downscaleRGBABox / ndi_stmap::warpRGBABox followed by the
+// flipping converters) operation-for-operation, in the same order, and the
+// translation unit compiles with --fmad=false (CMakeLists.txt) so nvcc cannot
+// contract the multiply-adds MSVC leaves separate. tests/test_cuda_downscale
+// holds the outputs to memcmp equality with the CPU oracles.
+//
+// Host discipline (spec decision 6): everything enqueues on the caller's
+// stream; the only waits are cudaStreamSynchronize in the explicitly-blocking
+// entry points (tests and the slow readback fallback). cudaDeviceSynchronize
+// and cudaDeviceReset appear nowhere in this plugin.
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+#include <cuda_runtime.h>
 
 #include "CudaGPUAcceleration.h"
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+
 #include <chrono>
+#include <condition_variable>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <unordered_map>
 
-#define CUDA_LOG(fmt, ...) printf("NDI Plugin CUDA: " fmt "\n", ##__VA_ARGS__)
+// Live capture via DebugView/WinDbg, same channel as the plugin's Windows
+// NDI_LOG sink (the Metal module logs through its own os_log the same way).
+static void cudaLog(const char* fmt, ...)
+{
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(buf, sizeof(buf) - 2, fmt, args);
+    va_end(args);
+    if (n < 0) return;
+    size_t len = static_cast<size_t>(n);
+    if (len > sizeof(buf) - 2) len = sizeof(buf) - 2;
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+    OutputDebugStringA(buf);
+}
+#define CUDA_LOG(fmt, ...) cudaLog("NDI Plugin CUDA: " fmt, ##__VA_ARGS__)
 
-// CUDA error checking macro
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            CUDA_LOG("CUDA error at %s:%d - %s", __FILE__, __LINE__, cudaGetErrorString(error)); \
-            return false; \
-        } \
-    } while(0)
+// ---------------------------------------------------------------------------
+// Kernels. One thread emits one 4:2:2 macropixel (two output pixels), exactly
+// like the Metal kernels; the arithmetic mirrors the CPU references (see the
+// byte-identity note at the top of this file).
+// ---------------------------------------------------------------------------
 
-#define CUDA_CHECK_VOID(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            CUDA_LOG("CUDA error at %s:%d - %s", __FILE__, __LINE__, cudaGetErrorString(error)); \
-        } \
-    } while(0)
-
-// CUDA GPU Context structure
-struct CudaGPUContext {
-    int deviceId;
-    cudaDeviceProp deviceProps;
-    cudaStream_t stream;
-    char deviceName[256];
-    
-    // Memory pools for better performance
-    float* d_rgbaInput;
-    unsigned char* d_uyvyOutput;
-    unsigned short* d_hdrOutput;
-    size_t allocatedInputSize;
-    size_t allocatedUyvySize;
-    size_t allocatedHdrSize;
+// One params struct for both kernel families (mapWidth/mapHeight unused by
+// the plain downscale); passed by value, so no constant-buffer plumbing.
+struct CudaConvertParams {
+    unsigned srcWidth;
+    unsigned srcHeight;
+    unsigned srcRowFloats;   // source stride in floats (rowBytes / 4)
+    unsigned outWidth;
+    unsigned outHeight;
+    unsigned divisor;
+    unsigned mapWidth;
+    unsigned mapHeight;
 };
 
-// CUDA kernel for RGBA to UYVY conversion
-__global__ void rgba_to_uyvy_kernel(
-    const float4* __restrict__ rgbaInput,
-    uchar4* __restrict__ uyvyOutput,
-    int width,
-    int height
-) {
-    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2; // Process two pixels at a time
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (x >= width || y >= height) return;
-    
-    // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
-    int srcRow = height - 1 - y;
-    
-    // Get two adjacent pixels
-    int srcIdx1 = srcRow * width + x;
-    int srcIdx2 = srcRow * width + x + 1;
-    
-    float4 pixel1 = rgbaInput[srcIdx1];
-    float4 pixel2 = (x + 1 < width) ? rgbaInput[srcIdx2] : pixel1;
-    
-    // Clamp values to [0, 1]
-    pixel1.x = fmaxf(0.0f, fminf(1.0f, pixel1.x));
-    pixel1.y = fmaxf(0.0f, fminf(1.0f, pixel1.y));
-    pixel1.z = fmaxf(0.0f, fminf(1.0f, pixel1.z));
-    
-    pixel2.x = fmaxf(0.0f, fminf(1.0f, pixel2.x));
-    pixel2.y = fmaxf(0.0f, fminf(1.0f, pixel2.y));
-    pixel2.z = fmaxf(0.0f, fminf(1.0f, pixel2.z));
-    
-    // Convert to YUV using Rec.709 coefficients
-    float y1 = 0.2126f * pixel1.x + 0.7152f * pixel1.y + 0.0722f * pixel1.z;
-    float y2 = 0.2126f * pixel2.x + 0.7152f * pixel2.y + 0.0722f * pixel2.z;
-    
-    float avgR = (pixel1.x + pixel2.x) * 0.5f;
-    float avgG = (pixel1.y + pixel2.y) * 0.5f;
-    float avgB = (pixel1.z + pixel2.z) * 0.5f;
-    
-    float u = -0.1146f * avgR - 0.3854f * avgG + 0.5f * avgB;
-    float v = 0.5f * avgR - 0.4542f * avgG - 0.0458f * avgB;
-    
-    // Scale to 8-bit and pack as UYVY
-    int dstIdx = y * (width / 2) + (x / 2);
-    uyvyOutput[dstIdx] = make_uchar4(
-        (unsigned char)((u + 0.5f) * 255.0f),  // U
-        (unsigned char)(y1 * 255.0f),          // Y1
-        (unsigned char)((v + 0.5f) * 255.0f),  // V
-        (unsigned char)(y2 * 255.0f)           // Y2
-    );
+__device__ __forceinline__ float cudaClamp01(float v)
+{
+    // Same tree as the CPU converters: fmax(0, fmin(1, v)).
+    return fmaxf(0.0f, fminf(1.0f, v));
 }
 
-// CUDA kernel for RGBA to HDR P216 conversion
-__global__ void rgba_to_hdr_p216_kernel(
-    const float4* __restrict__ rgbaInput,
-    unsigned short* __restrict__ yPlaneOutput,
-    unsigned short* __restrict__ uvPlaneOutput,
-    int width,
-    int height,
-    float scale
-) {
-    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2; // Process two pixels for 4:2:2
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (x >= width || y >= height) return;
-    
-    // Flip vertically: OpenFX uses bottom-left origin, NDI expects top-left
-    int srcRow = height - 1 - y;
-    
-    // Read two RGBA pixels
-    int srcIdx1 = srcRow * width + x;
-    int srcIdx2 = srcRow * width + x + 1;
-    
-    float4 rgba1 = rgbaInput[srcIdx1];
-    float4 rgba2 = (x + 1 < width) ? rgbaInput[srcIdx2] : rgba1;
-    
-    // Clamp to 0-1 range
-    rgba1.x = fmaxf(0.0f, fminf(1.0f, rgba1.x));
-    rgba1.y = fmaxf(0.0f, fminf(1.0f, rgba1.y));
-    rgba1.z = fmaxf(0.0f, fminf(1.0f, rgba1.z));
-    
-    rgba2.x = fmaxf(0.0f, fminf(1.0f, rgba2.x));
-    rgba2.y = fmaxf(0.0f, fminf(1.0f, rgba2.y));
-    rgba2.z = fmaxf(0.0f, fminf(1.0f, rgba2.z));
-    
-    // Convert to YUV using Rec.2020 coefficients for HDR
-    float y1 = 0.2627f * rgba1.x + 0.6780f * rgba1.y + 0.0593f * rgba1.z;
-    float y2 = 0.2627f * rgba2.x + 0.6780f * rgba2.y + 0.0593f * rgba2.z;
-    
-    // Average chroma for 4:2:2 subsampling
-    float avgR = (rgba1.x + rgba2.x) * 0.5f;
-    float avgG = (rgba1.y + rgba2.y) * 0.5f;
-    float avgB = (rgba1.z + rgba2.z) * 0.5f;
-    
-    float u = -0.1396f * avgR - 0.3604f * avgG + 0.5f * avgB;
-    float v = 0.5f * avgR - 0.4598f * avgG - 0.0402f * avgB;
-    
-    // Convert to 16-bit limited range (ITU BT.2100)
-    // Y: 16-bit limited range [4096, 60160] for 10-bit equivalent [64, 940]
-    // UV: 16-bit limited range [4096, 61440] for 10-bit equivalent [64, 960]
-    unsigned short y1_16 = (unsigned short)(4096 + y1 * 56064); // (60160-4096)
-    unsigned short y2_16 = (unsigned short)(4096 + y2 * 56064);
-    unsigned short u_16 = (unsigned short)(32768 + u * 28672); // Center + range
-    unsigned short v_16 = (unsigned short)(32768 + v * 28672);
-    
-    // Store in P216 format (planar)
-    int yIdx1 = y * width + x;
-    int yIdx2 = y * width + x + 1;
-    int uvIdx = (y * width + x) / 2; // 4:2:2 subsampling
-    
-    yPlaneOutput[yIdx1] = y1_16;
-    if (x + 1 < width) {
-        yPlaneOutput[yIdx2] = y2_16;
+// Fused box sample: matches ndi_stream::downscaleRGBABox composed with the
+// flipping converters — output top-down row oy averages source bottom-up rows
+// (outHeight-1-oy)*divisor + [0, divisor), edge-clamped, summed in (sy, sx)
+// order (float addition order is part of the byte-identity contract).
+__device__ __forceinline__ void cudaBoxSampleRGB(const float* src, const CudaConvertParams& p,
+                                                 unsigned ox, unsigned oy, float rgb[3])
+{
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
+    for (unsigned sy = 0; sy < p.divisor; ++sy) {
+        const unsigned srcY = min((p.outHeight - 1u - oy) * p.divisor + sy, p.srcHeight - 1u);
+        const float* row = src + static_cast<size_t>(srcY) * p.srcRowFloats;
+        for (unsigned sx = 0; sx < p.divisor; ++sx) {
+            const unsigned srcX = min(ox * p.divisor + sx, p.srcWidth - 1u);
+            const float* px = row + static_cast<size_t>(srcX) * 4u;
+            sum0 += px[0];
+            sum1 += px[1];
+            sum2 += px[2];
+        }
     }
-    
-    // Store U and V interleaved for 4:2:2
-    uvPlaneOutput[uvIdx * 2] = u_16;     // U
-    uvPlaneOutput[uvIdx * 2 + 1] = v_16; // V
+    const float invCount = 1.0f / static_cast<float>(p.divisor * p.divisor);
+    rgb[0] = cudaClamp01(sum0 * invCount);
+    rgb[1] = cudaClamp01(sum1 * invCount);
+    rgb[2] = cudaClamp01(sum2 * invCount);
 }
 
-bool cuda_gpu_is_available(void) {
-    int deviceCount = 0;
-    cudaError_t error = cudaGetDeviceCount(&deviceCount);
-    
-    if (error != cudaSuccess || deviceCount == 0) {
-        CUDA_LOG("CUDA not available: %s", cudaGetErrorString(error));
-        return false;
+// Bilinear source fetch mirroring ndi_stmap::detail::sampleBilinearClamped
+// (rgb only): integer clamps on every index so even a hostile map value can
+// never read out of bounds.
+__device__ __forceinline__ void cudaWarpFetchRGB(const float* src, const CudaConvertParams& p,
+                                                 float sx, float sy, float out[3])
+{
+    int x0 = static_cast<int>(floorf(sx));
+    int y0 = static_cast<int>(floorf(sy));
+    x0 = min(max(x0, 0), static_cast<int>(p.srcWidth) - 1);
+    y0 = min(max(y0, 0), static_cast<int>(p.srcHeight) - 1);
+    const int x1 = min(x0 + 1, static_cast<int>(p.srcWidth) - 1);
+    const int y1 = min(y0 + 1, static_cast<int>(p.srcHeight) - 1);
+    const float fx = fminf(fmaxf(sx - static_cast<float>(x0), 0.0f), 1.0f);
+    const float fy = fminf(fmaxf(sy - static_cast<float>(y0), 0.0f), 1.0f);
+    const float* p00 = src + static_cast<size_t>(y0) * p.srcRowFloats + static_cast<size_t>(x0) * 4u;
+    const float* p10 = src + static_cast<size_t>(y0) * p.srcRowFloats + static_cast<size_t>(x1) * 4u;
+    const float* p01 = src + static_cast<size_t>(y1) * p.srcRowFloats + static_cast<size_t>(x0) * 4u;
+    const float* p11 = src + static_cast<size_t>(y1) * p.srcRowFloats + static_cast<size_t>(x1) * 4u;
+    for (int c = 0; c < 3; ++c) {
+        const float a = p00[c] + (p10[c] - p00[c]) * fx;
+        const float b = p01[c] + (p11[c] - p01[c]) * fx;
+        out[c] = a + (b - a) * fy;
     }
-    
-    // Check if we have at least one device with compute capability 3.0+
-    for (int i = 0; i < deviceCount; i++) {
-        cudaDeviceProp props;
-        if (cudaGetDeviceProperties(&props, i) == cudaSuccess) {
-            if (props.major >= 3) {
-                CUDA_LOG("Found CUDA device %d: %s (Compute %d.%d)", 
-                        i, props.name, props.major, props.minor);
-                return true;
+}
+
+// Warped counterpart of cudaBoxSampleRGB, mirroring ndi_stmap::warpRGBABox:
+// taps whose map value leaves [0,1] (or is NaN — the comparisons fail) are
+// outside the lens image circle and stay black.
+__device__ __forceinline__ void cudaWarpSampleRGB(const float* src, const float* mapUV,
+                                                  const CudaConvertParams& p,
+                                                  unsigned ox, unsigned oy, float rgb[3])
+{
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
+    for (unsigned sy = 0; sy < p.divisor; ++sy) {
+        const unsigned dstY = min((p.outHeight - 1u - oy) * p.divisor + sy, p.mapHeight - 1u);
+        const unsigned mapRow = p.mapHeight - 1u - dstY;
+        for (unsigned sx = 0; sx < p.divisor; ++sx) {
+            const unsigned dstX = min(ox * p.divisor + sx, p.mapWidth - 1u);
+            const size_t mi = (static_cast<size_t>(mapRow) * p.mapWidth + dstX) * 2u;
+            const float u = mapUV[mi];
+            const float v = mapUV[mi + 1u];
+            if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                float px[3];
+                cudaWarpFetchRGB(src, p,
+                                 u * static_cast<float>(p.srcWidth) - 0.5f,
+                                 v * static_cast<float>(p.srcHeight) - 0.5f, px);
+                sum0 += px[0];
+                sum1 += px[1];
+                sum2 += px[2];
             }
         }
     }
-    
-    CUDA_LOG("No suitable CUDA devices found (need compute capability 3.0+)");
-    return false;
+    const float invCount = 1.0f / static_cast<float>(p.divisor * p.divisor);
+    rgb[0] = cudaClamp01(sum0 * invCount);
+    rgb[1] = cudaClamp01(sum1 * invCount);
+    rgb[2] = cudaClamp01(sum2 * invCount);
 }
 
-CudaGPUContextRef cuda_gpu_init(void) {
+// Shared packing tails: two sampled pixels -> one UYVY macropixel / one P216
+// column pair. Expression trees match the CPU converters exactly.
+__device__ __forceinline__ void cudaEmitUYVY(unsigned char* dst, unsigned outWidth,
+                                             unsigned x0, unsigned oy,
+                                             const float rgb1[3], const float rgb2[3])
+{
+    const float y1 = 0.2126f * rgb1[0] + 0.7152f * rgb1[1] + 0.0722f * rgb1[2];
+    const float y2 = 0.2126f * rgb2[0] + 0.7152f * rgb2[1] + 0.0722f * rgb2[2];
+    const float avgR = (rgb1[0] + rgb2[0]) * 0.5f;
+    const float avgG = (rgb1[1] + rgb2[1]) * 0.5f;
+    const float avgB = (rgb1[2] + rgb2[2]) * 0.5f;
+    const float u = -0.1146f * avgR - 0.3854f * avgG + 0.5f * avgB;
+    const float v = 0.5f * avgR - 0.4542f * avgG - 0.0458f * avgB;
+
+    unsigned char* out = dst + (static_cast<size_t>(oy) * outWidth + x0) * 2u;
+    out[0] = static_cast<unsigned char>((u + 0.5f) * 255.0f);
+    out[1] = static_cast<unsigned char>(y1 * 255.0f);
+    out[2] = static_cast<unsigned char>((v + 0.5f) * 255.0f);
+    out[3] = static_cast<unsigned char>(y2 * 255.0f);
+}
+
+__device__ __forceinline__ void cudaEmitP216(unsigned short* dst, unsigned outWidth, unsigned outHeight,
+                                             unsigned x0, unsigned oy,
+                                             const float rgb1[3], const float rgb2[3])
+{
+    const float y1 = 0.2627f * rgb1[0] + 0.6780f * rgb1[1] + 0.0593f * rgb1[2];
+    const float y2 = 0.2627f * rgb2[0] + 0.6780f * rgb2[1] + 0.0593f * rgb2[2];
+    const float avgR = (rgb1[0] + rgb2[0]) * 0.5f;
+    const float avgG = (rgb1[1] + rgb2[1]) * 0.5f;
+    const float avgB = (rgb1[2] + rgb2[2]) * 0.5f;
+    const float u = -0.1396f * avgR - 0.3604f * avgG + 0.5f * avgB;
+    const float v = 0.5f * avgR - 0.4598f * avgG - 0.0402f * avgB;
+
+    unsigned short* yPlane = dst;
+    unsigned short* uvPlane = dst + static_cast<size_t>(outWidth) * outHeight;
+
+    const size_t yIdx = static_cast<size_t>(oy) * outWidth + x0;
+    yPlane[yIdx] = static_cast<unsigned short>(4096 + y1 * 56064);
+    if (x0 + 1 < outWidth) {
+        yPlane[yIdx + 1] = static_cast<unsigned short>(4096 + y2 * 56064);
+    }
+    const size_t uvIdx = yIdx / 2;
+    uvPlane[uvIdx * 2] = static_cast<unsigned short>(32768 + u * 28672);
+    uvPlane[uvIdx * 2 + 1] = static_cast<unsigned short>(32768 + v * 28672);
+}
+
+__global__ void downscaleRGBAToUYVYKernel(const float* __restrict__ src, unsigned char* dst,
+                                          CudaConvertParams p)
+{
+    const unsigned gx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned x0 = gx * 2u;
+    if (x0 >= p.outWidth || oy >= p.outHeight) return;
+
+    float rgb1[3], rgb2[3];
+    cudaBoxSampleRGB(src, p, x0, oy, rgb1);
+    if (x0 + 1 < p.outWidth) {
+        cudaBoxSampleRGB(src, p, x0 + 1, oy, rgb2);
+    } else {
+        rgb2[0] = rgb1[0]; rgb2[1] = rgb1[1]; rgb2[2] = rgb1[2];
+    }
+    cudaEmitUYVY(dst, p.outWidth, x0, oy, rgb1, rgb2);
+}
+
+__global__ void downscaleRGBAToP216Kernel(const float* __restrict__ src, unsigned short* dst,
+                                          CudaConvertParams p)
+{
+    const unsigned gx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned x0 = gx * 2u;
+    if (x0 >= p.outWidth || oy >= p.outHeight) return;
+
+    float rgb1[3], rgb2[3];
+    cudaBoxSampleRGB(src, p, x0, oy, rgb1);
+    if (x0 + 1 < p.outWidth) {
+        cudaBoxSampleRGB(src, p, x0 + 1, oy, rgb2);
+    } else {
+        rgb2[0] = rgb1[0]; rgb2[1] = rgb1[1]; rgb2[2] = rgb1[2];
+    }
+    cudaEmitP216(dst, p.outWidth, p.outHeight, x0, oy, rgb1, rgb2);
+}
+
+__global__ void warpRGBAToUYVYKernel(const float* __restrict__ src, unsigned char* dst,
+                                     const float* __restrict__ mapUV, CudaConvertParams p)
+{
+    const unsigned gx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned x0 = gx * 2u;
+    if (x0 >= p.outWidth || oy >= p.outHeight) return;
+
+    float rgb1[3], rgb2[3];
+    cudaWarpSampleRGB(src, mapUV, p, x0, oy, rgb1);
+    if (x0 + 1 < p.outWidth) {
+        cudaWarpSampleRGB(src, mapUV, p, x0 + 1, oy, rgb2);
+    } else {
+        rgb2[0] = rgb1[0]; rgb2[1] = rgb1[1]; rgb2[2] = rgb1[2];
+    }
+    cudaEmitUYVY(dst, p.outWidth, x0, oy, rgb1, rgb2);
+}
+
+__global__ void warpRGBAToP216Kernel(const float* __restrict__ src, unsigned short* dst,
+                                     const float* __restrict__ mapUV, CudaConvertParams p)
+{
+    const unsigned gx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned oy = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned x0 = gx * 2u;
+    if (x0 >= p.outWidth || oy >= p.outHeight) return;
+
+    float rgb1[3], rgb2[3];
+    cudaWarpSampleRGB(src, mapUV, p, x0, oy, rgb1);
+    if (x0 + 1 < p.outWidth) {
+        cudaWarpSampleRGB(src, mapUV, p, x0 + 1, oy, rgb2);
+    } else {
+        rgb2[0] = rgb1[0]; rgb2[1] = rgb1[1]; rgb2[2] = rgb1[2];
+    }
+    cudaEmitP216(dst, p.outWidth, p.outHeight, x0, oy, rgb1, rgb2);
+}
+
+// ---------------------------------------------------------------------------
+// Module state
+// ---------------------------------------------------------------------------
+
+// One staging slot of the non-blocking fast path's ring. FREE -> BUSY at
+// submit (kernel writing devBuffer, then the D2H copy filling hostBuffer,
+// then the consumer reading hostBuffer via the done callback) -> FREE again
+// at cuda_gpu_downscale_release. hostBuffer is pinned so the copy is a real
+// async DMA; devBuffer exists because kernels scatter-writing over PCIe to
+// host memory would crawl.
+struct CudaAsyncSlot {
+    void* devBuffer = nullptr;
+    void* hostBuffer = nullptr;   // pinned (cudaMallocHost)
+    size_t capacity = 0;
+    cudaEvent_t evStart = nullptr; // GPU timing (spec decision 6): kernel-only,
+    cudaEvent_t evEnd = nullptr;   // queue wait excluded, honest under contention
+    bool busy = false;
+    // Completion payload, valid while busy.
+    cuda_downscale_done_fn done = nullptr;
+    void* user = nullptr;
+    size_t outBytes = 0;
+    struct CudaGPUContext* owner = nullptr;
+};
+
+#define CUDA_ASYNC_SLOTS 4
+
+struct CudaGPUContext {
+    cudaStream_t ownStream = nullptr;  // NULL-stream callers (tests, uploads)
+    std::mutex asyncMutex;             // guards the slot ring's busy flags
+    CudaAsyncSlot asyncSlots[CUDA_ASYNC_SLOTS];
+
+    // Blocking-path staging (device side only; the blocking copy lands
+    // straight in the caller's CPU buffer). Grown as needed; unguarded like
+    // the Metal fast-path staging — callers serialize per the contract.
+    void* stagingDev = nullptr;
+    size_t stagingDevCap = 0;
+
+    // Completion dispatcher: cudaLaunchHostFunc callbacks may not make CUDA
+    // API calls, so they only queue the finished slot here; this thread reads
+    // the timing events and invokes the done callback.
+    std::mutex dispatchMutex;
+    std::condition_variable dispatchCv;
+    std::queue<CudaAsyncSlot*> dispatchQueue;
+    bool dispatchStop = false;
+    std::thread dispatcher;
+};
+
+// Sizes of every buffer this module allocated, keyed by device pointer. A raw
+// CUDA device pointer has no queryable length (unlike an MTLBuffer), so this
+// is what lets warp-map validation refuse an undersized upload. Module-global
+// because cuda_gpu_release_buffer is called without a context (StmapEntry's
+// destructor, mirroring metal_gpu_release_buffer).
+static std::mutex gBufferRegistryMutex;
+static std::unordered_map<void*, size_t> gBufferRegistry;
+
+// 0 = unknown (a host-owned buffer we must trust, like every OFX CUDA plugin).
+static size_t trackedBufferBytes(void* devPtr)
+{
+    std::lock_guard<std::mutex> lock(gBufferRegistryMutex);
+    auto it = gBufferRegistry.find(devPtr);
+    return it != gBufferRegistry.end() ? it->second : 0;
+}
+
+bool cuda_gpu_is_available(void)
+{
+    int count = 0;
+    return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+}
+
+static void dispatcherLoop(CudaGPUContext* context)
+{
+    for (;;) {
+        CudaAsyncSlot* slot = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(context->dispatchMutex);
+            context->dispatchCv.wait(lock, [context] {
+                return context->dispatchStop || !context->dispatchQueue.empty();
+            });
+            if (context->dispatchStop && context->dispatchQueue.empty()) {
+                return;
+            }
+            slot = context->dispatchQueue.front();
+            context->dispatchQueue.pop();
+        }
+        // The host function ran, so everything enqueued before it — kernel and
+        // D2H copy — has completed. A failed kernel surfaces on the event.
+        const cudaError_t evStatus = cudaEventQuery(slot->evEnd);
+        const bool ok = (evStatus == cudaSuccess);
+        float gpuMs = 0.0f;
+        if (ok && cudaEventElapsedTime(&gpuMs, slot->evStart, slot->evEnd) != cudaSuccess) {
+            gpuMs = 0.0f;
+        }
+        if (!ok) {
+            CUDA_LOG("Fast path async: kernel failed: %s", cudaGetErrorString(evStatus));
+        }
+        // Invoked outside every module lock: done may (indirectly) call
+        // cuda_gpu_downscale_release.
+        slot->done(slot->user, slot, slot->hostBuffer, slot->outBytes,
+                   static_cast<double>(gpuMs), ok);
+    }
+}
+
+// cudaLaunchHostFunc callback: runs on CUDA's host-callback thread and blocks
+// every later host function on this stream — including the host's own — so it
+// only queues the slot and wakes the dispatcher. CUDA API calls are not
+// permitted here.
+static void CUDART_CB slotCompletedHostFn(void* userData)
+{
+    CudaAsyncSlot* slot = static_cast<CudaAsyncSlot*>(userData);
+    CudaGPUContext* context = slot->owner;
+    {
+        std::lock_guard<std::mutex> lock(context->dispatchMutex);
+        context->dispatchQueue.push(slot);
+    }
+    context->dispatchCv.notify_one();
+}
+
+CudaGPUContextRef cuda_gpu_init(void)
+{
     CUDA_LOG("Initializing CUDA GPU acceleration...");
-    
-    if (!cuda_gpu_is_available()) {
+
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        CUDA_LOG("cudaGetDevice failed — no usable CUDA runtime");
         return nullptr;
     }
-    
-    CudaGPUContext* context = (CudaGPUContext*)malloc(sizeof(CudaGPUContext));
-    if (!context) {
-        CUDA_LOG("Failed to allocate CUDA context");
+    cudaDeviceProp prop = {};
+    if (cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+        CUDA_LOG("CUDA device %d: %s (compute %d.%d)", device, prop.name, prop.major, prop.minor);
+    }
+
+    CudaGPUContext* context = new CudaGPUContext();
+    if (cudaStreamCreateWithFlags(&context->ownStream, cudaStreamNonBlocking) != cudaSuccess) {
+        CUDA_LOG("Failed to create module stream");
+        delete context;
         return nullptr;
     }
-    
-    memset(context, 0, sizeof(CudaGPUContext));
-    
-    // Find the best GPU (highest compute capability)
-    int deviceCount = 0;
-    cudaGetDeviceCount(&deviceCount);
-    
-    int bestDevice = 0;
-    int bestMajor = 0, bestMinor = 0;
-    
-    for (int i = 0; i < deviceCount; i++) {
-        cudaDeviceProp props;
-        if (cudaGetDeviceProperties(&props, i) == cudaSuccess) {
-            if (props.major > bestMajor || 
-                (props.major == bestMajor && props.minor > bestMinor)) {
-                bestDevice = i;
-                bestMajor = props.major;
-                bestMinor = props.minor;
+    for (int i = 0; i < CUDA_ASYNC_SLOTS; ++i) {
+        if (cudaEventCreate(&context->asyncSlots[i].evStart) != cudaSuccess ||
+            cudaEventCreate(&context->asyncSlots[i].evEnd) != cudaSuccess) {
+            CUDA_LOG("Failed to create timing events");
+            for (int j = 0; j <= i; ++j) {
+                if (context->asyncSlots[j].evStart) cudaEventDestroy(context->asyncSlots[j].evStart);
+                if (context->asyncSlots[j].evEnd) cudaEventDestroy(context->asyncSlots[j].evEnd);
             }
+            cudaStreamDestroy(context->ownStream);
+            delete context;
+            return nullptr;
         }
+        context->asyncSlots[i].owner = context;
     }
-    
-    context->deviceId = bestDevice;
-    
-    // Set device
-    if (cudaSetDevice(context->deviceId) != cudaSuccess) {
-        CUDA_LOG("Failed to set CUDA device %d", context->deviceId);
-        free(context);
-        return nullptr;
-    }
-    
-    // Get device properties
-    if (cudaGetDeviceProperties(&context->deviceProps, context->deviceId) != cudaSuccess) {
-        CUDA_LOG("Failed to get device properties");
-        free(context);
-        return nullptr;
-    }
-    
-    strncpy_s(context->deviceName, sizeof(context->deviceName), 
-              context->deviceProps.name, sizeof(context->deviceName) - 1);
-    
-    // Create CUDA stream for asynchronous operations
-    if (cudaStreamCreate(&context->stream) != cudaSuccess) {
-        CUDA_LOG("Failed to create CUDA stream");
-        free(context);
-        return nullptr;
-    }
-    
+    context->dispatcher = std::thread(dispatcherLoop, context);
+
     CUDA_LOG("CUDA GPU acceleration initialized successfully");
-    CUDA_LOG("Device: %s (Compute %d.%d)", 
-            context->deviceName, 
-            context->deviceProps.major, 
-            context->deviceProps.minor);
-    CUDA_LOG("Global Memory: %.1f MB", 
-            context->deviceProps.totalGlobalMem / (1024.0f * 1024.0f));
-    
     return context;
 }
 
-void cuda_gpu_shutdown(CudaGPUContextRef context) {
+void cuda_gpu_shutdown(CudaGPUContextRef context)
+{
     if (!context) return;
-    
+
     CUDA_LOG("Shutting down CUDA GPU acceleration...");
-    
-    // Free device memory
-    if (context->d_rgbaInput) {
-        CUDA_CHECK_VOID(cudaFree(context->d_rgbaInput));
+
+    // Async slots: the plugin drains its pump (all done callbacks fired, all
+    // slots released) before shutting the context down; this wait is the
+    // backstop so a straggling completion can't touch freed slots.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool anyBusy = true;
+        while (anyBusy && std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(context->asyncMutex);
+                anyBusy = false;
+                for (int i = 0; i < CUDA_ASYNC_SLOTS; ++i) {
+                    anyBusy = anyBusy || context->asyncSlots[i].busy;
+                }
+            }
+            if (anyBusy) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (anyBusy) {
+            // A host function or the dispatcher may still fire and touch the
+            // slot array — leak the whole context (dispatcher thread included)
+            // rather than free memory a straggler will dereference.
+            CUDA_LOG("Shutdown: async slot still busy after 2s — leaking the CUDA context to stay safe");
+            return;
+        }
     }
-    if (context->d_uyvyOutput) {
-        CUDA_CHECK_VOID(cudaFree(context->d_uyvyOutput));
+
+    {
+        std::lock_guard<std::mutex> lock(context->dispatchMutex);
+        context->dispatchStop = true;
     }
-    if (context->d_hdrOutput) {
-        CUDA_CHECK_VOID(cudaFree(context->d_hdrOutput));
+    context->dispatchCv.notify_all();
+    if (context->dispatcher.joinable()) {
+        context->dispatcher.join();
     }
-    
-    // Destroy stream
-    if (context->stream) {
-        CUDA_CHECK_VOID(cudaStreamDestroy(context->stream));
+
+    for (int i = 0; i < CUDA_ASYNC_SLOTS; ++i) {
+        CudaAsyncSlot& slot = context->asyncSlots[i];
+        if (slot.devBuffer) cudaFree(slot.devBuffer);
+        if (slot.hostBuffer) cudaFreeHost(slot.hostBuffer);
+        if (slot.evStart) cudaEventDestroy(slot.evStart);
+        if (slot.evEnd) cudaEventDestroy(slot.evEnd);
     }
-    
-    // Reset device
-    CUDA_CHECK_VOID(cudaDeviceReset());
-    
-    free(context);
+    if (context->stagingDev) cudaFree(context->stagingDev);
+    cudaStreamDestroy(context->ownStream);
+    delete context;
 }
 
-bool cuda_gpu_convert_rgba_to_uyvy(CudaGPUContextRef context, 
-                                   const float* rgbaData, 
-                                   unsigned char* uyvyData,
-                                   int width, 
-                                   int height) {
-    if (!context || !rgbaData || !uyvyData) {
-        CUDA_LOG("Invalid parameters for RGBA to UYVY conversion");
+// ---------------------------------------------------------------------------
+// Shared validation + launch plumbing
+// ---------------------------------------------------------------------------
+
+static cudaStream_t resolveStream(CudaGPUContextRef context, void* cudaStream)
+{
+    if (cudaStream) return static_cast<cudaStream_t>(cudaStream);
+    return context ? context->ownStream : nullptr;
+}
+
+// A usable map buffer holds mapWidth*mapHeight interleaved (u,v) float pairs.
+// Size is checkable only for module-tracked allocations (see gBufferRegistry).
+static bool validWarpMap(void* mapDeviceBuffer, int mapWidth, int mapHeight)
+{
+    if (!mapDeviceBuffer || mapWidth <= 0 || mapHeight <= 0) return false;
+    const size_t neededBytes =
+        static_cast<size_t>(mapWidth) * static_cast<size_t>(mapHeight) * 2 * sizeof(float);
+    const size_t tracked = trackedBufferBytes(mapDeviceBuffer);
+    return tracked == 0 || tracked >= neededBytes;
+}
+
+// Geometry gate shared by every convert entry point; mirrors the Metal
+// module so both platforms refuse the same sources (odd widths can't pack
+// 4:2:2 rows cleanly — the caller falls back to the CPU path).
+static bool validConvertGeometry(int srcWidth, int srcHeight, int srcRowFloats,
+                                 int divisor, int outWidth, int outHeight)
+{
+    return srcWidth > 0 && srcHeight > 0 && srcRowFloats >= srcWidth * 4 &&
+           divisor > 0 && outWidth >= 2 && (outWidth % 2) == 0 && outHeight > 0;
+}
+
+// Source-buffer size check, possible only when the buffer is module-tracked
+// (tests); the host's frame buffers are trusted.
+static bool srcBufferLargeEnough(void* srcDeviceBuffer, int srcHeight, int srcRowFloats)
+{
+    const size_t tracked = trackedBufferBytes(srcDeviceBuffer);
+    if (tracked == 0) return true;
+    const size_t neededBytes =
+        static_cast<size_t>(srcHeight) * static_cast<size_t>(srcRowFloats) * sizeof(float);
+    return tracked >= neededBytes;
+}
+
+static void launchConvertKernel(cudaStream_t stream, void* srcDeviceBuffer, void* dstDeviceBuffer,
+                                void* mapDeviceBuffer, const CudaConvertParams& p, bool p216)
+{
+    const dim3 block(16, 16, 1);
+    const dim3 grid(((p.outWidth / 2) + block.x - 1) / block.x,
+                    (p.outHeight + block.y - 1) / block.y, 1);
+    const float* src = static_cast<const float*>(srcDeviceBuffer);
+    if (mapDeviceBuffer) {
+        const float* mapUV = static_cast<const float*>(mapDeviceBuffer);
+        if (p216) {
+            warpRGBAToP216Kernel<<<grid, block, 0, stream>>>(
+                src, static_cast<unsigned short*>(dstDeviceBuffer), mapUV, p);
+        } else {
+            warpRGBAToUYVYKernel<<<grid, block, 0, stream>>>(
+                src, static_cast<unsigned char*>(dstDeviceBuffer), mapUV, p);
+        }
+    } else {
+        if (p216) {
+            downscaleRGBAToP216Kernel<<<grid, block, 0, stream>>>(
+                src, static_cast<unsigned short*>(dstDeviceBuffer), p);
+        } else {
+            downscaleRGBAToUYVYKernel<<<grid, block, 0, stream>>>(
+                src, static_cast<unsigned char*>(dstDeviceBuffer), p);
+        }
+    }
+}
+
+static CudaConvertParams makeParams(int srcWidth, int srcHeight, int srcRowFloats,
+                                    int divisor, int outWidth, int outHeight,
+                                    int mapWidth, int mapHeight)
+{
+    CudaConvertParams p;
+    p.srcWidth = static_cast<unsigned>(srcWidth);
+    p.srcHeight = static_cast<unsigned>(srcHeight);
+    p.srcRowFloats = static_cast<unsigned>(srcRowFloats);
+    p.outWidth = static_cast<unsigned>(outWidth);
+    p.outHeight = static_cast<unsigned>(outHeight);
+    p.divisor = static_cast<unsigned>(divisor);
+    p.mapWidth = static_cast<unsigned>(mapWidth);
+    p.mapHeight = static_cast<unsigned>(mapHeight);
+    return p;
+}
+
+// Blocking convert: run the fused kernel into the context staging buffer and
+// copy the small converted frame straight to cpuOut, waiting on the stream.
+// Slow-path/tests only — the render fast path uses the submit entry points.
+static bool runConvertKernel(CudaGPUContextRef context, void* cudaStream, void* srcDeviceBuffer,
+                             int srcWidth, int srcHeight, int srcRowFloats,
+                             void* mapDeviceBuffer, int mapWidth, int mapHeight,
+                             int divisor,
+                             int outWidth, int outHeight,
+                             bool p216, void* cpuOut, size_t outBytes, const char* label)
+{
+    if (!context || !srcDeviceBuffer || !cpuOut) return false;
+    if (!validConvertGeometry(srcWidth, srcHeight, srcRowFloats, divisor, outWidth, outHeight)) {
         return false;
     }
-    
-    auto startTime = std::chrono::high_resolution_clock::now();
-    
-    CUDA_LOG("Starting CUDA RGBA->UYVY conversion (%dx%d)", width, height);
-    
-    size_t inputSize = width * height * 4 * sizeof(float);
-    size_t outputSize = width * height * 2; // UYVY is 2 bytes per pixel
-    
-    // Allocate or reallocate device memory if needed
-    if (context->allocatedInputSize < inputSize) {
-        if (context->d_rgbaInput) {
-            CUDA_CHECK(cudaFree(context->d_rgbaInput));
-        }
-        CUDA_CHECK(cudaMalloc(&context->d_rgbaInput, inputSize));
-        context->allocatedInputSize = inputSize;
-    }
-    
-    if (context->allocatedUyvySize < outputSize) {
-        if (context->d_uyvyOutput) {
-            CUDA_CHECK(cudaFree(context->d_uyvyOutput));
-        }
-        CUDA_CHECK(cudaMalloc(&context->d_uyvyOutput, outputSize));
-        context->allocatedUyvySize = outputSize;
-    }
-    
-    // Copy input data to device
-    CUDA_CHECK(cudaMemcpyAsync(context->d_rgbaInput, rgbaData, inputSize, 
-                              cudaMemcpyHostToDevice, context->stream));
-    
-    // Configure kernel launch parameters
-    dim3 blockSize(16, 16);
-    dim3 gridSize((width / 2 + blockSize.x - 1) / blockSize.x, 
-                  (height + blockSize.y - 1) / blockSize.y);
-    
-    // Launch kernel
-    rgba_to_uyvy_kernel<<<gridSize, blockSize, 0, context->stream>>>(
-        (float4*)context->d_rgbaInput,
-        (uchar4*)context->d_uyvyOutput,
-        width,
-        height
-    );
-    
-    // Check for kernel launch errors
-    cudaError_t kernelError = cudaGetLastError();
-    if (kernelError != cudaSuccess) {
-        CUDA_LOG("CUDA kernel launch failed: %s", cudaGetErrorString(kernelError));
+    const bool warp = (mapDeviceBuffer != nullptr);
+    if (warp && !validWarpMap(mapDeviceBuffer, mapWidth, mapHeight)) {
         return false;
     }
-    
-    // Copy result back to host
-    CUDA_CHECK(cudaMemcpyAsync(uyvyData, context->d_uyvyOutput, outputSize, 
-                              cudaMemcpyDeviceToHost, context->stream));
-    
-    // Wait for completion
-    CUDA_CHECK(cudaStreamSynchronize(context->stream));
-    
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-    
-    CUDA_LOG("🚀 CUDA RGBA->UYVY conversion completed in %lld μs (%.2f ms)", 
-           duration.count(), duration.count() / 1000.0);
-    
+    if (!srcBufferLargeEnough(srcDeviceBuffer, srcHeight, srcRowFloats)) {
+        CUDA_LOG("Blocking convert: source buffer too small");
+        return false;
+    }
+    cudaStream_t stream = resolveStream(context, cudaStream);
+    if (!stream) return false;
+
+    const auto startTime = std::chrono::high_resolution_clock::now();
+
+    if (context->stagingDevCap < outBytes) {
+        if (context->stagingDev) {
+            cudaFree(context->stagingDev);
+            context->stagingDev = nullptr;
+            context->stagingDevCap = 0;
+        }
+        if (cudaMalloc(&context->stagingDev, outBytes) != cudaSuccess) {
+            CUDA_LOG("Blocking convert: failed to allocate %zu-byte staging buffer", outBytes);
+            context->stagingDev = nullptr;
+            return false;
+        }
+        context->stagingDevCap = outBytes;
+    }
+
+    const CudaConvertParams p = makeParams(srcWidth, srcHeight, srcRowFloats,
+                                           divisor, outWidth, outHeight, mapWidth, mapHeight);
+    launchConvertKernel(stream, srcDeviceBuffer, context->stagingDev, mapDeviceBuffer, p, p216);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        CUDA_LOG("Blocking convert: kernel launch failed: %s", cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaMemcpyAsync(cpuOut, context->stagingDev, outBytes, cudaMemcpyDeviceToHost, stream);
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(stream);
+    }
+    if (err != cudaSuccess) {
+        CUDA_LOG("Blocking convert: readback failed: %s", cudaGetErrorString(err));
+        return false;
+    }
+
+    const auto endTime = std::chrono::high_resolution_clock::now();
+    const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+    CUDA_LOG("Blocking convert %s: %dx%d -> %dx%d (divisor %d) in %lld us (%.2f ms)",
+             label, srcWidth, srcHeight, outWidth, outHeight, divisor,
+             static_cast<long long>(duration.count()), duration.count() / 1000.0);
     return true;
 }
 
-bool cuda_gpu_convert_rgba_to_hdr(CudaGPUContextRef context,
-                                  const float* rgbaData,
-                                  unsigned short* hdrData,
-                                  int width,
-                                  int height,
-                                  float scale) {
-    if (!context || !rgbaData || !hdrData) {
-        CUDA_LOG("Invalid parameters for RGBA to HDR conversion");
+bool cuda_gpu_buffer_downscale_to_uyvy(CudaGPUContextRef context,
+                                       void* cudaStream,
+                                       void* srcDeviceBuffer,
+                                       int srcWidth, int srcHeight, int srcRowFloats,
+                                       int divisor,
+                                       int outWidth, int outHeight,
+                                       unsigned char* uyvyOut)
+{
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2;
+    return runConvertKernel(context, cudaStream, srcDeviceBuffer,
+                            srcWidth, srcHeight, srcRowFloats, nullptr, 0, 0, divisor,
+                            outWidth, outHeight, false, uyvyOut, outBytes, "UYVY");
+}
+
+bool cuda_gpu_buffer_downscale_to_p216(CudaGPUContextRef context,
+                                       void* cudaStream,
+                                       void* srcDeviceBuffer,
+                                       int srcWidth, int srcHeight, int srcRowFloats,
+                                       int divisor,
+                                       int outWidth, int outHeight,
+                                       unsigned short* p216Out)
+{
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2 * sizeof(unsigned short);
+    return runConvertKernel(context, cudaStream, srcDeviceBuffer,
+                            srcWidth, srcHeight, srcRowFloats, nullptr, 0, 0, divisor,
+                            outWidth, outHeight, true, p216Out, outBytes, "P216");
+}
+
+bool cuda_gpu_buffer_warp_to_uyvy(CudaGPUContextRef context,
+                                  void* cudaStream,
+                                  void* srcDeviceBuffer,
+                                  int srcWidth, int srcHeight, int srcRowFloats,
+                                  void* mapDeviceBuffer, int mapWidth, int mapHeight,
+                                  int divisor,
+                                  int outWidth, int outHeight,
+                                  unsigned char* uyvyOut)
+{
+    if (!mapDeviceBuffer) return false;
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2;
+    return runConvertKernel(context, cudaStream, srcDeviceBuffer,
+                            srcWidth, srcHeight, srcRowFloats,
+                            mapDeviceBuffer, mapWidth, mapHeight, divisor,
+                            outWidth, outHeight, false, uyvyOut, outBytes, "warp UYVY");
+}
+
+bool cuda_gpu_buffer_warp_to_p216(CudaGPUContextRef context,
+                                  void* cudaStream,
+                                  void* srcDeviceBuffer,
+                                  int srcWidth, int srcHeight, int srcRowFloats,
+                                  void* mapDeviceBuffer, int mapWidth, int mapHeight,
+                                  int divisor,
+                                  int outWidth, int outHeight,
+                                  unsigned short* p216Out)
+{
+    if (!mapDeviceBuffer) return false;
+    const size_t outBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 2 * sizeof(unsigned short);
+    return runConvertKernel(context, cudaStream, srcDeviceBuffer,
+                            srcWidth, srcHeight, srcRowFloats,
+                            mapDeviceBuffer, mapWidth, mapHeight, divisor,
+                            outWidth, outHeight, true, p216Out, outBytes, "warp P216");
+}
+
+// Non-blocking variant: enqueue only. Validation mirrors runConvertKernel so
+// both paths refuse the same sources; refusals are typed (BUSY vs INVALID)
+// because the caller's correct reaction differs — drop vs fall back to the
+// blocking readback. mapDeviceBuffer selects the STMap warp kernels; null =
+// plain downscale.
+static cuda_submit_status submitConvertInternal(CudaGPUContextRef context,
+                                                void* cudaStream,
+                                                void* srcDeviceBuffer,
+                                                int srcWidth, int srcHeight, int srcRowFloats,
+                                                void* mapDeviceBuffer, int mapWidth, int mapHeight,
+                                                int divisor,
+                                                int outWidth, int outHeight,
+                                                bool p216,
+                                                cuda_downscale_done_fn done, void* user)
+{
+    if (!context || !srcDeviceBuffer || !done) return CUDA_SUBMIT_INVALID;
+    if (!validConvertGeometry(srcWidth, srcHeight, srcRowFloats, divisor, outWidth, outHeight)) {
+        return CUDA_SUBMIT_INVALID;
+    }
+    const bool warp = (mapDeviceBuffer != nullptr);
+    if (warp && !validWarpMap(mapDeviceBuffer, mapWidth, mapHeight)) {
+        return CUDA_SUBMIT_INVALID;
+    }
+    if (!srcBufferLargeEnough(srcDeviceBuffer, srcHeight, srcRowFloats)) {
+        return CUDA_SUBMIT_INVALID;
+    }
+    cudaStream_t stream = resolveStream(context, cudaStream);
+    if (!stream) return CUDA_SUBMIT_INVALID;
+    const size_t outBytes = static_cast<size_t>(outWidth) * outHeight * 2 *
+                            (p216 ? sizeof(unsigned short) : 1);
+
+    // Claim a free slot; none free = GPU behind or consumer backlogged — the
+    // caller drops this frame (backpressure by dropping, never blocking).
+    CudaAsyncSlot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(context->asyncMutex);
+        for (int i = 0; i < CUDA_ASYNC_SLOTS; ++i) {
+            if (!context->asyncSlots[i].busy) {
+                slot = &context->asyncSlots[i];
+                slot->busy = true;
+                break;
+            }
+        }
+    }
+    if (!slot) return CUDA_SUBMIT_BUSY;
+
+    if (slot->capacity < outBytes) {
+        if (slot->devBuffer) cudaFree(slot->devBuffer);
+        if (slot->hostBuffer) cudaFreeHost(slot->hostBuffer);
+        slot->devBuffer = nullptr;
+        slot->hostBuffer = nullptr;
+        slot->capacity = 0;
+        if (cudaMalloc(&slot->devBuffer, outBytes) != cudaSuccess ||
+            cudaMallocHost(&slot->hostBuffer, outBytes) != cudaSuccess) {
+            if (slot->devBuffer) cudaFree(slot->devBuffer);
+            slot->devBuffer = nullptr;
+            std::lock_guard<std::mutex> lock(context->asyncMutex);
+            slot->busy = false;
+            return CUDA_SUBMIT_INVALID; // allocation failure won't heal frame-to-frame
+        }
+        slot->capacity = outBytes;
+    }
+
+    slot->done = done;
+    slot->user = user;
+    slot->outBytes = outBytes;
+
+    const CudaConvertParams p = makeParams(srcWidth, srcHeight, srcRowFloats,
+                                           divisor, outWidth, outHeight, mapWidth, mapHeight);
+    cudaEventRecord(slot->evStart, stream);
+    launchConvertKernel(stream, srcDeviceBuffer, slot->devBuffer, mapDeviceBuffer, p, p216);
+    cudaError_t err = cudaGetLastError();
+    const bool kernelLaunched = (err == cudaSuccess);
+    if (err == cudaSuccess) err = cudaEventRecord(slot->evEnd, stream);
+    if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(slot->hostBuffer, slot->devBuffer, outBytes,
+                              cudaMemcpyDeviceToHost, stream);
+    }
+    if (err == cudaSuccess) err = cudaLaunchHostFunc(stream, slotCompletedHostFn, slot);
+    if (err != cudaSuccess) {
+        // Enqueue failed partway: no completion will fire. Practically this
+        // means a broken context (these calls only fail synchronously for
+        // configuration errors). Before a successful launch nothing can touch
+        // the slot's buffers, so it may be reused; after one, the pending
+        // kernel/copy still targets them — RETIRE the slot (busy forever)
+        // rather than free buffers a straggler will write.
+        CUDA_LOG("Fast path async: enqueue failed%s: %s",
+                 kernelLaunched ? " - retiring slot" : "", cudaGetErrorString(err));
+        if (!kernelLaunched) {
+            std::lock_guard<std::mutex> lock(context->asyncMutex);
+            slot->busy = false;
+        }
+        return CUDA_SUBMIT_INVALID;
+    }
+    return CUDA_SUBMIT_OK;
+}
+
+cuda_submit_status cuda_gpu_downscale_submit(CudaGPUContextRef context,
+                                             void* cudaStream,
+                                             void* srcDeviceBuffer,
+                                             int srcWidth, int srcHeight, int srcRowFloats,
+                                             int divisor,
+                                             int outWidth, int outHeight,
+                                             bool p216,
+                                             cuda_downscale_done_fn done, void* user)
+{
+    return submitConvertInternal(context, cudaStream, srcDeviceBuffer,
+                                 srcWidth, srcHeight, srcRowFloats,
+                                 nullptr, 0, 0, divisor,
+                                 outWidth, outHeight, p216, done, user);
+}
+
+cuda_submit_status cuda_gpu_warp_submit(CudaGPUContextRef context,
+                                        void* cudaStream,
+                                        void* srcDeviceBuffer,
+                                        int srcWidth, int srcHeight, int srcRowFloats,
+                                        void* mapDeviceBuffer, int mapWidth, int mapHeight,
+                                        int divisor,
+                                        int outWidth, int outHeight,
+                                        bool p216,
+                                        cuda_downscale_done_fn done, void* user)
+{
+    if (!mapDeviceBuffer) return CUDA_SUBMIT_INVALID;
+    return submitConvertInternal(context, cudaStream, srcDeviceBuffer,
+                                 srcWidth, srcHeight, srcRowFloats,
+                                 mapDeviceBuffer, mapWidth, mapHeight, divisor,
+                                 outWidth, outHeight, p216, done, user);
+}
+
+void cuda_gpu_downscale_release(CudaGPUContextRef context, void* slot)
+{
+    if (!context || !slot) return;
+    std::lock_guard<std::mutex> lock(context->asyncMutex);
+    static_cast<CudaAsyncSlot*>(slot)->busy = false;
+}
+
+bool cuda_gpu_copy_buffer(CudaGPUContextRef context,
+                          void* cudaStream,
+                          void* srcDeviceBuffer, void* dstDeviceBuffer,
+                          size_t byteCount, bool waitForCompletion)
+{
+    if (!srcDeviceBuffer || !dstDeviceBuffer || byteCount == 0) return false;
+    cudaStream_t stream = resolveStream(context, cudaStream);
+    if (!stream) return false;
+
+    size_t copyBytes = byteCount;
+    const size_t srcTracked = trackedBufferBytes(srcDeviceBuffer);
+    const size_t dstTracked = trackedBufferBytes(dstDeviceBuffer);
+    if (srcTracked && copyBytes > srcTracked) copyBytes = srcTracked;
+    if (dstTracked && copyBytes > dstTracked) copyBytes = dstTracked;
+    if (copyBytes != byteCount) {
+        CUDA_LOG("Passthrough copy clamped from %zu to %zu bytes", byteCount, copyBytes);
+    }
+
+    cudaError_t err = cudaMemcpyAsync(dstDeviceBuffer, srcDeviceBuffer, copyBytes,
+                                      cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) {
+        CUDA_LOG("Passthrough copy failed: %s", cudaGetErrorString(err));
         return false;
     }
-    
-    auto startTime = std::chrono::high_resolution_clock::now();
-    
-    CUDA_LOG("Starting CUDA RGBA->HDR conversion (%dx%d)", width, height);
-    
-    size_t inputSize = width * height * 4 * sizeof(float);
-    size_t outputSize = width * height * 2 * sizeof(unsigned short); // P216 format
-    
-    // Allocate or reallocate device memory if needed
-    if (context->allocatedInputSize < inputSize) {
-        if (context->d_rgbaInput) {
-            CUDA_CHECK(cudaFree(context->d_rgbaInput));
-        }
-        CUDA_CHECK(cudaMalloc(&context->d_rgbaInput, inputSize));
-        context->allocatedInputSize = inputSize;
+    if (waitForCompletion) {
+        return cudaStreamSynchronize(stream) == cudaSuccess;
     }
-    
-    if (context->allocatedHdrSize < outputSize) {
-        if (context->d_hdrOutput) {
-            CUDA_CHECK(cudaFree(context->d_hdrOutput));
-        }
-        CUDA_CHECK(cudaMalloc(&context->d_hdrOutput, outputSize));
-        context->allocatedHdrSize = outputSize;
-    }
-    
-    // Copy input data to device
-    CUDA_CHECK(cudaMemcpyAsync(context->d_rgbaInput, rgbaData, inputSize, 
-                              cudaMemcpyHostToDevice, context->stream));
-    
-    // Configure kernel launch parameters
-    dim3 blockSize(16, 16);
-    dim3 gridSize((width / 2 + blockSize.x - 1) / blockSize.x, 
-                  (height + blockSize.y - 1) / blockSize.y);
-    
-    // Calculate plane pointers for P216 format
-    unsigned short* yPlane = context->d_hdrOutput;
-    unsigned short* uvPlane = context->d_hdrOutput + (width * height);
-    
-    // Launch kernel
-    rgba_to_hdr_p216_kernel<<<gridSize, blockSize, 0, context->stream>>>(
-        (float4*)context->d_rgbaInput,
-        yPlane,
-        uvPlane,
-        width,
-        height,
-        scale
-    );
-    
-    // Check for kernel launch errors
-    cudaError_t kernelError = cudaGetLastError();
-    if (kernelError != cudaSuccess) {
-        CUDA_LOG("CUDA HDR kernel launch failed: %s", cudaGetErrorString(kernelError));
-        return false;
-    }
-    
-    // Copy result back to host
-    CUDA_CHECK(cudaMemcpyAsync(hdrData, context->d_hdrOutput, outputSize, 
-                              cudaMemcpyDeviceToHost, context->stream));
-    
-    // Wait for completion
-    CUDA_CHECK(cudaStreamSynchronize(context->stream));
-    
-    auto endTime = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-    
-    CUDA_LOG("🚀 CUDA RGBA->HDR conversion completed in %lld μs (%.2f ms)", 
-           duration.count(), duration.count() / 1000.0);
-    
     return true;
 }
 
-const char* cuda_gpu_get_device_name(CudaGPUContextRef context) {
-    if (!context) return "Unknown";
-    return context->deviceName;
-}
+bool cuda_gpu_read_buffer(CudaGPUContextRef context,
+                          void* cudaStream,
+                          void* srcDeviceBuffer,
+                          void* cpuDst, size_t byteCount)
+{
+    if (!srcDeviceBuffer || !cpuDst || byteCount == 0) return false;
+    const size_t tracked = trackedBufferBytes(srcDeviceBuffer);
+    if (tracked && byteCount > tracked) return false;
+    cudaStream_t stream = resolveStream(context, cudaStream);
+    if (!stream) return false;
 
-bool cuda_gpu_get_memory_info(CudaGPUContextRef context, size_t* free_mem, size_t* total_mem) {
-    if (!context || !free_mem || !total_mem) return false;
-    
-    if (cudaSetDevice(context->deviceId) != cudaSuccess) {
-        return false;
+    cudaError_t err = cudaMemcpyAsync(cpuDst, srcDeviceBuffer, byteCount,
+                                      cudaMemcpyDeviceToHost, stream);
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(stream);
     }
-    
-    return cudaMemGetInfo(free_mem, total_mem) == cudaSuccess;
+    return err == cudaSuccess;
 }
 
-#endif // Windows 
+// Upload synchronizes before returning so callers may immediately hand the
+// pointer to kernels on ANY stream — the caller's stream never sees a
+// half-uploaded map (Metal's newBufferWithBytes has the same semantics via
+// its CPU-side copy).
+static void* createTrackedBuffer(cudaStream_t stream, const void* initialData, size_t byteCount)
+{
+    if (!stream || byteCount == 0) return nullptr;
+    void* devPtr = nullptr;
+    if (cudaMalloc(&devPtr, byteCount) != cudaSuccess) {
+        return nullptr;
+    }
+    if (initialData) {
+        cudaError_t err = cudaMemcpyAsync(devPtr, initialData, byteCount,
+                                          cudaMemcpyHostToDevice, stream);
+        if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            cudaFree(devPtr);
+            return nullptr;
+        }
+    }
+    std::lock_guard<std::mutex> lock(gBufferRegistryMutex);
+    gBufferRegistry[devPtr] = byteCount;
+    return devPtr;
+}
+
+void* cuda_gpu_create_device_buffer(CudaGPUContextRef context, const void* initialData, size_t byteCount)
+{
+    if (!context) return nullptr;
+    return createTrackedBuffer(context->ownStream, initialData, byteCount);
+}
+
+void* cuda_gpu_create_device_buffer_for_stream(CudaGPUContextRef context, void* cudaStream,
+                                               const void* initialData, size_t byteCount)
+{
+    return createTrackedBuffer(resolveStream(context, cudaStream), initialData, byteCount);
+}
+
+void* cuda_gpu_stream_device(CudaGPUContextRef context, void* cudaStream)
+{
+    (void)context;
+    (void)cudaStream;
+    // CUDA device memory is process-wide under unified addressing; key caches
+    // by the calling thread's current device (+1 so device 0 isn't NULL).
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return nullptr;
+    return reinterpret_cast<void*>(static_cast<intptr_t>(device) + 1);
+}
+
+void cuda_gpu_release_buffer(void* deviceBuffer)
+{
+    if (!deviceBuffer) return;
+    {
+        std::lock_guard<std::mutex> lock(gBufferRegistryMutex);
+        gBufferRegistry.erase(deviceBuffer);
+    }
+    // cudaFree (unlike cudaFreeAsync) does not release memory out from under
+    // still-running work that references it — the driver orders the free
+    // behind prior launches — so an in-flight frame on a dying STMap entry is
+    // safe, mirroring Metal's retain-while-executing semantics.
+    cudaFree(deviceBuffer);
+}
+
+#endif // _WIN32

@@ -1,177 +1,312 @@
-cmake_minimum_required(VERSION 3.18)
-project(NDIOutput LANGUAGES CXX CUDA)
+# Windows build harness for the NDI Output OFX plugin (spec decision 8:
+# CMake + VS2022 + CUDA Toolkit 12.9; docs/windows-port-spec.md). The
+# Makefile remains the macOS harness; BUILD.md is the contract between the
+# two.
+#
+# The CUDA module (ticket #22) implements the same GPU-module contract the
+# Metal module does; -DNDI_ENABLE_CUDA=OFF builds the CPU-only plugin (no
+# GPU-native path, no CUDA toolkit needed).
+#
+# Configure + build (see BUILD.md, Windows section). The -T option points the
+# VS generator's CUDA toolset straight at the toolkit — needed whenever the
+# CUDA VS integration was never copied into Visual Studio (an admin step the
+# toolkit installer performs but a bare nvcc install does not):
+#   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
+#         -T "cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9" ^
+#         -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+#   cmake --build build --config Release
+#   ctest --test-dir build -C Release --output-on-failure
+#   cmake --install build --config Release --prefix stage
 
-# Set C++ standard
+# 3.22 for VS_SETTINGS on the vendored BRAW IDL (ticket #26) — on older
+# CMake the property is silently ignored and the MIDL header lands where no
+# target can include it.
+cmake_minimum_required(VERSION 3.22)
+
+# zlib must link STATICALLY. The plugin is a DLL living in a folder Windows
+# never searches when resolving its load-time imports, so any dynamic
+# dependency staged beside it (vcpkg's default z.dll) makes the whole plugin
+# fail to load inside Resolve - the same loader trap the delay-loaded NDI DLL
+# exists to dodge. zlib can simply be static; the NDI runtime cannot (the SDK
+# license requires shipping the vendor DLL). static-md keeps the CRT dynamic,
+# matching the /MD default of the rest of the build. Must be set before
+# project() for the vcpkg toolchain to see it.
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-windows-static-md" CACHE STRING "vcpkg triplet")
+endif()
+
+# C is enabled for the generated NDI stub (ndi_stub.c, CI mode below).
+project(NDIOutput LANGUAGES C CXX)
+
+if(NOT WIN32)
+    message(FATAL_ERROR
+        "CMake drives the Windows build only; use the Makefile on macOS "
+        "(see BUILD.md).")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Set CUDA standard
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Version management
-file(READ "VERSION" VERSION_STRING)
-string(STRIP "${VERSION_STRING}" VERSION_STRING)
-
-# Platform-specific settings
-if(WIN32)
-    # Windows-specific settings
-    set(NDI_SDK_PATH "C:/Program Files/NDI/NDI 6 Advanced SDK" CACHE PATH "Path to NDI Advanced SDK")
-    set(NDI_INCLUDE "${NDI_SDK_PATH}/Include")
-    set(NDI_LIB "${NDI_SDK_PATH}/Lib/x64/Processing.NDI.Lib.x64.lib")
-    
-    # CUDA settings for Windows
-    find_package(CUDAToolkit REQUIRED)
-    
-    # Compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
-    
-    # Define Windows macros
-    add_definitions(-D_WIN32 -DWIN32 -D_WINDOWS)
-    
-elseif(APPLE)
-    # macOS-specific settings
-    set(NDI_SDK_PATH "/Library/NDI Advanced SDK for Apple" CACHE PATH "Path to NDI Advanced SDK")
-    set(NDI_INCLUDE "${NDI_SDK_PATH}/include")
-    set(NDI_LIB "${NDI_SDK_PATH}/lib/macOS/libndi_advanced.dylib")
-    
-    # Compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden")
-    
-    # Metal framework
-    find_library(METAL_FRAMEWORK Metal)
-    find_library(METALKIT_FRAMEWORK MetalKit)
-    find_library(FOUNDATION_FRAMEWORK Foundation)
-    
-else()
-    # Linux-specific settings
-    set(NDI_SDK_PATH "/usr/local/include/ndi" CACHE PATH "Path to NDI SDK")
-    set(NDI_INCLUDE "${NDI_SDK_PATH}")
-    set(NDI_LIB "ndi")
-    
-    # Compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden")
-endif()
-
-# Include directories
-include_directories(
-    openfx/include
-    ${NDI_INCLUDE}
-    src
-)
-
-# Source files
-set(SOURCES
-    src/NDIOutputPlugin.cpp
-)
-
-# Platform-specific source files
-if(WIN32)
-    list(APPEND SOURCES src/CudaGPUAcceleration.cu)
-elseif(APPLE)
-    list(APPEND SOURCES src/MetalGPUAcceleration.mm)
-endif()
-
-# Create the plugin library
-if(WIN32)
-    add_library(NDIOutput SHARED ${SOURCES})
-    set_target_properties(NDIOutput PROPERTIES
-        SUFFIX ".ofx"
-        PREFIX ""
-    )
-elseif(APPLE)
-    add_library(NDIOutput MODULE ${SOURCES})
-    set_target_properties(NDIOutput PROPERTIES
-        BUNDLE TRUE
-        BUNDLE_EXTENSION "ofx.bundle"
-        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/Info.plist"
-    )
-else()
-    add_library(NDIOutput SHARED ${SOURCES})
-    set_target_properties(NDIOutput PROPERTIES
-        SUFFIX ".ofx"
-        PREFIX ""
-    )
-endif()
-
-# Link libraries
-if(WIN32)
-    target_link_libraries(NDIOutput
-        ${NDI_LIB}
-        CUDA::cudart
-        CUDA::cuda_driver
-    )
-elseif(APPLE)
-    target_link_libraries(NDIOutput
-        ${NDI_LIB}
-        ${METAL_FRAMEWORK}
-        ${METALKIT_FRAMEWORK}
-        ${FOUNDATION_FRAMEWORK}
-    )
-else()
-    target_link_libraries(NDIOutput
-        ${NDI_LIB}
-        GL
-    )
-endif()
-
-# Compiler definitions
-target_compile_definitions(NDIOutput PRIVATE
-    kPluginVersionString="${VERSION_STRING}"
-)
-
-# CUDA-specific settings
-if(WIN32)
-    set_property(TARGET NDIOutput PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-    set_property(TARGET NDIOutput PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-    
-    # Set CUDA architecture (adjust based on target GPUs)
-    set_property(TARGET NDIOutput PROPERTY CUDA_ARCHITECTURES "52;61;75;86")
-endif()
-
-# Installation
-if(WIN32)
-    # Windows installation
-    install(TARGETS NDIOutput
-        DESTINATION "C:/Program Files/Common Files/OFX/Plugins"
-    )
-elseif(APPLE)
-    # macOS installation
-    install(TARGETS NDIOutput
-        DESTINATION "/Library/OFX/Plugins"
-    )
-else()
-    # Linux installation
-    install(TARGETS NDIOutput
-        DESTINATION "/usr/OFX/Plugins"
-    )
-endif()
-
-# Copy NDI library on Windows
-if(WIN32)
-    # Find NDI runtime DLL
-    find_file(NDI_DLL
-        NAMES "Processing.NDI.Lib.x64.dll"
-        PATHS "${NDI_SDK_PATH}/Bin/x64"
-        NO_DEFAULT_PATH
-    )
-    
-    if(NDI_DLL)
-        install(FILES ${NDI_DLL}
-            DESTINATION "C:/Program Files/Common Files/OFX/Plugins"
-        )
+# --- CUDA (ticket #22; spec decisions 4, 5, 8) -------------------------------
+# Architectures (spec decision 8): Pascal + Turing + Ampere as real targets
+# plus Ampere PTX so newer GPUs (Ada, Hopper, ...) JIT forward. Must be set
+# before enable_language(CUDA).
+option(NDI_ENABLE_CUDA "Build the CUDA GPU-native pipeline" ON)
+if(NDI_ENABLE_CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "60-real;75-real;86-real;86-virtual")
     endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 endif()
 
-# Print configuration summary
-message(STATUS "NDI Output Plugin Configuration:")
-message(STATUS "  Version: ${VERSION_STRING}")
-message(STATUS "  Platform: ${CMAKE_SYSTEM_NAME}")
-message(STATUS "  NDI SDK Path: ${NDI_SDK_PATH}")
-if(WIN32)
-    message(STATUS "  CUDA Support: Enabled")
-    message(STATUS "  CUDA Version: ${CUDAToolkit_VERSION}")
-elseif(APPLE)
-    message(STATUS "  Metal Support: Enabled")
-endif() 
+# --- Version guard -----------------------------------------------------------
+# VERSION and the #defines in src/NDIOutputPlugin.cpp are synced by
+# scripts/set_version.sh / increment_version.sh; the source is authoritative
+# for the compiled plugin (defining kPluginVersionString here as well was the
+# old scaffold's redefinition collision). Fail configure on drift instead.
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" NDI_VERSION_FILE)
+string(STRIP "${NDI_VERSION_FILE}" NDI_VERSION_FILE)
+file(STRINGS "${CMAKE_SOURCE_DIR}/src/NDIOutputPlugin.cpp" NDI_VERSION_LINE
+     REGEX "#define kPluginVersionString")
+string(REGEX MATCH "\"([0-9]+\\.[0-9]+\\.[0-9]+)\"" _unused "${NDI_VERSION_LINE}")
+set(NDI_VERSION_SOURCE "${CMAKE_MATCH_1}")
+if(NOT NDI_VERSION_FILE STREQUAL NDI_VERSION_SOURCE)
+    message(FATAL_ERROR
+        "VERSION file says ${NDI_VERSION_FILE} but src/NDIOutputPlugin.cpp "
+        "defines kPluginVersionString ${NDI_VERSION_SOURCE}. Run "
+        "scripts/set_version.sh to re-sync (never edit either by hand).")
+endif()
+
+# --- Dependencies ------------------------------------------------------------
+# zlib via vcpkg (spec decision 8): pass the vcpkg toolchain file; vcpkg.json
+# pins the dependency list.
+find_package(ZLIB REQUIRED)
+
+# NDI Advanced SDK: use the real installation when present (required for any
+# binary that will actually stream; release builds must use an SDK <= 30 days
+# old). Without it — hosted CI, where the access-gated SDK cannot live — fall
+# back to the vendored MIT-licensed headers plus a stub import library built
+# from the checked-in export list, which proves the plugin compiles and links
+# without shipping a byte of NDI code.
+set(NDI_SDK_PATH "C:/Program Files/NDI/NDI 6 Advanced SDK"
+    CACHE PATH "Path to the NDI Advanced SDK")
+set(NDI_DLL_NAME "Processing.NDI.Lib.Advanced.x64")
+
+if(EXISTS "${NDI_SDK_PATH}/Include/Processing.NDI.Lib.h")
+    message(STATUS "NDI: using installed Advanced SDK at ${NDI_SDK_PATH}")
+    set(NDI_INCLUDE_DIR "${NDI_SDK_PATH}/Include")
+    set(NDI_LINK_LIB "${NDI_SDK_PATH}/Lib/x64/${NDI_DLL_NAME}.lib")
+    set(NDI_USING_STUB FALSE)
+else()
+    message(STATUS "NDI: SDK not found - linking against the stub import library (CI mode)")
+    set(NDI_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/ndi/include")
+    set(NDI_USING_STUB TRUE)
+
+    # Generate one empty function per exported name; the .def attached to the
+    # stub target turns them into exports, and linking the target gives the
+    # plugin a normal import library for ${NDI_DLL_NAME}.dll.
+    set(NDI_DEF_FILE "${CMAKE_SOURCE_DIR}/third_party/ndi/${NDI_DLL_NAME}.def")
+    file(STRINGS "${NDI_DEF_FILE}" NDI_DEF_LINES)
+    set(NDI_STUB_SOURCE "// Generated from ${NDI_DLL_NAME}.def - do not edit.\n")
+    set(NDI_IN_EXPORTS FALSE)
+    foreach(_line IN LISTS NDI_DEF_LINES)
+        string(STRIP "${_line}" _line)
+        if(_line STREQUAL "EXPORTS")
+            set(NDI_IN_EXPORTS TRUE)
+        elseif(NDI_IN_EXPORTS AND _line MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+            string(APPEND NDI_STUB_SOURCE "void ${_line}(void) {}\n")
+        endif()
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/ndi_stub.c" "${NDI_STUB_SOURCE}")
+
+    add_library(ndi_stub SHARED "${CMAKE_BINARY_DIR}/ndi_stub.c" "${NDI_DEF_FILE}")
+    set_target_properties(ndi_stub PROPERTIES
+        OUTPUT_NAME "${NDI_DLL_NAME}"
+        PREFIX "")
+endif()
+
+# --- Shared compile settings -------------------------------------------------
+# /utf-8: sources hold UTF-8 string literals (log emoji, path tests); without
+# it MSVC decodes them through the local ANSI code page. MSVC flags are scoped
+# to C/C++ — nvcc rejects them on its own command line — and reach CUDA host
+# code via -Xcompiler.
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/W3;/utf-8;/MP>")
+add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>")
+add_compile_definitions(_CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
+
+# Byte-identity flag (ticket #22): the CUDA kernels must produce bytes equal
+# to the shared CPU references, so nvcc may not contract the multiply-adds
+# MSVC leaves separate (MSVC generates no FMA at the default /arch). The
+# kernels are memory-bound; the cost is noise. test_cuda_downscale is the
+# enforcement.
+set(NDI_CUDA_EXACT_MATH "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
+
+# --- BRAW immersive-metadata reader (ticket #26) -----------------------------
+# The Camera Metadata projection's SDK-facing half. The Windows Blackmagic
+# RAW SDK ships no C++ header — it is generated from the vendored IDL
+# (third_party/braw/Win/, Boost-style license, same provenance as the macOS
+# shim) by midl.exe, which the VS generator drives automatically for .idl
+# sources. VS_SETTINGS pins the output into one fixed directory so the
+# include path below is config-independent; without it the header lands in
+# the per-config IntDir where no other target could name it portably.
+# Nothing Blackmagic is linked or bundled: the dispatch shim (compiled into
+# BRAWImmersiveReader.cpp) resolves BlackmagicRawAPI.dll at runtime —
+# exe-relative, so inside Resolve it binds Resolve's own shipped copy.
+set(NDI_BRAW_GEN_DIR "${CMAKE_BINARY_DIR}/braw_gen")
+file(MAKE_DIRECTORY "${NDI_BRAW_GEN_DIR}")
+set_source_files_properties(third_party/braw/Win/BlackmagicRawAPI.idl PROPERTIES
+    VS_SETTINGS "OutputDirectory=${NDI_BRAW_GEN_DIR};HeaderFileName=BlackmagicRawAPI.h;InterfaceIdentifierFileName=BlackmagicRawAPI_i.c;ProxyFileName=BlackmagicRawAPI_p.c;TypeLibraryName=BlackmagicRawAPI.tlb")
+add_library(braw_reader STATIC
+    src/BRAWImmersiveReader.cpp
+    third_party/braw/Win/BlackmagicRawAPI.idl)
+target_include_directories(braw_reader PRIVATE
+    "${NDI_BRAW_GEN_DIR}"
+    third_party/braw/Win
+    src)
+# oleaut32: BSTR/VARIANT plumbing the Windows BRAW API speaks; ole32: the
+# CoInitializeEx courtesy call. System DLLs, no loader-trap concern.
+target_link_libraries(braw_reader PUBLIC oleaut32 ole32)
+
+# --- The plugin --------------------------------------------------------------
+add_library(NDIOutput SHARED
+    src/NDIOutputPlugin.cpp
+    src/WinFileDialog.cpp
+    src/WinTimelineWatch.cpp)
+set_target_properties(NDIOutput PROPERTIES
+    OUTPUT_NAME "NDIOutput"
+    SUFFIX ".ofx"
+    PREFIX "")
+if(NDI_ENABLE_CUDA)
+    target_sources(NDIOutput PRIVATE src/CudaGPUAcceleration.cu)
+    # NDI_HAS_CUDA gates the plugin's GPU-native seam (NDIOutputPlugin.cpp);
+    # without it the same source builds the CPU-only plugin.
+    target_compile_definitions(NDIOutput PRIVATE NDI_HAS_CUDA)
+    target_compile_options(NDIOutput PRIVATE ${NDI_CUDA_EXACT_MATH})
+    # cudart must link STATICALLY: a cudart64_*.dll staged beside the plugin
+    # would hit the same loader trap as z.dll (Windows never searches the
+    # plugin's folder for its load-time imports) and silently empty the
+    # Effects Library. test_plugin_delayload enforces this stays true.
+    set_target_properties(NDIOutput PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    # cudart_static.lib embeds /DEFAULTLIB:LIBCMT (it is built /MT); in this
+    # /MD build that raises LNK4098, which the plugin's /WX would make fatal.
+    # Dropping LIBCMT is the standard pairing for cudart_static + /MD — its
+    # CRT needs resolve from the dynamic runtime.
+    target_link_options(NDIOutput PRIVATE "/NODEFAULTLIB:LIBCMT")
+endif()
+target_include_directories(NDIOutput PRIVATE
+    openfx/include
+    src
+    "${NDI_INCLUDE_DIR}")
+target_link_libraries(NDIOutput PRIVATE ZLIB::ZLIB)
+# ole32 + shell32 + user32: the browse buttons' IFileOpenDialog and its
+# GUI-thread guard (ticket #24, src/WinFileDialog.cpp). advapi32: the
+# timeline watcher's PEP 514 Python discovery reads the registry (ticket
+# #25, src/WinTimelineWatch.h). System DLLs, so no loader-trap concern.
+target_link_libraries(NDIOutput PRIVATE ole32 shell32 user32 advapi32)
+# The BRAW immersive-metadata reader (ticket #26; braw_reader above).
+target_link_libraries(NDIOutput PRIVATE braw_reader)
+
+# Delay-load the NDI DLL (spec decision 12): Windows' loader never searches a
+# DLL's own folder for load-time imports of another DLL, so a static import
+# would make the plugin silently fail to load on machines without an NDI
+# runtime. Delay-loading defers resolution to first call; before that call the
+# plugin preloads the DLL from its own directory (src/NDIRuntimeLoader.h,
+# ticket #21), and test_plugin_delayload below keeps the import delay-loaded
+# forever.
+if(NDI_USING_STUB)
+    target_link_libraries(NDIOutput PRIVATE ndi_stub)
+else()
+    target_link_libraries(NDIOutput PRIVATE "${NDI_LINK_LIB}")
+endif()
+target_link_libraries(NDIOutput PRIVATE delayimp)
+# /WX: LNK4199 ("/DELAYLOAD ignored; no imports found") is a silent revert to
+# a load-time NDI import - exactly the plugin-vanishes failure. Make any
+# linker warning on this target fatal so it can never ship quietly.
+target_link_options(NDIOutput PRIVATE "/DELAYLOAD:${NDI_DLL_NAME}.dll" "/WX")
+
+# --- Portable unit tests (LEARNINGS.md Tier 0; `make test` on macOS) --------
+enable_testing()
+set(NDI_PORTABLE_TESTS
+    test_render_probe
+    test_stream_resolution
+    test_stereo_pair
+    test_platform_paths
+    test_ndi_loader
+    test_stmap
+    test_brawmap
+    test_braw_reader
+    test_win_file_dialog
+    test_timeline_watch)
+foreach(_t IN LISTS NDI_PORTABLE_TESTS)
+    add_executable(${_t} tests/${_t}.cpp)
+    target_include_directories(${_t} PRIVATE src)
+    add_test(NAME ${_t} COMMAND ${_t})
+    # Fixture paths in the tests are relative to the repo root.
+    set_tests_properties(${_t} PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endforeach()
+target_link_libraries(test_stmap PRIVATE ZLIB::ZLIB)
+target_link_libraries(test_brawmap PRIVATE ZLIB::ZLIB)
+target_link_libraries(test_braw_reader PRIVATE braw_reader ZLIB::ZLIB)
+target_link_libraries(test_timeline_watch PRIVATE advapi32)  # registry discovery
+
+# CUDA kernel-identity test (ticket #22): the fused kernels must be
+# byte-identical to the shared CPU references. Compiles the module in
+# directly, like test_metal_downscale does on macOS; runs on any machine with
+# a CUDA device and skips cleanly without one (hosted CI compiles it, the
+# Windows workstation executes it — LEARNINGS.md Tier 0).
+if(NDI_ENABLE_CUDA)
+    add_executable(test_cuda_downscale
+        tests/test_cuda_downscale.cpp
+        src/CudaGPUAcceleration.cu)
+    target_include_directories(test_cuda_downscale PRIVATE src)
+    target_compile_options(test_cuda_downscale PRIVATE ${NDI_CUDA_EXACT_MATH})
+    set_target_properties(test_cuda_downscale PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+    target_link_options(test_cuda_downscale PRIVATE "/NODEFAULTLIB:LIBCMT") # see the plugin's note
+    target_link_libraries(test_cuda_downscale PRIVATE ZLIB::ZLIB)
+    add_test(NAME test_cuda_downscale COMMAND test_cuda_downscale)
+    set_tests_properties(test_cuda_downscale PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
+
+# Delay-load smoke test (Windows-only, so not in the portable list): loads
+# the freshly built .ofx with a System32-only import search - what Resolve's
+# plugin scanner amounts to - and fails on any load-time import that would
+# make the plugin silently vanish from the Effects Library. wmain needs the
+# wide entry point.
+add_executable(test_plugin_delayload tests/test_plugin_delayload.cpp)
+target_include_directories(test_plugin_delayload PRIVATE openfx/include)
+target_link_options(test_plugin_delayload PRIVATE "/ENTRY:wmainCRTStartup")
+add_test(NAME test_plugin_delayload
+         COMMAND test_plugin_delayload "$<TARGET_FILE:NDIOutput>")
+
+# --- Install: the OFX bundle tree (spec decision 16) -------------------------
+# NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx, installed under
+# C:\Program Files\Common Files\OFX\Plugins (the flat install in the old
+# scaffold was wrong). The NDI runtime DLL and its licenses file ride along
+# when the real SDK is present (spec decisions 11 and 13); the installer
+# ticket (#23) owns end-user packaging.
+set(NDI_BUNDLE_BIN_DIR "NDIOutput.ofx.bundle/Contents/Win64")
+install(TARGETS NDIOutput RUNTIME DESTINATION "${NDI_BUNDLE_BIN_DIR}")
+# The Timeline (Auto) watcher helper rides in Contents/Resources, same spot
+# the macOS Makefile stages it (ticket #25; the watcher derives this path
+# from its own module location — see WinTimelineWatch.h bundleResourcePath).
+# Lua first (runs under Resolve's own fuscript.exe — nothing to install);
+# the Python helper stays as the documented fallback for hosts without
+# fuscript beside them.
+install(FILES src/ndi_timeline_watch.lua src/ndi_timeline_watch.py
+        DESTINATION "NDIOutput.ofx.bundle/Contents/Resources")
+if(NOT NDI_USING_STUB)
+    install(FILES
+        "${NDI_SDK_PATH}/Bin/x64/${NDI_DLL_NAME}.dll"
+        "${NDI_SDK_PATH}/Bin/x64/Processing.NDI.Lib.Licenses.txt"
+        DESTINATION "${NDI_BUNDLE_BIN_DIR}")
+endif()
+
+if(NDI_ENABLE_CUDA)
+    message(STATUS "NDI Output ${NDI_VERSION_FILE} - Windows build with the "
+                   "CUDA GPU-native pipeline (ticket #22)")
+else()
+    message(STATUS "NDI Output ${NDI_VERSION_FILE} - Windows CPU-only build "
+                   "(NDI_ENABLE_CUDA=OFF)")
+endif()

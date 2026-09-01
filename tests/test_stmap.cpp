@@ -28,6 +28,10 @@
 #include <sys/stat.h>
 #include <vector>
 
+#ifdef _WIN32
+#include <direct.h> // _mkdir
+#endif
+
 static int failures = 0;
 
 static void check(bool ok, const char* name)
@@ -298,7 +302,11 @@ static std::vector<uint8_t> buildEXR(int width, int height,
 
 static std::string writeTemp(const char* name, const std::vector<uint8_t>& bytes)
 {
+#ifdef _WIN32
+    ::_mkdir("build"); // ignore EEXIST — the harness usually creates it anyway
+#else
     ::mkdir("build", 0755); // ignore EEXIST — make test creates it anyway
+#endif
     const std::string path = std::string("build/") + name;
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) {

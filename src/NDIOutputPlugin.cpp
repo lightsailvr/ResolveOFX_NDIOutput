@@ -32,6 +32,13 @@
 // For dynamic strings a human must be able to read in `log stream`/`log show`:
 // os_log can redact plain %s arguments as <private> depending on system config.
 #define NDI_LOG_TEXT(str) os_log(OS_LOG_DEFAULT, "NDI Plugin: %{public}s", str)
+#elif defined(_WIN32)
+// Windows sink: OutputDebugStringA for live capture (DebugView/WinDbg), plus
+// an append-only file sink when NDI_OUTPUT_LOG_FILE names a path. Resolve on
+// Windows has no console, so printf would go nowhere.
+static void ndiWinLog(const char* fmt, ...);
+#define NDI_LOG(fmt, ...) ndiWinLog("NDI Plugin: " fmt, ##__VA_ARGS__)
+#define NDI_LOG_TEXT(str) ndiWinLog("NDI Plugin: %s", str)
 #else
 #define NDI_LOG(fmt, ...) printf("NDI Plugin: " fmt "\n", ##__VA_ARGS__)
 #define NDI_LOG_TEXT(str) printf("NDI Plugin: %s\n", str)
@@ -42,52 +49,65 @@
 #include "ofxMemory.h"
 #include "ofxMultiThread.h"
 
-#include <sys/stat.h>
+// Resolve's CUDA-stream extension properties (ticket #22). Present in the
+// official ofxGPURender.h; the vendored ofxImageEffectExt.h predates them.
+#ifndef kOfxImageEffectPropCudaStreamSupported
+#define kOfxImageEffectPropCudaStreamSupported "OfxImageEffectPropCudaStreamSupported"
+#endif
+#ifndef kOfxImageEffectPropCudaStream
+#define kOfxImageEffectPropCudaStream "OfxImageEffectPropCudaStream"
+#endif
 
 #include <algorithm>
 
 #include "BRAWLensMap.h"
+#include "NDIRuntimeLoader.h"
+#include "PlatformPaths.h"
 #include "RenderProbe.h"
 #include "STMap.h"
 #include "StereoPair.h"
 #include "StreamResolution.h"
+#include "TimelineClipWatcher.h"  // self-gates (defines NDI_TIMELINE_WATCH on macOS + Windows)
+
+#include "BRAWImmersiveReader.h"  // self-gates (macOS + Windows, ticket #26)
 
 #ifdef __APPLE__
-#include "BRAWImmersiveReader.h"
 #include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
-#include "TimelineClipWatcher.h"
 #endif
 
-#ifdef _WIN32
+#ifdef NDI_HAS_CUDA // defined by CMake when the CUDA module is in the build
 #include "CudaGPUAcceleration.h"
 #endif
 
-// GPU acceleration headers (forward declarations only)
-#ifdef __APPLE__
-// Forward declarations for Metal types to avoid Objective-C in C++
-#ifdef __OBJC__
-#include <Metal/Metal.h>
-#include <MetalKit/MetalKit.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #endif
-#include <OpenGL/OpenGL.h>
-#include <OpenGL/gl3.h>
-#elif defined(_WIN32) || defined(__WIN32__) || defined(WIN32) || defined(_WIN64) || defined(__WIN64__) || defined(WIN64)
-#include <d3d11.h>
-#include <dxgi.h>
-#else
-#include <GL/gl.h>
-#include <GL/glext.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <cstdarg>
+#include <cstdlib>
+#include "WinFileDialog.h"
 #endif
 
-// NDI Advanced SDK includes
-#ifdef __APPLE__
-#include <Processing.NDI.Lib.h>
-#elif defined(_WIN32) || defined(__WIN32__) || defined(WIN32) || defined(_WIN64) || defined(__WIN64__) || defined(WIN64)
-#include <Processing.NDI.Lib.h>
-#else
-#include <Processing.NDI.Lib.h>
+// Native browse-dialog seam (ticket #24): both desktop platforms pop a
+// native open dialog from the browse push-buttons, behind one contract
+// (UTF-8 in/out; cancel and every failure return false with the buffer
+// untouched). Aliased like the GPU modules so the param plumbing below
+// compiles identically on both.
+#if defined(__APPLE__)
+#define NDI_HAS_BROWSE_DIALOGS 1
+#define native_open_file_dialog mac_open_file_dialog
+#elif defined(_WIN32)
+#define NDI_HAS_BROWSE_DIALOGS 1
+#define native_open_file_dialog win_open_file_dialog
 #endif
+
+// NDI Advanced SDK
+#include <Processing.NDI.Lib.h>
 
 #if defined __APPLE__ || defined __linux__ || defined __FreeBSD__
 #  define EXPORT __attribute__((visibility("default")))
@@ -96,6 +116,44 @@
 #else
 #  error Not building on your operating system quite yet
 #endif
+
+#ifdef _WIN32
+// NDI_LOG sink for Windows. Live capture: run DebugView (Sysinternals) or
+// attach WinDbg — OutputDebugStringA lines carry the "NDI Plugin: " prefix.
+// Optional file sink: set NDI_OUTPUT_LOG_FILE to a writable path before
+// launching Resolve and lines are appended there too (fwrite on one FILE* is
+// thread-safe in the MSVC CRT; render threads log concurrently).
+static void ndiWinLog(const char* fmt, ...)
+{
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(buf, sizeof(buf) - 2, fmt, args);
+    va_end(args);
+    if (n < 0) {
+        return;
+    }
+    size_t len = static_cast<size_t>(n);
+    if (len > sizeof(buf) - 3) {
+        // vsnprintf truncated: it wrote sizeof(buf)-3 chars plus its own NUL
+        // at [sizeof(buf)-3]; the newline must overwrite that NUL, not land
+        // after it (an embedded NUL would cut the line short in both sinks).
+        len = sizeof(buf) - 3;
+    }
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+    OutputDebugStringA(buf);
+
+    static std::FILE* sink = []() -> std::FILE* {
+        const char* path = std::getenv("NDI_OUTPUT_LOG_FILE");
+        return (path && *path) ? ndi_path::fopenUtf8(path, "ab") : nullptr;
+    }();
+    if (sink) {
+        std::fwrite(buf, 1, len + 1, sink);
+        std::fflush(sink);
+    }
+}
+#endif // _WIN32
 
 // Plugin constants
 #define kPluginName "NDIOutput"
@@ -159,7 +217,8 @@
 
 // Native browse buttons: Resolve renders filePath string params as plain
 // text fields with no browse control (verified 2026-08-30), so the plugin
-// pops its own NSOpenPanel from push-button params (macOS only).
+// pops its own native open dialog from push-button params — NSOpenPanel on
+// macOS, IFileOpenDialog on Windows (the browse-dialog seam above).
 #define kParamSTMapPackedBrowse "stmapPackedBrowse"
 #define kParamSTMapPackedBrowseLabel "Browse for STMap..."
 #define kParamSTMapPackedBrowseHint "Pick the packed side-by-side STMap EXR with a file dialog and fill the path field above."
@@ -251,21 +310,96 @@ OfxMemorySuiteV1        *gMemoryHost = 0;
 OfxMultiThreadSuiteV1   *gThreadHost = 0;
 OfxMessageSuiteV1       *gMessageSuite = 0;
 
-// GPU Processing Context
-struct GPUContext {
+// ---------------------------------------------------------------------------
+// GPU-native seam (spec decision 5): one header-level C API, two
+// implementations — Metal on macOS, CUDA on Windows (ticket #22). These
+// aliases let everything above the seam (the async pump, the render fast
+// path, the STMap upload cache) compile identically on both platforms; a
+// platform with neither module runs the CPU path.
+// ---------------------------------------------------------------------------
+#if defined(__APPLE__) || defined(NDI_HAS_CUDA)
+#define NDI_GPU_NATIVE 1
+#endif
+
 #ifdef __APPLE__
-    MetalGPUContextRef metalContext;
-#elif defined(_WIN32)
-    CudaGPUContextRef cudaContext;
-    void* d3dDevice;
-    void* d3dContext;
-    void* colorConversionShader;
-    void* frameBuffer;
-#else
-    // OpenGL context for Linux
-    unsigned int framebuffer;
-    unsigned int colorConversionProgram;
-    unsigned int frameTexture;
+#define NDI_GPU_BACKEND_NAME "Metal"
+typedef MetalGPUContextRef NativeGPUContextRef;
+typedef metal_submit_status NativeSubmitStatus;
+typedef metal_downscale_done_fn native_gpu_done_fn;
+static const NativeSubmitStatus kNativeSubmitOK = METAL_SUBMIT_OK;
+static const NativeSubmitStatus kNativeSubmitBusy = METAL_SUBMIT_BUSY;
+static const NativeSubmitStatus kNativeSubmitInvalid = METAL_SUBMIT_INVALID;
+static inline bool nativeGpuAvailable(void) { return metal_gpu_is_available(); }
+static inline NativeGPUContextRef nativeGpuInit(void) { return metal_gpu_init(); }
+static inline void nativeGpuShutdown(NativeGPUContextRef c) { metal_gpu_shutdown(c); }
+static inline bool nativeGpuCopyBuffer(NativeGPUContextRef c, void* q, void* src, void* dst,
+                                       size_t bytes, bool wait)
+{ return metal_gpu_copy_buffer(c, q, src, dst, bytes, wait); }
+static inline bool nativeGpuReadBuffer(NativeGPUContextRef c, void* q, void* src,
+                                       void* cpuDst, size_t bytes)
+{ return metal_gpu_read_buffer(c, q, src, cpuDst, bytes); }
+static inline NativeSubmitStatus nativeGpuDownscaleSubmit(NativeGPUContextRef c, void* q, void* src,
+                                                          int sw, int sh, int srf, int divisor,
+                                                          int ow, int oh, bool p216,
+                                                          native_gpu_done_fn done, void* user)
+{ return metal_gpu_downscale_submit(c, q, src, sw, sh, srf, divisor, ow, oh, p216, done, user); }
+static inline NativeSubmitStatus nativeGpuWarpSubmit(NativeGPUContextRef c, void* q, void* src,
+                                                     int sw, int sh, int srf,
+                                                     void* map, int mw, int mh, int divisor,
+                                                     int ow, int oh, bool p216,
+                                                     native_gpu_done_fn done, void* user)
+{ return metal_gpu_warp_submit(c, q, src, sw, sh, srf, map, mw, mh, divisor, ow, oh, p216, done, user); }
+static inline void nativeGpuDownscaleRelease(NativeGPUContextRef c, void* slot)
+{ metal_gpu_downscale_release(c, slot); }
+static inline void* nativeGpuCreateBufferForQueue(NativeGPUContextRef c, void* q,
+                                                  const void* data, size_t bytes)
+{ return metal_gpu_create_shared_buffer_for_queue(c, q, data, bytes); }
+static inline void* nativeGpuQueueDevice(NativeGPUContextRef c, void* q)
+{ return metal_gpu_queue_device(c, q); }
+static inline void nativeGpuReleaseBuffer(void* buffer) { metal_gpu_release_buffer(buffer); }
+#elif defined(NDI_HAS_CUDA)
+#define NDI_GPU_BACKEND_NAME "CUDA"
+typedef CudaGPUContextRef NativeGPUContextRef;
+typedef cuda_submit_status NativeSubmitStatus;
+typedef cuda_downscale_done_fn native_gpu_done_fn;
+static const NativeSubmitStatus kNativeSubmitOK = CUDA_SUBMIT_OK;
+static const NativeSubmitStatus kNativeSubmitBusy = CUDA_SUBMIT_BUSY;
+static const NativeSubmitStatus kNativeSubmitInvalid = CUDA_SUBMIT_INVALID;
+static inline bool nativeGpuAvailable(void) { return cuda_gpu_is_available(); }
+static inline NativeGPUContextRef nativeGpuInit(void) { return cuda_gpu_init(); }
+static inline void nativeGpuShutdown(NativeGPUContextRef c) { cuda_gpu_shutdown(c); }
+static inline bool nativeGpuCopyBuffer(NativeGPUContextRef c, void* q, void* src, void* dst,
+                                       size_t bytes, bool wait)
+{ return cuda_gpu_copy_buffer(c, q, src, dst, bytes, wait); }
+static inline bool nativeGpuReadBuffer(NativeGPUContextRef c, void* q, void* src,
+                                       void* cpuDst, size_t bytes)
+{ return cuda_gpu_read_buffer(c, q, src, cpuDst, bytes); }
+static inline NativeSubmitStatus nativeGpuDownscaleSubmit(NativeGPUContextRef c, void* q, void* src,
+                                                          int sw, int sh, int srf, int divisor,
+                                                          int ow, int oh, bool p216,
+                                                          native_gpu_done_fn done, void* user)
+{ return cuda_gpu_downscale_submit(c, q, src, sw, sh, srf, divisor, ow, oh, p216, done, user); }
+static inline NativeSubmitStatus nativeGpuWarpSubmit(NativeGPUContextRef c, void* q, void* src,
+                                                     int sw, int sh, int srf,
+                                                     void* map, int mw, int mh, int divisor,
+                                                     int ow, int oh, bool p216,
+                                                     native_gpu_done_fn done, void* user)
+{ return cuda_gpu_warp_submit(c, q, src, sw, sh, srf, map, mw, mh, divisor, ow, oh, p216, done, user); }
+static inline void nativeGpuDownscaleRelease(NativeGPUContextRef c, void* slot)
+{ cuda_gpu_downscale_release(c, slot); }
+static inline void* nativeGpuCreateBufferForQueue(NativeGPUContextRef c, void* q,
+                                                  const void* data, size_t bytes)
+{ return cuda_gpu_create_device_buffer_for_stream(c, q, data, bytes); }
+static inline void* nativeGpuQueueDevice(NativeGPUContextRef c, void* q)
+{ return cuda_gpu_stream_device(c, q); }
+static inline void nativeGpuReleaseBuffer(void* buffer) { cuda_gpu_release_buffer(buffer); }
+#endif
+
+// GPU Processing Context: the platform GPU-module context behind the seam
+// above. On a platform with neither module the CPU path renders.
+struct GPUContext {
+#ifdef NDI_GPU_NATIVE
+    NativeGPUContextRef nativeContext;
 #endif
     bool initialized;
     std::mutex gpuMutex;
@@ -281,7 +415,7 @@ struct AsyncFrameData {
 };
 
 struct SenderHub; // process-shared NDI sender + eye pairer (defined below)
-#ifdef __APPLE__
+#ifdef NDI_GPU_NATIVE
 struct AsyncPump; // per-instance off-render-thread NDI worker (defined below)
 #endif
 
@@ -289,7 +423,7 @@ struct AsyncPump; // per-instance off-render-thread NDI worker (defined below)
 // STMap store (issue #7). One loaded map is shared process-wide via a
 // weak-pointer cache: in stereo, both per-eye instances name the same files,
 // and an 8K float map runs to hundreds of MB — loading it once matters. An
-// entry is immutable after load (the per-device Metal upload cache is the one
+// entry is immutable after load (the per-device GPU upload cache is the one
 // lazily-filled part, behind its own mutex); instances hold shared_ptrs and
 // the map frees itself when the last instance lets go.
 // ---------------------------------------------------------------------------
@@ -301,17 +435,18 @@ struct StmapEntry {
     bool valid = false;
     std::string error;
     ndi_stmap::STMapImage map;
-#ifdef __APPLE__
-    // Per-device Metal upload of map.uv, created lazily on the render path
-    // and reused every frame. In-flight command buffers retain the MTLBuffer,
-    // so releasing here while one executes is safe.
-    std::mutex metalMutex;
-    std::map<void*, void*> metalBufferByDevice; // key: device ptr; value: retained MTLBuffer
-    bool metalUploadFailed = false;             // don't retry (or re-log) an OOM every frame
+#ifdef NDI_GPU_NATIVE
+    // Per-device GPU upload of map.uv, created lazily on the render path and
+    // reused every frame. Releasing while a frame is in flight is safe on
+    // both backends: Metal command buffers retain the MTLBuffer, and CUDA's
+    // cudaFree orders itself behind already-launched work.
+    std::mutex gpuUploadMutex;
+    std::map<void*, void*> gpuBufferByDevice; // key: device ptr; value: device buffer
+    bool gpuUploadFailed = false;             // don't retry (or re-log) an OOM every frame
     ~StmapEntry()
     {
-        for (auto& kv : metalBufferByDevice) {
-            metal_gpu_release_buffer(kv.second);
+        for (auto& kv : gpuBufferByDevice) {
+            nativeGpuReleaseBuffer(kv.second);
         }
     }
 #endif
@@ -322,13 +457,7 @@ static std::map<std::string, std::weak_ptr<StmapEntry>> gStmapCache;
 
 static bool stmapFileStat(const char* path, long long* mtime, long long* size)
 {
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        return false;
-    }
-    *mtime = static_cast<long long>(st.st_mtime);
-    *size = static_cast<long long>(st.st_size);
-    return true;
+    return ndi_path::statUtf8(path, mtime, size);
 }
 
 // Fetch the STMap at `path`, loading it only when no instance already holds a
@@ -477,7 +606,7 @@ static void brawAcquireLensPair(const std::string& path, int mapSize, bool apply
     left->fileMtime = right->fileMtime = mtime;
     left->fileSize = right->fileSize = size;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     std::string json, kind, calType, error;
     ndi_brawmap::LensCalibration cal;
     if (!ndi_brawreader::readImmersiveCalibration(path, &json, &kind, &calType, &error) ||
@@ -513,7 +642,7 @@ static void brawAcquireLensPair(const std::string& path, int mapSize, bool apply
 #else
     (void)mapSize;
     (void)applyMask;
-    left->error = right->error = "Camera-metadata projection is macOS-only for now";
+    left->error = right->error = "Camera-metadata projection is not available on this platform";
 #endif
 
     std::lock_guard<std::mutex> lock(gStmapCacheMutex);
@@ -523,55 +652,55 @@ static void brawAcquireLensPair(const std::string& path, int mapSize, bool apply
     *rightOut = right;
 }
 
-#ifdef __APPLE__
-// Per-device Metal upload of an STMap's uv data, cached on the shared entry:
-// uploaded once, referenced by every subsequent frame's command buffer (which
-// retains it while executing, so the entry dying mid-flight is safe). Returns
-// NULL on failure — callers fall back to the CPU warp. The upload itself (a
-// multi-hundred-MB memcpy for a big map) runs OUTSIDE entry->metalMutex so
+#ifdef NDI_GPU_NATIVE
+// Per-device GPU upload of an STMap's uv data, cached on the shared entry:
+// uploaded once, referenced by every subsequent frame's submission (safe if
+// the entry dies mid-flight — see the cache comment above). Returns NULL on
+// failure — callers fall back to the CPU warp. The upload itself (a
+// multi-hundred-MB copy for a big map) runs OUTSIDE entry->gpuUploadMutex so
 // the other eye's render thread never queues behind it; normally it doesn't
 // run on a render thread at all — refreshSTMaps pre-warms it on the host's
 // main thread whenever the context device matches the host queue's device
-// (always, except multi-GPU Macs).
-static void* stmapMetalBufferForQueue(const std::shared_ptr<StmapEntry>& entry,
-                                      MetalGPUContextRef metalContext, void* metalQueue)
+// (always, except multi-GPU machines).
+static void* stmapNativeBufferForQueue(const std::shared_ptr<StmapEntry>& entry,
+                                       NativeGPUContextRef nativeContext, void* gpuQueue)
 {
     if (!entry || !entry->valid) {
         return nullptr;
     }
-    void* deviceKey = metal_gpu_queue_device(metalContext, metalQueue);
+    void* deviceKey = nativeGpuQueueDevice(nativeContext, gpuQueue);
     if (!deviceKey) {
         return nullptr;
     }
     {
-        std::lock_guard<std::mutex> lock(entry->metalMutex);
-        auto it = entry->metalBufferByDevice.find(deviceKey);
-        if (it != entry->metalBufferByDevice.end()) {
+        std::lock_guard<std::mutex> lock(entry->gpuUploadMutex);
+        auto it = entry->gpuBufferByDevice.find(deviceKey);
+        if (it != entry->gpuBufferByDevice.end()) {
             return it->second;
         }
-        if (entry->metalUploadFailed) {
+        if (entry->gpuUploadFailed) {
             return nullptr;
         }
     }
-    void* buffer = metal_gpu_create_shared_buffer_for_queue(metalContext, metalQueue,
-                                                            entry->map.uv.data(),
-                                                            entry->map.uv.size() * sizeof(float));
-    std::lock_guard<std::mutex> lock(entry->metalMutex);
+    void* buffer = nativeGpuCreateBufferForQueue(nativeContext, gpuQueue,
+                                                 entry->map.uv.data(),
+                                                 entry->map.uv.size() * sizeof(float));
+    std::lock_guard<std::mutex> lock(entry->gpuUploadMutex);
     if (!buffer) {
-        entry->metalUploadFailed = true; // don't retry (or re-log) an OOM every frame
+        entry->gpuUploadFailed = true; // don't retry (or re-log) an OOM every frame
         NDI_LOG("STMap: GPU upload failed (%zu bytes) — using the CPU warp fallback",
                 entry->map.uv.size() * sizeof(float));
         return nullptr;
     }
-    auto inserted = entry->metalBufferByDevice.emplace(deviceKey, buffer);
+    auto inserted = entry->gpuBufferByDevice.emplace(deviceKey, buffer);
     if (!inserted.second) {
         // Lost a concurrent upload race — keep the first, drop ours.
-        metal_gpu_release_buffer(buffer);
+        nativeGpuReleaseBuffer(buffer);
         return inserted.first->second;
     }
     return buffer;
 }
-#endif // __APPLE__
+#endif // NDI_GPU_NATIVE
 
 // Stream-status projection tag, composed into the Stream Status parameter.
 enum ProjStatus {
@@ -606,8 +735,8 @@ struct NDIInstanceData {
     OfxParamHandle stmapRightParam;
     OfxParamHandle brawSourceParam;
     OfxParamHandle brawClipParam;
-#ifdef __APPLE__
-    // Browse buttons (Apple-only, like their definitions) — cached so
+#ifdef NDI_HAS_BROWSE_DIALOGS
+    // Browse buttons (gated like their definitions) — cached so
     // updateParamVisibility can flip their secret state with the path fields.
     OfxParamHandle stmapPackedBrowseParam;
     OfxParamHandle stmapLeftBrowseParam;
@@ -639,7 +768,7 @@ struct NDIInstanceData {
     // renders each stereo eye through its own plugin instance, so senders and
     // pairing can never be instance state (see the SenderHub comment below).
     SenderHub* hub;
-#ifdef __APPLE__
+#ifdef NDI_GPU_NATIVE
     AsyncPump* pump;           // created on first async submit; drained in shutdownNDI
 #endif
     bool ndiInitialized;
@@ -784,6 +913,37 @@ struct SenderHub {
 static std::mutex gHubRegistryMutex;
 static std::map<std::string, SenderHub*> gHubRegistry;
 
+#ifdef _WIN32
+// The NDI import is delay-loaded (CMakeLists.txt /DELAYLOAD): resolution
+// happens at the first NDI call, and an unresolvable DLL there raises the
+// delay-load helper's SEH exception inside Resolve. So before any NDI call,
+// load the runtime shipped inside the bundle from the plugin's own directory
+// (module-relative; the loader never searches there on its own), falling back
+// to a system-wide NDI runtime. On total failure NDI stays off and the
+// plugin keeps working as a pass-through. See NDIRuntimeLoader.h.
+static bool ensureNDIRuntimeLoaded()
+{
+    static const bool loaded = []() {
+        const ndi_loader::PreloadResult r =
+            ndi_loader::preloadNDIRuntime(L"Processing.NDI.Lib.Advanced.x64.dll");
+        if (r.loaded && r.fromBundle) {
+            NDI_LOG("NDI runtime loaded from the bundle: %ls", r.bundlePath.c_str());
+        } else if (r.loaded) {
+            NDI_LOG("NDI runtime not beside the plugin (%ls, Win32 error %lu); "
+                    "using the system-installed runtime",
+                    r.bundlePath.c_str(), r.bundleError);
+        } else {
+            NDI_LOG("NDI runtime NOT FOUND: bundle attempt %ls failed "
+                    "(Win32 error %lu), system search failed (Win32 error %lu) "
+                    "- streaming disabled",
+                    r.bundlePath.c_str(), r.bundleError, r.systemError);
+        }
+        return r.loaded;
+    }();
+    return loaded;
+}
+#endif // _WIN32
+
 // NDIlib_initialize is refcounted inside the SDK and safe to call once and
 // keep; see the hub comment for why NDIlib_destroy must never be called.
 static bool ensureNDILibInitialized()
@@ -792,6 +952,11 @@ static bool ensureNDILibInitialized()
     static bool initialized = false;
     std::lock_guard<std::mutex> lock(initMutex);
     if (!initialized) {
+#ifdef _WIN32
+        if (!ensureNDIRuntimeLoaded()) {
+            return false;
+        }
+#endif
         initialized = NDIlib_initialize();
         if (initialized) {
             NDI_LOG("NDI library initialized (process-wide, kept for process lifetime)");
@@ -1184,12 +1349,14 @@ static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTime
     hubUpdateStatusLocked(hub, data);
 }
 
-#ifdef __APPLE__
+#ifdef NDI_GPU_NATIVE
 // ---------------------------------------------------------------------------
-// Async NDI pump (issue #5, v1.6.0). Diagnosis showed the 8K stereo playback
-// collapse (30fps -> 5fps) was ~90ms of blocking inside each render action —
-// the GPU wait plus the CPU-side NDI work. Now the render action only ENCODES
-// the fused downscale+convert kernel (microseconds); Metal's completion
+// Async NDI pump (issue #5, v1.6.0; un-gated from Apple-only by ticket #22 —
+// it consumes Metal and CUDA completions identically through the GPU-native
+// seam). Diagnosis showed the 8K stereo playback collapse (30fps -> 5fps) was
+// ~90ms of blocking inside each render action — the GPU wait plus the
+// CPU-side NDI work. Now the render action only ENQUEUES the fused
+// downscale+convert kernel (microseconds); the GPU module's completion
 // callback queues the finished staging slot here, and this per-instance
 // worker does everything else — pairing, packing, the NDI send — off the
 // render thread. Every worker send is synchronous, so no NDI in-flight buffer
@@ -1199,7 +1366,7 @@ static void hubSubmitFrame(NDIInstanceData* data, const HubSubmit& s, SubmitTime
 // ---------------------------------------------------------------------------
 struct AsyncPumpItem {
     void* slot = nullptr;
-    MetalGPUContextRef metalContext = nullptr;
+    NativeGPUContextRef nativeContext = nullptr;
     HubSubmit submit;  // bytes/byteCount are filled by the completion callback
     double gpuMs = 0.0;
     bool ok = false;
@@ -1210,7 +1377,7 @@ struct AsyncPump {
     std::mutex m;
     std::condition_variable cv;
     std::queue<AsyncPumpItem> queue; // bounded by kAsyncPumpQueueCap
-    std::atomic<int> pendingSubmits{0}; // Metal callbacks not yet finished with this pump
+    std::atomic<int> pendingSubmits{0}; // GPU callbacks not yet finished with this pump
     bool stop = false;
     std::thread worker;
     std::atomic<uint64_t> drops{0};  // incremented from render threads AND the callback
@@ -1257,7 +1424,7 @@ static void pumpWorkerLoop(AsyncPump* pump)
                         msSince(t0), depth);
             }
         }
-        metal_gpu_downscale_release(item.metalContext, item.slot);
+        nativeGpuDownscaleRelease(item.nativeContext, item.slot);
     }
 }
 
@@ -1271,9 +1438,9 @@ static AsyncPump* pumpEnsure(NDIInstanceData* data)
     return data->pump;
 }
 
-// Metal completion callback. Runs on the queue's completion thread — anything
-// slow here stalls the host's own completion handlers, so it only queues the
-// slot and wakes the worker.
+// GPU completion callback (Metal's completion thread / the CUDA module's
+// dispatcher). Anything slow here stalls the host's own completion handlers,
+// so it only queues the slot and wakes the worker.
 static void pumpOnConvertDone(void* user, void* slot, const void* outPtr,
                               size_t outBytes, double gpuMs, bool ok)
 {
@@ -1300,7 +1467,7 @@ static void pumpOnConvertDone(void* user, void* slot, const void* outPtr,
     if (queued) {
         pump->cv.notify_one();
     } else {
-        metal_gpu_downscale_release(ctx->item.metalContext, slot);
+        nativeGpuDownscaleRelease(ctx->item.nativeContext, slot);
     }
     delete ctx;
     --pump->pendingSubmits; // last touch: pumpShutdown waits on this before freeing
@@ -1330,12 +1497,12 @@ static void pumpShutdown(NDIInstanceData* data)
         // Worker exits on stop with items possibly still queued — release them.
         std::lock_guard<std::mutex> lock(pump->m);
         while (!pump->queue.empty()) {
-            metal_gpu_downscale_release(pump->queue.front().metalContext, pump->queue.front().slot);
+            nativeGpuDownscaleRelease(pump->queue.front().nativeContext, pump->queue.front().slot);
             pump->queue.pop();
         }
     }
     if (pump->pendingSubmits.load() > 0) {
-        NDI_LOG("Async pump: %d Metal callback(s) never arrived — leaking pump to stay safe",
+        NDI_LOG("Async pump: %d GPU callback(s) never arrived — leaking pump to stay safe",
                 pump->pendingSubmits.load());
         data->pump = nullptr;
         return;
@@ -1343,7 +1510,7 @@ static void pumpShutdown(NDIInstanceData* data)
     delete pump;
     data->pump = nullptr;
 }
-#endif // __APPLE__
+#endif // NDI_GPU_NATIVE
 
 // GPU Acceleration Functions
 static bool initializeGPUContext(NDIInstanceData* data)
@@ -1357,63 +1524,27 @@ static bool initializeGPUContext(NDIInstanceData* data)
     data->gpuContext = std::make_unique<GPUContext>();
     data->gpuContext->initialized = false;
 
-#ifdef __APPLE__
-    // Check if Metal is available
-    if (!metal_gpu_is_available()) {
-        NDI_LOG("Metal is not available on this system\n");
+#ifdef NDI_GPU_NATIVE
+    // Metal on macOS, CUDA on Windows — same seam. Unavailable (e.g. a
+    // non-NVIDIA Windows machine) is not an error: the caller falls back to
+    // the CPU conversion path (spec decision 4's documented ceiling).
+    if (!nativeGpuAvailable()) {
+        NDI_LOG(NDI_GPU_BACKEND_NAME " is not available on this system - using the CPU path");
         return false;
     }
-    
-    // Initialize Metal GPU acceleration
-    data->gpuContext->metalContext = metal_gpu_init();
-    if (!data->gpuContext->metalContext) {
-        NDI_LOG("Failed to initialize Metal GPU acceleration\n");
+
+    data->gpuContext->nativeContext = nativeGpuInit();
+    if (!data->gpuContext->nativeContext) {
+        NDI_LOG("Failed to initialize " NDI_GPU_BACKEND_NAME " GPU acceleration");
         return false;
     }
-    
-    NDI_LOG("Metal GPU acceleration initialized successfully\n");
-    
-#elif defined(_WIN32)
-    // Try CUDA first, then fallback to D3D11
-    if (cuda_gpu_is_available()) {
-        NDI_LOG("Initializing CUDA GPU acceleration...");
-        data->gpuContext->cudaContext = cuda_gpu_init();
-        if (data->gpuContext->cudaContext) {
-            NDI_LOG("CUDA GPU acceleration initialized successfully");
-            NDI_LOG("Device: %s", cuda_gpu_get_device_name(data->gpuContext->cudaContext));
-            
-            size_t free_mem, total_mem;
-            if (cuda_gpu_get_memory_info(data->gpuContext->cudaContext, &free_mem, &total_mem)) {
-                NDI_LOG("CUDA Memory: %.1f MB free / %.1f MB total", 
-                       free_mem / (1024.0f * 1024.0f), 
-                       total_mem / (1024.0f * 1024.0f));
-            }
-        } else {
-            NDI_LOG("Failed to initialize CUDA GPU acceleration, trying D3D11...");
-        }
-    } else {
-        NDI_LOG("CUDA not available, trying D3D11...");
-    }
-    
-    // Fallback to D3D11 if CUDA failed
-    if (!data->gpuContext->cudaContext) {
-        HRESULT hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-            0, nullptr, 0, D3D11_SDK_VERSION,
-            (ID3D11Device**)&data->gpuContext->d3dDevice,
-            nullptr, (ID3D11DeviceContext**)&data->gpuContext->d3dContext);
-        
-        if (FAILED(hr)) {
-            NDI_LOG("Failed to create D3D11 device");
-            return false;
-        }
-        
-        NDI_LOG("D3D11 GPU acceleration initialized as fallback");
-    }
+
+    NDI_LOG(NDI_GPU_BACKEND_NAME " GPU acceleration initialized successfully");
+
 #else
-    // Initialize OpenGL for Linux
-    // Note: This would require proper OpenGL context setup
-    NDI_LOG("OpenGL GPU acceleration available\n");
+    // No GPU-native module in this build — the CPU conversion path renders.
+    NDI_LOG("GPU-native path not available on this platform - using the CPU path");
+    return false;
 #endif
 
     data->gpuContext->initialized = true;
@@ -1428,25 +1559,10 @@ static void shutdownGPUContext(NDIInstanceData* data)
 
     NDI_LOG("Shutting down GPU acceleration...\n");
 
-#ifdef __APPLE__
-    // Shutdown Metal GPU acceleration
-    if (data->gpuContext->metalContext) {
-        metal_gpu_shutdown(data->gpuContext->metalContext);
-        data->gpuContext->metalContext = nullptr;
-    }
-#elif defined(_WIN32)
-    // Shutdown CUDA if it was initialized
-    if (data->gpuContext->cudaContext) {
-        cuda_gpu_shutdown(data->gpuContext->cudaContext);
-        data->gpuContext->cudaContext = nullptr;
-    }
-    
-    // Shutdown D3D11 if it was initialized
-    if (data->gpuContext->d3dContext) {
-        ((ID3D11DeviceContext*)data->gpuContext->d3dContext)->Release();
-    }
-    if (data->gpuContext->d3dDevice) {
-        ((ID3D11Device*)data->gpuContext->d3dDevice)->Release();
+#ifdef NDI_GPU_NATIVE
+    if (data->gpuContext->nativeContext) {
+        nativeGpuShutdown(data->gpuContext->nativeContext);
+        data->gpuContext->nativeContext = nullptr;
     }
 #endif
 
@@ -1471,11 +1587,11 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
 
 #ifdef __APPLE__
     // Use Metal GPU acceleration for RGBA to UYVY conversion
-    if (data->gpuContext->metalContext) {
+    if (data->gpuContext->nativeContext) {
         NDI_LOG("🚀 Attempting Metal GPU acceleration...\n");
-        
+
         bool success = metal_gpu_convert_rgba_to_uyvy(
-            data->gpuContext->metalContext,
+            data->gpuContext->nativeContext,
             static_cast<const float*>(rgbaData),
             data->uyvyFrameBuffer.data(),
             width,
@@ -1491,50 +1607,15 @@ static void convertRGBAToUYVY_GPU(NDIInstanceData* data, void* rgbaData, int wid
     } else {
         NDI_LOG("⚠️ Metal context not available, falling back to CPU\n");
     }
-    
+
     // Fallback to CPU if Metal fails
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    
-#elif defined(_WIN32)
-    // Try CUDA first if available
-    if (data->gpuContext->cudaContext) {
-        NDI_LOG("🚀 Attempting CUDA GPU acceleration...");
-        
-        bool success = cuda_gpu_convert_rgba_to_uyvy(
-            data->gpuContext->cudaContext,
-            static_cast<const float*>(rgbaData),
-            data->uyvyFrameBuffer.data(),
-            width,
-            height
-        );
-        
-        if (success) {
-            NDI_LOG("✅ CUDA GPU acceleration SUCCESS!");
-            return;
-        } else {
-            NDI_LOG("❌ CUDA GPU conversion failed, falling back to CPU");
-        }
-    }
-    
-    // D3D11 implementation for RGBA to UYVY conversion (fallback)
-    if (data->gpuContext->d3dDevice && data->gpuContext->d3dContext) {
-        ID3D11Device* device = (ID3D11Device*)data->gpuContext->d3dDevice;
-        ID3D11DeviceContext* context = (ID3D11DeviceContext*)data->gpuContext->d3dContext;
-        
-        // Create buffers and execute compute shader
-        // ... D3D11 compute shader execution ...
-        NDI_LOG("D3D11 GPU conversion available, using CPU fallback for now");
-    }
-    
-    // Fallback to CPU if both GPU methods failed
-    convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    
+
 #else
-    // OpenGL implementation for Linux
-    // ... OpenGL compute shader execution ...
-    NDI_LOG("OpenGL GPU conversion available, using CPU fallback for now\n");
+    // CPU-buffer renders convert on the CPU everywhere but macOS; the
+    // Windows GPU-native path (CUDA, ticket #22) runs through the render
+    // action's device-buffer fast path instead, never through here.
     convertRGBAToUYVY_CPU(data, rgbaData, width, height);
-    return;
 #endif
 }
 
@@ -1710,9 +1791,9 @@ static void shutdownNDI(NDIInstanceData* data)
 
     NDI_LOG("Shutting down NDI SDK...");
 
-#ifdef __APPLE__
+#ifdef NDI_GPU_NATIVE
     // Drain the async pump FIRST: its worker submits into the hub and its
-    // Metal callbacks write staging slots — both must be quiet before the
+    // GPU callbacks write staging slots — both must be quiet before the
     // GPU context and the hub go away.
     pumpShutdown(data);
 #endif
@@ -1791,7 +1872,7 @@ static void createHDRMetadata(NDIInstanceData* data)
 // Submit the already-packed UYVY frame in data->uyvyFrameBuffer to the hub
 // (which streams it as mono, or pairs and packs it in stereo). Used by both
 // conversion paths: CPU/upload-convert (sendSDRFrame) and the GPU-native
-// fused downscale+convert (renderMetalFrame).
+// fused downscale+convert (renderGPUFrame).
 // Shared tail of the legacy blocking paths — these run on the render thread,
 // so data->render* is current and the stage timings land in the mtimer fields.
 static void hubSubmitFromRenderThread(NDIInstanceData* data, const HubSubmit& s)
@@ -1858,13 +1939,13 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
     // Try GPU acceleration first for HDR conversion
     bool gpuSuccess = false;
 #ifdef __APPLE__
-    if (data->gpuAcceleration && data->gpuContext && data->gpuContext->initialized && data->gpuContext->metalContext) {
+    if (data->gpuAcceleration && data->gpuContext && data->gpuContext->initialized && data->gpuContext->nativeContext) {
         // For HDR, we need to convert to 16-bit limited range
         // The scale factor should be for 16-bit limited range (not full range)
         float scale = 65472.0f; // 16-bit limited range: (235-16) * 256 + (240-16) * 256 for chroma
         
         gpuSuccess = metal_gpu_convert_rgba_to_hdr(
-            data->gpuContext->metalContext,
+            data->gpuContext->nativeContext,
             srcData,
             dstData,
             width,
@@ -1876,26 +1957,6 @@ static void sendHDRFrame(NDIInstanceData* data, void* imageData, int width, int 
             NDI_LOG("Metal GPU HDR conversion completed");
         } else {
             NDI_LOG("Metal GPU HDR conversion failed, falling back to CPU");
-        }
-    }
-#elif defined(_WIN32)
-    if (data->gpuAcceleration && data->gpuContext && data->gpuContext->initialized && data->gpuContext->cudaContext) {
-        // For HDR, we need to convert to 16-bit limited range
-        float scale = 65472.0f; // 16-bit limited range
-        
-        gpuSuccess = cuda_gpu_convert_rgba_to_hdr(
-            data->gpuContext->cudaContext,
-            srcData,
-            dstData,
-            width,
-            height,
-            scale
-        );
-        
-        if (gpuSuccess) {
-            NDI_LOG("CUDA GPU HDR conversion completed");
-        } else {
-            NDI_LOG("CUDA GPU HDR conversion failed, falling back to CPU");
         }
     }
 #endif
@@ -2142,23 +2203,25 @@ static void sendCPUFrameToNDI(NDIInstanceData* data, void* imageData, int width,
     sendNDIFrame(data, data->downscaleBuffer.data(), outWidth, outHeight);
 }
 
-#ifdef __APPLE__
-// Metal render action (issue #5): the host handed src/dst as id<MTLBuffer>
-// device buffers. Passthrough-copy src→dst on the host's queue for the effect
-// output, then feed NDI through the fused GPU downscale+convert kernels — the
-// downscale happens before any readback, so only the small converted frame
-// crosses to the CPU. Any GPU-convert gap (legacy RGBA format, GPU
-// Acceleration off, kernel failure) falls back to a full-frame readback plus
-// the CPU path, so the stream survives every combination. In Equirect mode
-// (issue #7) the fused kernel is the STMap warp variant and the output takes
-// the MAP's dimensions; the readback fallback then warps on the CPU instead,
-// so the stream stays geometrically correct on every path.
-static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* dstBuffer,
-                                  int width, int height, int srcRowBytes, int dstRowBytes,
-                                  void* metalQueue)
+#ifdef NDI_GPU_NATIVE
+// GPU render action (issue #5; CUDA on Windows via ticket #22): the host
+// handed src/dst as device buffers (id<MTLBuffer> on macOS, CUDA device
+// pointers on Windows). Passthrough-copy src→dst on the host's queue/stream
+// for the effect output, then feed NDI through the fused GPU
+// downscale+convert kernels — the downscale happens before any readback, so
+// only the small converted frame crosses to the CPU. Any GPU-convert gap
+// (legacy RGBA format, GPU Acceleration off, kernel failure) falls back to a
+// full-frame readback plus the CPU path, so the stream survives every
+// combination. In Equirect mode (issue #7) the fused kernel is the STMap warp
+// variant and the output takes the MAP's dimensions; the readback fallback
+// then warps on the CPU instead, so the stream stays geometrically correct on
+// every path.
+static OfxStatus renderGPUFrame(NDIInstanceData* data, void* srcBuffer, void* dstBuffer,
+                                int width, int height, int srcRowBytes, int dstRowBytes,
+                                void* gpuQueue)
 {
     if (!srcBuffer || !dstBuffer) {
-        NDI_LOG("Metal render: missing device buffer, skipping frame");
+        NDI_LOG("GPU render: missing device buffer, skipping frame");
         return kOfxStatOK; // matches the CPU path's leniency for absent images
     }
 
@@ -2166,18 +2229,18 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
     if (data->gpuAcceleration && !data->gpuContext) {
         initializeGPUContext(data);
     }
-    MetalGPUContextRef metalContext =
-        (data->gpuContext && data->gpuContext->initialized) ? data->gpuContext->metalContext : nullptr;
+    NativeGPUContextRef nativeContext =
+        (data->gpuContext && data->gpuContext->initialized) ? data->gpuContext->nativeContext : nullptr;
 
     // Host output first: the effect is a passthrough. No wait — the host
     // orders its downstream reads on the same queue (cf. the Resolve
     // GainPlugin sample).
     const size_t frameBytes = static_cast<size_t>(height) * static_cast<size_t>(dstRowBytes);
     const auto blitT0 = std::chrono::steady_clock::now();
-    const bool blitOk = metal_gpu_copy_buffer(metalContext, metalQueue, srcBuffer, dstBuffer, frameBytes, false);
+    const bool blitOk = nativeGpuCopyBuffer(nativeContext, gpuQueue, srcBuffer, dstBuffer, frameBytes, false);
     data->timerBlitMs = msSince(blitT0);
     if (!blitOk) {
-        NDI_LOG("Metal render: passthrough copy failed");
+        NDI_LOG("GPU render: passthrough copy failed");
         return kOfxStatFailed;
     }
 
@@ -2197,10 +2260,10 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
     const int rowFloats = srcRowBytes / static_cast<int>(sizeof(float));
 
     bool handledByFastPath = false;
-    if (data->gpuAcceleration && metalContext &&
+    if (data->gpuAcceleration && nativeContext &&
         (data->hdrEnabled || data->optimalFormat)) {
-        // Non-blocking fast path (v1.6.0): ENCODE the fused kernel and return.
-        // No waitUntilCompleted here — that wait (plus the CPU-side NDI work
+        // Non-blocking fast path (v1.6.0): ENQUEUE the fused kernel and
+        // return. No GPU wait here — that wait (plus the CPU-side NDI work
         // that followed it) was ~90ms of render-thread blocking per eye and
         // the whole 8K playback collapse (#5). The pump worker pairs and
         // sends when the GPU finishes. The submit validates geometry itself:
@@ -2212,7 +2275,7 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
         const bool wantP216 = data->hdrEnabled;
         AsyncSubmitCtx* ctx = new AsyncSubmitCtx();
         ctx->pump = pump;
-        ctx->item.metalContext = metalContext;
+        ctx->item.nativeContext = nativeContext;
         ctx->item.submit.format = wantP216 ? ndi_stereo::WireFormat::P216
                                            : ndi_stereo::WireFormat::UYVY8;
         ctx->item.submit.width = outWidth;
@@ -2228,34 +2291,34 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
         }
         ++pump->pendingSubmits;
         const auto convT0 = std::chrono::steady_clock::now();
-        metal_submit_status st = METAL_SUBMIT_INVALID;
+        NativeSubmitStatus st = kNativeSubmitInvalid;
         if (stmap) {
             // Warp path: a failed map upload never reaches the submit — it
             // stays INVALID and falls through to the readback + CPU warp, so
             // the stream keeps its corrected geometry (slowly) either way.
-            void* mapBuffer = stmapMetalBufferForQueue(data->renderStmap, metalContext, metalQueue);
+            void* mapBuffer = stmapNativeBufferForQueue(data->renderStmap, nativeContext, gpuQueue);
             if (mapBuffer) {
-                st = metal_gpu_warp_submit(metalContext, metalQueue, srcBuffer,
-                                           width, height, rowFloats,
-                                           mapBuffer, stmap->map.width, stmap->map.height,
-                                           divisor, outWidth, outHeight, wantP216,
-                                           pumpOnConvertDone, ctx);
+                st = nativeGpuWarpSubmit(nativeContext, gpuQueue, srcBuffer,
+                                         width, height, rowFloats,
+                                         mapBuffer, stmap->map.width, stmap->map.height,
+                                         divisor, outWidth, outHeight, wantP216,
+                                         pumpOnConvertDone, ctx);
             }
         } else {
-            st = metal_gpu_downscale_submit(metalContext, metalQueue, srcBuffer,
-                                            width, height, rowFloats, divisor,
-                                            outWidth, outHeight, wantP216,
-                                            pumpOnConvertDone, ctx);
+            st = nativeGpuDownscaleSubmit(nativeContext, gpuQueue, srcBuffer,
+                                          width, height, rowFloats, divisor,
+                                          outWidth, outHeight, wantP216,
+                                          pumpOnConvertDone, ctx);
         }
         data->timerConvMs = msSince(convT0);
-        if (st == METAL_SUBMIT_OK) {
+        if (st == kNativeSubmitOK) {
             handledByFastPath = true;
-            NDI_LOG("GPU-native async: %dx%d Metal frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216, warp %d)",
+            NDI_LOG("GPU-native async: %dx%d device frame -> %dx%d %d enqueued (divisor %d, fmt 0=UYVY 1=P216, warp %d)",
                     width, height, outWidth, outHeight, wantP216 ? 1 : 0, divisor, stmap ? 1 : 0);
         } else {
             --pump->pendingSubmits;
             delete ctx;
-            if (st == METAL_SUBMIT_BUSY) {
+            if (st == kNativeSubmitBusy) {
                 handledByFastPath = true; // deliberate drop — backpressure, not failure
                 const uint64_t drops = ++pump->drops;
                 const auto now = std::chrono::steady_clock::now();
@@ -2265,7 +2328,7 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
                             static_cast<unsigned long long>(drops));
                 }
             }
-            // METAL_SUBMIT_INVALID falls through to the readback path below.
+            // kNativeSubmitInvalid falls through to the readback path below.
         }
     }
 
@@ -2275,21 +2338,21 @@ static OfxStatus renderMetalFrame(NDIInstanceData* data, void* srcBuffer, void* 
             data->readbackBuffer.resize(srcBytes / sizeof(float));
         }
         const auto convT0 = std::chrono::steady_clock::now();
-        const bool readOk = metal_gpu_read_buffer(metalContext, metalQueue, srcBuffer,
-                                                  data->readbackBuffer.data(), srcBytes);
+        const bool readOk = nativeGpuReadBuffer(nativeContext, gpuQueue, srcBuffer,
+                                                data->readbackBuffer.data(), srcBytes);
         data->timerConvMs = msSince(convT0);
         if (readOk) {
-            NDI_LOG("Metal frame full readback -> CPU fallback path (%dx%d, gpu=%d)",
+            NDI_LOG("Device frame full readback -> CPU fallback path (%dx%d, gpu=%d)",
                     width, height, data->gpuAcceleration ? 1 : 0);
             sendCPUFrameToNDI(data, data->readbackBuffer.data(), width, height, srcRowBytes);
         } else {
-            NDI_LOG("Metal frame readback failed — NDI frame skipped");
+            NDI_LOG("Device frame readback failed — NDI frame skipped");
         }
     }
 
     return kOfxStatOK;
 }
-#endif // __APPLE__
+#endif // NDI_GPU_NATIVE
 
 // Plugin functions
 static OfxStatus onLoad(void)
@@ -2299,7 +2362,7 @@ static OfxStatus onLoad(void)
 
 static OfxStatus onUnLoad(void)
 {
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
     ndi_timelinewatch::shutdown();
 #endif
     return kOfxStatOK;
@@ -2338,7 +2401,7 @@ static void instanceRegistryRemove(NDIInstanceData* data)
         gInstanceRegistry.end());
 }
 
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
 // Runs on the watcher thread: re-source this instance's lens maps for the
 // clip now under the playhead. Sticky on anything unusable — a gap between
 // clips, a non-BRAW clip, a BRAW without calibration — the previous camera's
@@ -2416,7 +2479,7 @@ static void timelineClipChanged(const std::string& path)
         applyAutoLensClip(data, path);
     }
 }
-#endif // __APPLE__
+#endif // NDI_TIMELINE_WATCH
 
 // Bring the instance's loaded STMaps in line with the current parameter
 // values (issue #7). Called from createInstance and instanceChanged, never
@@ -2457,7 +2520,7 @@ static void refreshSTMaps(NDIInstanceData* data)
     }
     if (wantMetadata) {
         metadataClipPath = data->brawClipPathWanted;  // Manual Path source
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
         if (autoSource) {
             // Timeline (Auto): follow the playhead clip. The watcher keeps
             // pushing changes via timelineClipChanged; here we just take its
@@ -2511,7 +2574,7 @@ static void refreshSTMaps(NDIInstanceData* data)
                 status = kProjActive;
             } else {
                 status = kProjError;
-#ifdef __APPLE__
+#ifdef NDI_TIMELINE_WATCH
                 std::string detail;
                 ndi_timelinewatch::healthy(&detail);
                 NDI_LOG_TEXT(("Equirect (Camera Metadata) auto: no usable clip under the "
@@ -2526,18 +2589,18 @@ static void refreshSTMaps(NDIInstanceData* data)
         }
     }
 
-#ifdef __APPLE__
+#ifdef NDI_GPU_NATIVE
     // Pre-warm the GPU upload here, on the host's main thread, so the first
     // warped render doesn't pay it. The context's default device matches the
-    // host queue's device except on multi-GPU Macs, where the render path
+    // host queue's device except on multi-GPU machines, where the render path
     // uploads once itself (also outside the entry mutex). No GPU context yet
     // (NDI disabled) is fine — the render path covers it.
     if (status == kProjActive && !stickyKeep && left && left->valid &&
         data->gpuContext && data->gpuContext->initialized &&
-        data->gpuContext->metalContext) {
-        stmapMetalBufferForQueue(left, data->gpuContext->metalContext, nullptr);
+        data->gpuContext->nativeContext) {
+        stmapNativeBufferForQueue(left, data->gpuContext->nativeContext, nullptr);
         if (right) {
-            stmapMetalBufferForQueue(right, data->gpuContext->metalContext, nullptr);
+            stmapNativeBufferForQueue(right, data->gpuContext->nativeContext, nullptr);
         }
     }
 #endif
@@ -2580,7 +2643,7 @@ static void updateParamVisibility(NDIInstanceData* data)
     setParamSecret(data->stmapRightParam, packed);
     const bool autoClip = (data->brawSourceChoice == 0);
     setParamSecret(data->brawClipParam, autoClip);
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     setParamSecret(data->stmapPackedBrowseParam, !packed);
     setParamSecret(data->stmapLeftBrowseParam, packed);
     setParamSecret(data->stmapRightBrowseParam, packed);
@@ -2717,7 +2780,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     myData->timersEnabled = false;
     myData->timerBlitMs = myData->timerConvMs = 0.0;
     myData->timerFlushMs = myData->timerPackMs = myData->timerSendMs = 0.0;
-#ifdef __APPLE__
+#ifdef NDI_GPU_NATIVE
     myData->pump = nullptr;
 #endif
     if (inArgs) {
@@ -2750,7 +2813,7 @@ static OfxStatus createInstance(OfxImageEffectHandle effect, OfxPropertySetHandl
     gParamHost->paramGetHandle(paramSet, kParamSTMapRight, &myData->stmapRightParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWSource, &myData->brawSourceParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamBRAWClip, &myData->brawClipParam, 0);
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     gParamHost->paramGetHandle(paramSet, kParamSTMapPackedBrowse, &myData->stmapPackedBrowseParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapLeftBrowse, &myData->stmapLeftBrowseParam, 0);
     gParamHost->paramGetHandle(paramSet, kParamSTMapRightBrowse, &myData->stmapRightBrowseParam, 0);
@@ -2818,8 +2881,8 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
         
         NDI_LOG("Parameter changed: %s", paramName);
 
-#ifdef __APPLE__
-        // Browse buttons: pop the native open panel and write the picked path
+#ifdef NDI_HAS_BROWSE_DIALOGS
+        // Browse buttons: pop the native open dialog and write the picked path
         // into the matching STMap field, then fall through — the reads below
         // pick the new value up and refreshSTMaps loads the map. Cancel (or
         // any dialog failure) changes nothing.
@@ -2833,7 +2896,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
             char* currentPath = nullptr;
             gParamHost->paramGetValue(pathParam, &currentPath);
             char picked[4096];
-            if (mac_open_file_dialog(isPacked ? "Choose the packed side-by-side STMap EXR"
+            if (native_open_file_dialog(isPacked ? "Choose the packed side-by-side STMap EXR"
                                     : isLeft  ? "Choose the left-eye STMap EXR"
                                               : "Choose the right-eye STMap EXR",
                                      "exr", currentPath, picked, sizeof(picked))) {
@@ -2845,7 +2908,7 @@ static OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHand
             char* currentPath = nullptr;
             gParamHost->paramGetValue(myData->brawClipParam, &currentPath);
             char picked[4096];
-            if (mac_open_file_dialog("Choose any BRAW clip shot on the URSA Cine Immersive",
+            if (native_open_file_dialog("Choose any BRAW clip shot on the URSA Cine Immersive",
                                      "braw", currentPath, picked, sizeof(picked))) {
                 gParamHost->paramSetValue(myData->brawClipParam, picked);
                 NDI_LOG_TEXT((std::string("Camera clip browse picked: '") + picked + "'").c_str());
@@ -3049,17 +3112,30 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
     int width = dstRect.x2 - dstRect.x1;
     int height = dstRect.y2 - dstRect.y1;
 
+#ifdef NDI_GPU_NATIVE
+    // GPU render: describe() declared Metal/CUDA render support, so when the
+    // host sets the matching Enabled property the image data pointers are
+    // device buffers, not CPU memory. The queue/stream pointer is the host's
+    // own — work enqueued there is ordered after the host's renders.
+    int gpuEnabled = 0;
+    void* gpuQueue = nullptr;
 #ifdef __APPLE__
-    // Metal render: describe() declared kOfxImageEffectPropMetalRenderSupported,
-    // so when the host sets MetalEnabled the image data pointers are
-    // id<MTLBuffer> device buffers, not CPU memory.
-    int metalEnabled = 0;
-    gPropHost->propGetInt(inArgs, kOfxImageEffectPropMetalEnabled, 0, &metalEnabled);
-    if (metalEnabled) {
-        void* metalQueue = nullptr;
-        gPropHost->propGetPointer(inArgs, kOfxImageEffectPropMetalCommandQueue, 0, &metalQueue);
-        OfxStatus metalStatus = renderMetalFrame(myData, srcData, dstData, width, height,
-                                                 srcRowBytes, dstRowBytes, metalQueue);
+    gPropHost->propGetInt(inArgs, kOfxImageEffectPropMetalEnabled, 0, &gpuEnabled);
+    if (gpuEnabled) {
+        gPropHost->propGetPointer(inArgs, kOfxImageEffectPropMetalCommandQueue, 0, &gpuQueue);
+    }
+#else
+    gPropHost->propGetInt(inArgs, kOfxImageEffectPropCudaEnabled, 0, &gpuEnabled);
+    if (gpuEnabled) {
+        // NULL when the host predates CudaStreamSupported: the module then
+        // runs on its own stream (the host synchronizes around render in
+        // that mode).
+        gPropHost->propGetPointer(inArgs, kOfxImageEffectPropCudaStream, 0, &gpuQueue);
+    }
+#endif
+    if (gpuEnabled) {
+        OfxStatus gpuStatus = renderGPUFrame(myData, srcData, dstData, width, height,
+                                             srcRowBytes, dstRowBytes, gpuQueue);
         gEffectHost->clipReleaseImage(sourceImg);
         gEffectHost->clipReleaseImage(outputImg);
         flushStatusParam(myData);
@@ -3071,8 +3147,8 @@ static OfxStatus render(OfxImageEffectHandle instance, OfxPropertySetHandle inAr
                     msSince(renderT0), imagesMs, myData->timerBlitMs, myData->timerConvMs,
                     myData->timerFlushMs, myData->timerPackMs, myData->timerSendMs);
         }
-        NDI_LOG("Render completed (Metal)");
-        return metalStatus;
+        NDI_LOG("Render completed (" NDI_GPU_BACKEND_NAME ")");
+        return gpuStatus;
     }
 #endif
 
@@ -3122,6 +3198,14 @@ static OfxStatus describe(OfxImageEffectHandle effect)
     // downscale+convert runs before any readback. CPU rendering stays
     // supported — the host chooses per render via kOfxImageEffectPropMetalEnabled.
     gPropHost->propSetString(props, kOfxImageEffectPropMetalRenderSupported, 0, "true");
+#elif defined(NDI_HAS_CUDA)
+    // CUDA render + CUDA-stream support, Windows only (ticket #22, spec
+    // decision 4): accept frames as CUDA device buffers, with the host's
+    // stream handed per render via kOfxImageEffectPropCudaStream. CPU
+    // rendering stays supported — non-NVIDIA machines keep receiving CPU
+    // buffers and the existing CPU path.
+    gPropHost->propSetString(props, kOfxImageEffectPropCudaRenderSupported, 0, "true");
+    gPropHost->propSetString(props, kOfxImageEffectPropCudaStreamSupported, 0, "true");
 #endif
 
     return kOfxStatOK;
@@ -3307,9 +3391,9 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapPackedProps, kOfxParamPropAnimates, 0, 0);
     gPropHost->propSetString(stmapPackedProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the packed STMap browse button - in Projection group (native
-    // panel; Resolve draws no browse control on filePath string params)
+    // dialog; Resolve draws no browse control on filePath string params)
     OfxPropertySetHandle stmapPackedBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapPackedBrowse, &stmapPackedBrowseProps);
     gPropHost->propSetString(stmapPackedBrowseProps, kOfxPropLabel, 0, kParamSTMapPackedBrowseLabel);
@@ -3330,7 +3414,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapLeftProps, kOfxParamPropSecret, 0, 1); // hidden in packed layout (the default)
     gPropHost->propSetString(stmapLeftProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the left-eye browse button - in Projection group
     OfxPropertySetHandle stmapLeftBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapLeftBrowse, &stmapLeftBrowseProps);
@@ -3353,7 +3437,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(stmapRightProps, kOfxParamPropSecret, 0, 1); // hidden in packed layout (the default)
     gPropHost->propSetString(stmapRightProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the right-eye browse button - in Projection group
     OfxPropertySetHandle stmapRightBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamSTMapRightBrowse, &stmapRightBrowseProps);
@@ -3394,7 +3478,7 @@ static OfxStatus describeInContext(OfxImageEffectHandle effect, OfxPropertySetHa
     gPropHost->propSetInt(brawClipProps, kOfxParamPropSecret, 0, 1);
     gPropHost->propSetString(brawClipProps, kOfxParamPropParent, 0, "projectionGroup");
 
-#ifdef __APPLE__
+#ifdef NDI_HAS_BROWSE_DIALOGS
     // Define the camera clip browse button - in Projection group
     OfxPropertySetHandle brawClipBrowseProps = NULL;
     gParamHost->paramDefine(paramSet, kOfxParamTypePushButton, kParamBRAWClipBrowse, &brawClipBrowseProps);
