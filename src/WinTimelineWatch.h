@@ -287,6 +287,24 @@ inline PythonDiscovery discoverPython()
     return {};
 }
 
+#endif  // _WIN32
+
+// ---- fuscript command line --------------------------------------------------
+// The primary watcher interpreter is Resolve's OWN bundled fuscript.exe
+// (beside Resolve.exe) running the Lua helper — nothing to install, which is
+// what makes Timeline (Auto) one-click (ticket #23). Python cannot be
+// bundled instead: fusionscript.dll binds only a PEP 514 registry-REGISTERED
+// interpreter, never the process hosting it (LEARNINGS 2026-09-01). -q
+// suppresses the banner fuscript writes to stdout, which would otherwise be
+// read as clip paths by the line protocol (verified on Resolve 20).
+inline std::wstring fuscriptCommandLine(const std::wstring& fuscriptExe,
+                                        const std::wstring& luaScript)
+{
+    return quoteArg(fuscriptExe) + L" -q -l lua " + quoteArg(luaScript);
+}
+
+#ifdef _WIN32
+
 // ---- Process spawn ----------------------------------------------------------
 
 struct HelperProcess {

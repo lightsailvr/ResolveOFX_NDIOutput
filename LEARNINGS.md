@@ -380,6 +380,13 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0 — new unit tests in `tests/test_timeline_watch.cpp` (alias flavors, case-insensitivity, and that the real Store package dir under Program Files\WindowsApps does NOT match), 12/12 suite green.
 **Rule:** an executable existing on PATH is not evidence of an interpreter — both Windows and macOS ship stubs at the canonical python locations, so validate provenance (registry/xcode-select) or probe it once, and always log a dead child's exit code.
 
+### 2026-09-01 — fusionscript.dll only binds a REGISTRY-registered Python — an embedded/bundled interpreter can never work (tickets #23/#25)
+**Symptom:** planning one-click Timeline (Auto) by bundling the python.org embeddable runtime: the helper spawned, imported the module machinery, then `PyInit_fusionscript` returned NULL ("initialization of fusionscript failed without raising an exception") — under the embeddable 3.12.10, the full-layout nuget 3.12.10, and even an installed python.org 3.11, while the Microsoft Store 3.12 on the same machine worked.
+**Root cause:** established empirically (probes in-session, incl. a `RegOverridePredefKey` empty-registry simulation): fusionscript.dll consults the PEP 514 registry (`Software\Python\PythonCore`) and loads THAT python's DLL — it never binds the interpreter hosting it. With an empty registry its DllMain fails outright. On this workstation the Store 3.12 registration additionally poisons every other host: its DLL lives under the ACL-locked `WindowsApps` package dir, unloadable from any other process (LoadLibrary → error 5), so even a real python.org 3.11 host fails while the Store python (already holding its own DLL mapped) succeeds.
+**Fix:** stop requiring Python at all — the watcher's primary helper is now `ndi_timeline_watch.lua` under Resolve's own bundled `fuscript.exe -q -l lua` (`-q` matters: the banner goes to stdout, straight into the line protocol). The Python helper stays as the fuscript-missing fallback. Same idea ports to macOS (issue #34).
+**Validated by:** Tier 0.5 — fuscript ran the Lua helper standalone on the workstation: correct `!` status line with Resolve closed, empty-line heartbeats, `-q` verified banner-free; 12/12 unit suite incl. the `fuscriptCommandLine` contract. The live-Resolve half re-runs in the next Tier 1–2 pass.
+**Rule:** anything that loads Resolve's `fusionscript.dll` needs a PEP 514-registered, ACL-loadable Python — never an embedded one — and when Resolve's own `fuscript` can do the job, prefer it and depend on nothing.
+
 ---
 
 ## Template for new entries

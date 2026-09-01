@@ -5,6 +5,17 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.1] - 2026-09-01
+
+Windows-port testing build (branch `windows-port`; not yet a public release).
+
+### Added
+- **Windows installer** (ticket #23): Inno Setup installer to `C:\Program Files\Common Files\OFX\Plugins`, Add-or-Remove-Programs entry, `/VERYSILENT` fleet deployment, NDI attribution readme and third-party licenses beside the binaries. Ships unsigned with the SmartScreen "More info → Run anyway" flow documented. Release flow attaches installer + bare-bundle zip + `SHA256SUMS-Windows.txt` next to the macOS artifacts.
+- **Timeline (Auto) is one-click on Windows**: the camera-clip watcher now runs its helper under Resolve's own bundled script interpreter (`fuscript.exe`, Lua) — no Python install required. The Python helper remains as an automatic fallback.
+
+### Fixed
+- **Windows watcher no longer loops silently on machines without Python**: discovery rejects the Microsoft Store's `python.exe` App Execution Alias stub, and the helper-exit log now carries the child's exit code.
+
 ## [1.14.0] - 2026-08-30
 
 ### Changed

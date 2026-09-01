@@ -291,7 +291,10 @@ install(TARGETS NDIOutput RUNTIME DESTINATION "${NDI_BUNDLE_BIN_DIR}")
 # The Timeline (Auto) watcher helper rides in Contents/Resources, same spot
 # the macOS Makefile stages it (ticket #25; the watcher derives this path
 # from its own module location — see WinTimelineWatch.h bundleResourcePath).
-install(FILES src/ndi_timeline_watch.py
+# Lua first (runs under Resolve's own fuscript.exe — nothing to install);
+# the Python helper stays as the documented fallback for hosts without
+# fuscript beside them.
+install(FILES src/ndi_timeline_watch.lua src/ndi_timeline_watch.py
         DESTINATION "NDIOutput.ofx.bundle/Contents/Resources")
 if(NOT NDI_USING_STUB)
     install(FILES

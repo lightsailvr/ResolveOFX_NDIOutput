@@ -103,31 +103,57 @@ bool spawnHelperLocked()
 
     const std::wstring modulePath =
         modulePathContaining(reinterpret_cast<const void*>(&spawnHelperLocked));
-    const std::wstring script = bundleResourcePath(modulePath, L"ndi_timeline_watch.py");
-    if (script.empty() || GetFileAttributesW(script.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        setHealthLocked(false, "helper script missing from the plugin bundle's Resources");
-        return false;
-    }
 
-    const PythonDiscovery python = discoverPython();
-    if (python.exePath.empty()) {
-        setHealthLocked(false, "no 64-bit Python 3 found (PEP 514 registry or PATH) — "
-                               "install Python 3 x64 from python.org or set a "
-                               "Manual Path clip");
-        return false;
-    }
-
-    // fusionscript.dll lives beside Resolve.exe — and this code runs inside
-    // Resolve's process, so the host executable's own path finds it even in
-    // a non-default install directory. Passed to the helper as argv[1]; an
-    // empty/missing path just leaves the script on its documented default.
+    // Primary: Resolve's own bundled script interpreter (fuscript.exe, beside
+    // Resolve.exe — this code runs inside Resolve's process, so the host
+    // executable's path finds it in any install directory) running the Lua
+    // helper. Nothing to install — the one-click path (ticket #23). Python
+    // cannot be bundled instead: fusionscript.dll only binds a PEP 514
+    // registry-registered interpreter, never its host process (LEARNINGS
+    // 2026-09-01).
     const std::wstring exePath = modulePathContaining(nullptr);
-    const std::wstring fusionscript =
+    const std::wstring fuscript =
         exePath.empty() ? std::wstring()
-                        : ndi_loader::siblingDllPath(exePath, L"fusionscript.dll");
+                        : ndi_loader::siblingDllPath(exePath, L"fuscript.exe");
+    const std::wstring luaScript =
+        bundleResourcePath(modulePath, L"ndi_timeline_watch.lua");
 
-    const std::wstring cmdLine = quoteArg(python.exePath) + L" " + quoteArg(script) +
-                                 L" " + quoteArg(fusionscript);
+    std::wstring cmdLine;
+    std::string chain;
+    if (!fuscript.empty() && !luaScript.empty() &&
+        GetFileAttributesW(fuscript.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(luaScript.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        cmdLine = fuscriptCommandLine(fuscript, luaScript);
+        chain = "fuscript [" + narrowForLog(fuscript) + "] " + narrowForLog(luaScript);
+    } else {
+        // Fallback: the Python helper — a host without fuscript beside it
+        // (standalone test binaries, an exotic Resolve packaging).
+        const std::wstring script =
+            bundleResourcePath(modulePath, L"ndi_timeline_watch.py");
+        if (script.empty() ||
+            GetFileAttributesW(script.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            setHealthLocked(false,
+                            "helper script missing from the plugin bundle's Resources");
+            return false;
+        }
+        const PythonDiscovery python = discoverPython();
+        if (python.exePath.empty()) {
+            setHealthLocked(false,
+                            "no fuscript.exe beside the host and no 64-bit Python 3 "
+                            "(PEP 514 registry or PATH) — install Python 3 x64 from "
+                            "python.org or set a Manual Path clip");
+            return false;
+        }
+        // fusionscript.dll lives beside Resolve.exe; passed as argv[1], an
+        // empty path leaves the script on its documented default.
+        const std::wstring fusionscript =
+            exePath.empty() ? std::wstring()
+                            : ndi_loader::siblingDllPath(exePath, L"fusionscript.dll");
+        cmdLine = quoteArg(python.exePath) + L" " + quoteArg(script) + L" " +
+                  quoteArg(fusionscript);
+        chain = "python [" + narrowForLog(python.exePath) + " via " + python.source +
+                "] " + narrowForLog(script);
+    }
 
     HelperProcess proc;
     std::string error;
@@ -138,8 +164,7 @@ bool spawnHelperLocked()
     gHelperProcess = proc.process;
     gHelperRead = proc.readPipe;
     setHealthLocked(false, "helper starting");  // healthy once the first line lands
-    watchLog("helper started (" + narrowForLog(python.exePath) + " [" + python.source +
-             "] " + narrowForLog(script) + ")");
+    watchLog("helper started (" + chain + ")");
     return true;
 }
 

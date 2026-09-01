@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (ticket #22), native Browse dialogs (ticket #24), and the Timeline (Auto) clip watcher (ticket #25) in the build; installer pending (see [status](#windows--status-cuda-pipeline-22-browse-dialogs-24-and-the-timeline-auto-watcher-25-in-the-build-installer-pending-23))
+- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (#22), native Browse dialogs (#24), Timeline (Auto) clip watcher (#25, one-click via Resolve's own fuscript since v1.14.1), Camera Metadata projection (#26), and the Inno Setup installer + release wiring (#23) in the build — see the Windows STATUS section below for what remains human-verified
 
 ---
 
@@ -220,9 +220,11 @@ from an **elevated** PowerShell with Resolve closed. It drives a real `/VERYSILE
 
 ### Timeline (Auto) camera-clip watcher (ticket #25)
 
-The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns the bundled `Contents/Resources/ndi_timeline_watch.py` as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. Requirements on Windows:
+The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v1.11.0): the plugin spawns a bundled helper as a hidden console process (`src/WinTimelineWatch.cpp`; spawn/discovery seams and their tests in `src/WinTimelineWatch.h`) and the helper polls the Resolve scripting API ~2×/s for the clip under the playhead. **Primary helper (v1.14.1+): `Contents/Resources/ndi_timeline_watch.lua`, run by Resolve's own bundled script interpreter (`fuscript.exe -q -l lua`, found beside `Resolve.exe`)** — nothing to install, which is what makes Timeline (Auto) one-click. The Python helper (`ndi_timeline_watch.py`) remains as the automatic fallback when fuscript is missing beside the host executable (standalone test processes, exotic packagings); the log names which chain spawned. Requirement on Windows:
 
 - **Resolve Studio with external scripting enabled** — Preferences → System → General → *External scripting using: Local*. Without it the helper connects to nothing and the log says `scriptapp('Resolve') returned nothing — is external scripting enabled?`.
+
+Python requirement — **fallback path only** (a machine where fuscript is unavailable):
 - **A 64-bit Python 3.** Discovery order (the plugin logs which one it picked): the **PEP 514 registry** — `Software\Python\PythonCore` under HKCU then HKLM, 64-bit view, skipping `-32`/`-arm64` tags, highest version wins — then a **PATH search** for `python.exe` as fallback. The PATH fallback **rejects the `%LOCALAPPDATA%\Microsoft\WindowsApps` App Execution Alias** — the stub Windows ships even with no Python installed, which spawns, dies, and would otherwise loop the helper silently (LEARNINGS 2026-09-01; a real Store Python registers under PEP 514 and is found by the registry sweep, so it is unaffected). The python.org x64 installer is the recommended install (it registers under PEP 514 whether or not "Add to PATH" was checked); the Microsoft Store Python also registers and is verified working on the dev workstation (3.12). Resolve's own scripting docs assume a python.org install, so prefer that on user machines. On a machine with no usable Python the log says so by name and the helper never spawns; when the helper does die, the log now carries its exit code.
 
 The helper finds Resolve's scripting environment without configuration: the scripting modules load from `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules`, and the plugin derives the `fusionscript.dll` path from the *running* `Resolve.exe` (the watcher spawns from inside Resolve's process) and hands it to the helper, so non-default install directories work.

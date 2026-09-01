@@ -165,8 +165,8 @@ static void ndiWinLog(const char* fmt, ...)
 #define kPluginIdentifier "LSVR.NDIOutput"
 #define kPluginVersionMajor 1
 #define kPluginVersionMinor 14
-#define kPluginVersionPatch 0
-#define kPluginVersionString "1.14.0"
+#define kPluginVersionPatch 1
+#define kPluginVersionString "1.14.1"
 
 // Parameter names
 #define kParamSourceName "sourceName"

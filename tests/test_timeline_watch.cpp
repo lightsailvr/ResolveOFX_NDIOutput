@@ -169,6 +169,32 @@ static void testIsWindowsAppsAliasPath()
     expectTrue(!isWindowsAppsAliasPath(L""), "empty path is not an alias");
 }
 
+static void testFuscriptCommandLine()
+{
+    using ndi_timelinewatch_win::fuscriptCommandLine;
+
+    // The exact flag contract matters: -q suppresses the banner fuscript
+    // writes to STDOUT, which the line protocol would otherwise read as clip
+    // paths; -l lua selects the interpreter for the helper (verified against
+    // Resolve 20's fuscript on the workstation, 2026-09-01).
+    expectTrue(fuscriptCommandLine(L"C:\\R\\fuscript.exe", L"C:\\B\\watch.lua") ==
+                   L"C:\\R\\fuscript.exe -q -l lua C:\\B\\watch.lua",
+               "plain paths pass through with -q -l lua between them");
+    // Both real paths contain spaces (Program Files, Common Files) - they
+    // must be quoted for CreateProcessW's command-line parsing.
+    expectTrue(fuscriptCommandLine(L"C:\\Program Files\\Blackmagic Design\\"
+                                   L"DaVinci Resolve\\fuscript.exe",
+                                   L"C:\\Program Files\\Common Files\\OFX\\Plugins\\"
+                                   L"NDIOutput.ofx.bundle\\Contents\\Resources\\"
+                                   L"ndi_timeline_watch.lua") ==
+                   L"\"C:\\Program Files\\Blackmagic Design\\DaVinci Resolve\\"
+                   L"fuscript.exe\" -q -l lua "
+                   L"\"C:\\Program Files\\Common Files\\OFX\\Plugins\\"
+                   L"NDIOutput.ofx.bundle\\Contents\\Resources\\"
+                   L"ndi_timeline_watch.lua\"",
+               "spaced paths are quoted");
+}
+
 #ifdef _WIN32
 static void testDiscoverPython()
 {
@@ -239,6 +265,7 @@ int main()
     testQuoteArg();
     testBundleResourcePath();
     testIsWindowsAppsAliasPath();
+    testFuscriptCommandLine();
 #ifdef _WIN32
     testDiscoverPython();
     testSpawnHelperProcess();

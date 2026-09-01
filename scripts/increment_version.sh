@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# In-place sed that works with both BSD sed (macOS) and GNU sed (Linux and
+# Git Bash on the Windows workstation): BSD needs `-i ''`, GNU needs bare -i.
+sedi() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$@"          # GNU
+    else
+        sedi "$@"       # BSD
+    fi
+}
+
+
 # Script to increment the patch version number
 # Usage: ./scripts/increment_version.sh
 
@@ -27,12 +38,12 @@ NEW_VERSION="$MAJOR.$MINOR.$PATCH"
 echo "$NEW_VERSION" > "$VERSION_FILE"
 
 # Update plugin source code
-sed -i '' "s/#define kPluginVersionPatch [0-9]*/#define kPluginVersionPatch $PATCH/" src/NDIOutputPlugin.cpp
-sed -i '' "s/#define kPluginVersionString \"[0-9]*\.[0-9]*\.[0-9]*\"/#define kPluginVersionString \"$NEW_VERSION\"/" src/NDIOutputPlugin.cpp
+sedi "s/#define kPluginVersionPatch [0-9]*/#define kPluginVersionPatch $PATCH/" src/NDIOutputPlugin.cpp
+sedi "s/#define kPluginVersionString \"[0-9]*\.[0-9]*\.[0-9]*\"/#define kPluginVersionString \"$NEW_VERSION\"/" src/NDIOutputPlugin.cpp
 
 # Update bundle Info.plist (a stale/higher version here makes the pkg
 # installer silently skip the bundle — see LEARNINGS 2026-08-30)
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $NEW_VERSION" -c "Set :CFBundleVersion $NEW_VERSION" Info.plist
+[ -x /usr/libexec/PlistBuddy ] && /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $NEW_VERSION" -c "Set :CFBundleVersion $NEW_VERSION" Info.plist
 
 echo "Version incremented to: $NEW_VERSION"
 echo "Updated files:"
