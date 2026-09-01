@@ -69,8 +69,9 @@ static void ndiWinLog(const char* fmt, ...);
 #include "StreamResolution.h"
 #include "TimelineClipWatcher.h"  // self-gates (defines NDI_TIMELINE_WATCH on macOS + Windows)
 
+#include "BRAWImmersiveReader.h"  // self-gates (macOS + Windows, ticket #26)
+
 #ifdef __APPLE__
-#include "BRAWImmersiveReader.h"
 #include "MacFileDialog.h"
 #include "MetalGPUAcceleration.h"
 #endif
@@ -605,7 +606,7 @@ static void brawAcquireLensPair(const std::string& path, int mapSize, bool apply
     left->fileMtime = right->fileMtime = mtime;
     left->fileSize = right->fileSize = size;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     std::string json, kind, calType, error;
     ndi_brawmap::LensCalibration cal;
     if (!ndi_brawreader::readImmersiveCalibration(path, &json, &kind, &calType, &error) ||
@@ -641,7 +642,7 @@ static void brawAcquireLensPair(const std::string& path, int mapSize, bool apply
 #else
     (void)mapSize;
     (void)applyMask;
-    left->error = right->error = "Camera-metadata projection is macOS-only for now";
+    left->error = right->error = "Camera-metadata projection is not available on this platform";
 #endif
 
     std::lock_guard<std::mutex> lock(gStmapCacheMutex);

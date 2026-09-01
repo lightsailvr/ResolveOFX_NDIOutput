@@ -120,7 +120,7 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), and the Timeline (Auto) watcher (#25) in the build; installer pending (#23)
+## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25), and Camera Metadata (BRAW) projection (#26) in the build; installer pending (#23)
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
@@ -128,12 +128,14 @@ The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and p
 
 **Still owed from issue #24 (Tier 1–2, human in Resolve):** the four Browse buttons appear next to their path fields, a picked file (including a non-ASCII path) lands in the field and the map/clip loads, and Cancel changes nothing — findings to LEARNINGS.md.
 
-**Still owed from issue #25 (Tier 1–2, human in Resolve):** with Camera Metadata + Timeline (Auto) selected and playback running, the DebugView log shows `TimelineWatch: playhead clip: '<path>'` lines following cuts across a multi-clip timeline; disabling external scripting (or renaming python) produces the documented soft-fail lines and Manual Path keeps working. (The end-to-end projection itself — clip path → lens maps → warped stream — additionally needs the BRAW reader port, ticket #26; until then Auto mode on Windows reports and logs the followed clip but map generation states "Camera-metadata projection is macOS-only for now".) The helper's scripting chain (module import from `%PROGRAMDATA%`, `fusionscript.dll` hand-off, playhead query against live Resolve) was verified standalone on the workstation 2026-08-31.
+**Still owed from issue #25 (Tier 1–2, human in Resolve):** with Camera Metadata + Timeline (Auto) selected and playback running, the DebugView log shows `TimelineWatch: playhead clip: '<path>'` lines following cuts across a multi-clip timeline; disabling external scripting (or renaming python) produces the documented soft-fail lines and Manual Path keeps working. The helper's scripting chain (module import from `%PROGRAMDATA%`, `fusionscript.dll` hand-off, playhead query against live Resolve) was verified standalone on the workstation 2026-08-31.
+
+**Still owed from issue #26 (Tier 1–2, human in Resolve):** an immersive timeline with an URSA Cine Immersive clip, Projection = Equirect (Camera Metadata), streams the warped equirect to Studio Monitor / a Quest 180 player with both eyes correct (Manual Path and Timeline (Auto) both), and an A/B against the same clip on macOS matches. Tier 0.5 already passed on the workstation 2026-08-31: `test_braw_reader` against the real sample clip read the calibration through Resolve's own `BlackmagicRawAPI.dll` chain and generated maps, and the extracted calibration JSON is semantically identical to the macOS-extracted fixture — so projection output matches macOS by construction (both platforms share the goldens-tested generator in `src/BRAWLensMap.h`).
 
 ### Prerequisites
 
 - **Visual Studio 2022** with the "Desktop development with C++" workload (MSVC v143 + Windows SDK)
-- **CMake** ≥ 3.21 and **vcpkg** (supplies zlib via [vcpkg.json](vcpkg.json))
+- **CMake** ≥ 3.22 and **vcpkg** (supplies zlib via [vcpkg.json](vcpkg.json))
 - **Windows NDI 6 Advanced SDK** installed at `C:\Program Files\NDI\NDI 6 Advanced SDK` (or pass `-DNDI_SDK_PATH=...`). HDR needs Advanced; the download is access-gated, request early. Without it the build automatically links a **stub import library** built from [third_party/ndi/](third_party/ndi/) — good for compile-proof only; a streaming binary needs the real SDK.
 - **CUDA Toolkit 12.9** (pinned; spec decision 8) — compiles the GPU-native pipeline (`src/CudaGPUAcceleration.cu`; nvcc requires MSVC as host compiler — that constraint killed the old MinGW script). Nothing can be cross-compiled from macOS. `-DNDI_ENABLE_CUDA=OFF` builds the CPU-only plugin without the toolkit (no GPU-native path — the documented non-NVIDIA behavior, not a shippable default).
 
@@ -153,7 +155,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ctest` runs the portable unit suite from `make test` on macOS — including `test_platform_paths` (UTF-8⇄UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus three Windows-side additions the Makefile doesn't build: `test_win_file_dialog` (the browse dialog's pure logic, ticket #24), `test_timeline_watch` (the watcher's Python-discovery/quoting/path seams plus a live pipe-spawn smoke test, ticket #25), and `test_plugin_delayload`, which loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+`ctest` runs the portable unit suite from `make test` on macOS — including `test_platform_paths` (UTF-8⇄UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus four Windows-side additions the Makefile doesn't build: `test_win_file_dialog` (the browse dialog's pure logic, ticket #24), `test_timeline_watch` (the watcher's Python-discovery/quoting/path seams plus a live pipe-spawn smoke test, ticket #25), `test_braw_reader` (the BRAW metadata reader's soft-fail contract, ticket #26 — see the Camera Metadata section below for its opt-in real-clip mode), and `test_plugin_delayload`, which loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
 
 `test_cuda_downscale` (ticket #22) is the Windows counterpart of `make test-metal`: it holds the fused CUDA kernels **byte-identical** to the shared CPU references (`ndi_stream::downscaleRGBABox`, `ndi_stmap::warpRGBABox`, the flipping converters), including identity-STMap ≡ plain-downscale, plus the slot ring and passthrough/readback contracts. It needs a CUDA device — it runs for real on the workstation and skips cleanly on GPU-less machines (hosted CI compiles it, which is CI's whole job here). Byte-identity leans on `--fmad=false` for the CUDA translation units (CMakeLists.txt) — don't "optimize" that flag away.
 
@@ -190,6 +192,20 @@ The Windows counterpart of the macOS playhead watcher (BUILD.md macOS section, v
 The helper finds Resolve's scripting environment without configuration: the scripting modules load from `%PROGRAMDATA%\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules`, and the plugin derives the `fusionscript.dll` path from the *running* `Resolve.exe` (the watcher spawns from inside Resolve's process) and hands it to the helper, so non-default install directories work.
 
 Every failure is soft and named in the log (DebugView filter `NDI Plugin: TimelineWatch:`): no Python found, helper script missing from the bundle, spawn failure, scripting disabled, module-import failure. The helper respawns with 30 s backoff; Manual Path mode is unaffected throughout. When Auto mode has no usable clip, Stream Status shows the generic camera-metadata passthrough message (same text as macOS) and the *log* carries the watcher's health detail alongside it.
+
+### Camera Metadata (BRAW) projection (ticket #26)
+
+The Windows counterpart of the macOS camera-metadata reader (macOS section above): `src/BRAWImmersiveReader.cpp` reads the Apple Immersive lens calibration out of URSA Cine Immersive clips and feeds the same platform-neutral map generator (`src/BRAWLensMap.h`) the macOS build uses, so the projection math — and therefore the output — is identical on both platforms.
+
+**Header generation (build step):** the Windows Blackmagic RAW SDK ships no C++ header — the API surface is defined in `BlackmagicRawAPI.idl`, vendored (with the SDK's dispatch shim, all under Blackmagic's Boost-style license, notices intact) in [third_party/braw/Win/](third_party/braw/Win/); re-copy all three files from `C:\Program Files (x86)\Blackmagic Design\Blackmagic RAW\Blackmagic RAW SDK\Win\Include\` to update. At build time **midl.exe** (part of the Windows SDK that comes with the VS workload — nothing extra to install) compiles the IDL into `build/braw_gen/BlackmagicRawAPI.h`; the VS generator drives this automatically because the `.idl` is a source of the `braw_reader` target, and a `VS_SETTINGS` source property in CMakeLists.txt pins the output directory so the include path is config-independent. Building therefore needs **no Blackmagic install at all** — CI proves it on every push.
+
+**How the BRAW runtime resolves:** nothing Blackmagic is linked or bundled. The vendored dispatch shim loads `BlackmagicRawAPI.dll` at runtime, trying in order: an exe-relative `BlackmagicRawAPI\` folder, then the exe's own folder — **inside Resolve's process the exe is `Resolve.exe`, so this binds `C:\Program Files\Blackmagic Design\DaVinci Resolve\BlackmagicRawAPI.dll`, Resolve's own shipped copy**. User machines need no separate Blackmagic install and can never skew versions against the host. Standalone processes (the unit-test binary) fall back to explicit paths: the installed Blackmagic RAW SDK (`...\Blackmagic RAW SDK\Win\Libraries`), then a default-location Resolve. When no runtime resolves anywhere, the feature soft-fails exactly like a bad STMap: passthrough + a Stream Status message, and the log names the failure. The DLL is loaded on the parameter-edit path (never render), and only when a Camera Metadata clip is actually read — the plugin's load-time imports are untouched (`test_plugin_delayload` enforces this).
+
+**Testing:** `test_braw_reader` always runs the soft-fail contract (missing file, garbage bytes, invalid UTF-8 → `false` + readable error, no crash) — it passes with or without a BRAW runtime on the machine, so hosted CI covers it. On a workstation, point `NDI_TEST_BRAW_CLIP` at a real URSA Cine Immersive clip to run the full chain (metadata → JSON parse → map generation), and optionally `NDI_TEST_BRAW_DUMP` at a path to write the raw calibration blob for diffing against `tests/fixtures/ursa_immersive_calibration.json`:
+
+```bash
+NDI_TEST_BRAW_CLIP='C:\clips\B001_10151156_C001.braw' ./build/Release/test_braw_reader.exe
+```
 
 ### Logs on Windows
 
