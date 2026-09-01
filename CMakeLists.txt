@@ -18,7 +18,10 @@
 #   ctest --test-dir build -C Release --output-on-failure
 #   cmake --install build --config Release --prefix stage
 
-cmake_minimum_required(VERSION 3.21)
+# 3.22 for VS_SETTINGS on the vendored BRAW IDL (ticket #26) — on older
+# CMake the property is silently ignored and the MIDL header lands where no
+# target can include it.
+cmake_minimum_required(VERSION 3.22)
 
 # zlib must link STATICALLY. The plugin is a DLL living in a folder Windows
 # never searches when resolving its load-time imports, so any dynamic
@@ -140,10 +143,37 @@ add_compile_definitions(_CRT_SECURE_NO_WARNINGS _USE_MATH_DEFINES)
 # enforcement.
 set(NDI_CUDA_EXACT_MATH "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 
+# --- BRAW immersive-metadata reader (ticket #26) -----------------------------
+# The Camera Metadata projection's SDK-facing half. The Windows Blackmagic
+# RAW SDK ships no C++ header — it is generated from the vendored IDL
+# (third_party/braw/Win/, Boost-style license, same provenance as the macOS
+# shim) by midl.exe, which the VS generator drives automatically for .idl
+# sources. VS_SETTINGS pins the output into one fixed directory so the
+# include path below is config-independent; without it the header lands in
+# the per-config IntDir where no other target could name it portably.
+# Nothing Blackmagic is linked or bundled: the dispatch shim (compiled into
+# BRAWImmersiveReader.cpp) resolves BlackmagicRawAPI.dll at runtime —
+# exe-relative, so inside Resolve it binds Resolve's own shipped copy.
+set(NDI_BRAW_GEN_DIR "${CMAKE_BINARY_DIR}/braw_gen")
+file(MAKE_DIRECTORY "${NDI_BRAW_GEN_DIR}")
+set_source_files_properties(third_party/braw/Win/BlackmagicRawAPI.idl PROPERTIES
+    VS_SETTINGS "OutputDirectory=${NDI_BRAW_GEN_DIR};HeaderFileName=BlackmagicRawAPI.h;InterfaceIdentifierFileName=BlackmagicRawAPI_i.c;ProxyFileName=BlackmagicRawAPI_p.c;TypeLibraryName=BlackmagicRawAPI.tlb")
+add_library(braw_reader STATIC
+    src/BRAWImmersiveReader.cpp
+    third_party/braw/Win/BlackmagicRawAPI.idl)
+target_include_directories(braw_reader PRIVATE
+    "${NDI_BRAW_GEN_DIR}"
+    third_party/braw/Win
+    src)
+# oleaut32: BSTR/VARIANT plumbing the Windows BRAW API speaks; ole32: the
+# CoInitializeEx courtesy call. System DLLs, no loader-trap concern.
+target_link_libraries(braw_reader PUBLIC oleaut32 ole32)
+
 # --- The plugin --------------------------------------------------------------
 add_library(NDIOutput SHARED
     src/NDIOutputPlugin.cpp
-    src/WinFileDialog.cpp)
+    src/WinFileDialog.cpp
+    src/WinTimelineWatch.cpp)
 set_target_properties(NDIOutput PROPERTIES
     OUTPUT_NAME "NDIOutput"
     SUFFIX ".ofx"
@@ -171,9 +201,12 @@ target_include_directories(NDIOutput PRIVATE
     "${NDI_INCLUDE_DIR}")
 target_link_libraries(NDIOutput PRIVATE ZLIB::ZLIB)
 # ole32 + shell32 + user32: the browse buttons' IFileOpenDialog and its
-# GUI-thread guard (ticket #24, src/WinFileDialog.cpp). System DLLs, so no
-# loader-trap concern.
-target_link_libraries(NDIOutput PRIVATE ole32 shell32 user32)
+# GUI-thread guard (ticket #24, src/WinFileDialog.cpp). advapi32: the
+# timeline watcher's PEP 514 Python discovery reads the registry (ticket
+# #25, src/WinTimelineWatch.h). System DLLs, so no loader-trap concern.
+target_link_libraries(NDIOutput PRIVATE ole32 shell32 user32 advapi32)
+# The BRAW immersive-metadata reader (ticket #26; braw_reader above).
+target_link_libraries(NDIOutput PRIVATE braw_reader)
 
 # Delay-load the NDI DLL (spec decision 12): Windows' loader never searches a
 # DLL's own folder for load-time imports of another DLL, so a static import
@@ -203,7 +236,9 @@ set(NDI_PORTABLE_TESTS
     test_ndi_loader
     test_stmap
     test_brawmap
-    test_win_file_dialog)
+    test_braw_reader
+    test_win_file_dialog
+    test_timeline_watch)
 foreach(_t IN LISTS NDI_PORTABLE_TESTS)
     add_executable(${_t} tests/${_t}.cpp)
     target_include_directories(${_t} PRIVATE src)
@@ -213,6 +248,8 @@ foreach(_t IN LISTS NDI_PORTABLE_TESTS)
 endforeach()
 target_link_libraries(test_stmap PRIVATE ZLIB::ZLIB)
 target_link_libraries(test_brawmap PRIVATE ZLIB::ZLIB)
+target_link_libraries(test_braw_reader PRIVATE braw_reader ZLIB::ZLIB)
+target_link_libraries(test_timeline_watch PRIVATE advapi32)  # registry discovery
 
 # CUDA kernel-identity test (ticket #22): the fused kernels must be
 # byte-identical to the shared CPU references. Compiles the module in
@@ -251,6 +288,11 @@ add_test(NAME test_plugin_delayload
 # ticket (#23) owns end-user packaging.
 set(NDI_BUNDLE_BIN_DIR "NDIOutput.ofx.bundle/Contents/Win64")
 install(TARGETS NDIOutput RUNTIME DESTINATION "${NDI_BUNDLE_BIN_DIR}")
+# The Timeline (Auto) watcher helper rides in Contents/Resources, same spot
+# the macOS Makefile stages it (ticket #25; the watcher derives this path
+# from its own module location — see WinTimelineWatch.h bundleResourcePath).
+install(FILES src/ndi_timeline_watch.py
+        DESTINATION "NDIOutput.ofx.bundle/Contents/Resources")
 if(NOT NDI_USING_STUB)
     install(FILES
         "${NDI_SDK_PATH}/Bin/x64/${NDI_DLL_NAME}.dll"

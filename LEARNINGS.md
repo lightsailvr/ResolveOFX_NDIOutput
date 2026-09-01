@@ -338,6 +338,27 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0 — async submit tests (output bit-equal to blocking path, slot-ring backpressure, 4-in-flight) green.
 **Rule:** never touch the CUDA API from a `cudaLaunchHostFunc` callback — treat it purely as a signal and do the CUDA-facing work (event queries, timing) on your own thread.
 
+### 2026-08-31 — The watcher's Windows scripting chain is verifiable standalone, before any plugin install (ticket #25)
+**Symptom:** verifying Timeline (Auto) on Windows looked like it needed the full Tier 1 loop (elevated install, Resolve restart, DebugView) just to learn whether Python/fusionscript/scripting-preference plumbing works at all.
+**Root cause (of the assumed friction):** external scripting is process-independent — `fusionscript.dll` connects to a *running* Resolve from any process, not just children of it. The helper script needs nothing from the plugin but the `fusionscript.dll` path it would pass as argv[1].
+**Fix:** run the helper directly while Resolve is open: `python src\ndi_timeline_watch.py "C:\Program Files\Blackmagic Design\DaVinci Resolve\fusionscript.dll"` — it prints the clip under the playhead per poll (or the exact `!`-prefixed failure reason). Verified live on the workstation: Store-installed Python 3.12 (which registers PEP 514 keys in HKCU, so registry discovery finds it) imported the modules from `%PROGRAMDATA%` and reported the open project's playhead clip.
+**Validated by:** Tier 0.5 — standalone helper run against live Resolve during ticket #25 development; the in-Resolve spawn path still owes its Tier 1–2 pass (BUILD.md).
+**Rule:** debug Resolve-scripting features with the helper run standalone first — it isolates the scripting chain from the spawn/pipe plumbing and needs no install or restart.
+
+### 2026-08-31 — MIDL output must be pinned with VS_SETTINGS or no other target can find the generated header (ticket #26)
+**Symptom:** (caught at design time) the Windows BRAW SDK ships only an IDL; the VS generator runs midl.exe automatically for `.idl` sources, but drops `BlackmagicRawAPI.h` into the target's per-config IntDir (`build/<target>.dir/<Config>/`) — a path no `target_include_directories` call can name portably, and one that differs per configuration.
+**Root cause:** CMake's VS generator hardcodes the Midl item's `OutputDirectory` to `$(ProjectDir)/$(IntDir)`; CMake include paths are resolved at generate time and can't carry MSBuild macros.
+**Fix:** `set_source_files_properties(... VS_SETTINGS "OutputDirectory=${CMAKE_BINARY_DIR}/braw_gen;...")` (CMakeLists.txt) — per-source MSBuild metadata overrides CMake's default, landing the header at one fixed, config-independent path every target can include. Requires CMake ≥ 3.22 (present everywhere we build).
+**Validated by:** Tier 0 — header generated into `build/braw_gen/` on the workstation (CMake 4.0 / VS2022), `braw_reader` and `test_braw_reader` both compile against it, full suite green.
+**Rule:** any MIDL-generated header consumed across targets needs its `OutputDirectory` pinned via `VS_SETTINGS` — never chase the per-config IntDir default.
+
+### 2026-08-31 — The BRAW calibration blob is not byte-stable across platforms; compare it parsed, never memcmp (ticket #26)
+**Symptom:** the Windows-extracted `OpticalProjectionData` came out 802 bytes smaller (30,551) than the macOS-extracted fixture (31,353) for the *same clip* — smelling like truncation or a conversion bug.
+**Root cause:** whitespace only. The SDK hands the blob back through platform string types (CFString on macOS, BSTR on Windows) and the newline/indentation formatting differs; every value is identical — `json.load(a) == json.load(b)` is `True`.
+**Fix:** none needed in code — the consumer parses JSON. `test_braw_reader`'s `NDI_TEST_BRAW_DUMP` writes the raw blob so the parsed comparison is one command (BUILD.md, Camera Metadata section).
+**Validated by:** Tier 0.5 — full-chain `test_braw_reader` run against the sample URSA Cine Immersive clip on the workstation; semantic diff against the checked-in fixture clean.
+**Rule:** cross-platform parity checks on SDK-returned text blobs compare parsed values, not bytes — byte-count differences alone prove nothing.
+
 ---
 
 ## Template for new entries

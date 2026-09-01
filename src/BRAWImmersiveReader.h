@@ -2,24 +2,26 @@
 #define _BRAWImmersiveReader_h_
 
 /*
-  BRAW SDK-facing half of the camera-metadata projection (issue #11): pulls the
-  embedded Apple Immersive calibration JSON (OpticalProjectionData) out of an
-  URSA Cine Immersive .braw. Header-only interface so the plugin core never
-  sees the SDK's COM-style headers; the implementation
-  (src/BRAWImmersiveReader.cpp) compiles the vendored dispatch shim
-  (third_party/braw/, Boost-style license), which resolves the API at runtime
-  from the host application's own bundled BlackmagicRawAPI.framework — inside
-  Resolve that is Resolve's copy, so the plugin ships no Blackmagic binaries
-  and can never skew versions against the host. Outside a bundle-carrying host
-  (the unit-test binary, say) it falls back to the installed Blackmagic RAW
-  SDK, and fails soft when neither exists.
+  BRAW SDK-facing half of the camera-metadata projection (issue #11; Windows
+  port issue #26): pulls the embedded Apple Immersive calibration JSON
+  (OpticalProjectionData) out of an URSA Cine Immersive .braw. Header-only
+  interface so the plugin core never sees the SDK's COM-style headers; the
+  implementation (src/BRAWImmersiveReader.cpp) compiles the vendored dispatch
+  shim (third_party/braw/, Boost-style license), which resolves the API at
+  runtime from the host application's own copy — on macOS
+  BlackmagicRawAPI.framework out of the host bundle, on Windows
+  BlackmagicRawAPI.dll beside the host exe — inside Resolve that is Resolve's
+  shipped copy, so the plugin ships no Blackmagic binaries and, on that
+  primary path, cannot skew versions against the host. When the host carries
+  no copy (the unit-test binary, or a broken install) it falls back to the
+  installed Blackmagic RAW SDK, and fails soft when nothing resolves.
 
   Metadata-only: opening a clip parses headers — no frame decode, no GPU use,
   instant even on multi-GB media. Call it from the same main-thread parameter
   paths that load STMap EXRs (createInstance / instanceChanged), never render.
 */
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
 
 #include <string>
 
@@ -40,6 +42,6 @@ bool readImmersiveCalibration(const std::string& brawPath,
 
 } // namespace ndi_brawreader
 
-#endif // __APPLE__
+#endif // __APPLE__ || _WIN32
 
 #endif
