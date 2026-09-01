@@ -127,6 +127,12 @@ inline bool spawnPipedProcess(const std::vector<std::string>& argv, pid_t* pid, 
     if (pipe(fds) != 0) {
         return fail("pipe() failed", errno);
     }
+    // Close-on-exec on both ends: this runs inside Resolve's process, and any
+    // OTHER child Resolve forks meanwhile would otherwise inherit the write
+    // end and hold the pipe open past the helper's death. The dup2 below
+    // gives the helper itself a plain (inheritable) stdout.
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
@@ -154,6 +160,30 @@ inline bool spawnPipedProcess(const std::vector<std::string>& argv, pid_t* pid, 
     *pid = child;
     *readFd = fds[0];
     return true;
+}
+
+// ---- Probe-once ---------------------------------------------------------------------
+// Run a candidate to completion with its output discarded; true only for a
+// clean exit(0). The python fallback trusts an interpreter only after seeing
+// it run `--version` — hardening against ANY stub at a canonical path, not
+// just the two known today (issue #34).
+inline bool exitsCleanly(const std::vector<std::string>& argv)
+{
+    pid_t pid = -1;
+    int fd = -1;
+    std::string error;
+    if (!spawnPipedProcess(argv, &pid, &fd, &error)) {
+        return false;
+    }
+    char sink[256];
+    while (read(fd, sink, sizeof(sink)) > 0) {
+    }
+    close(fd);
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 } // namespace ndi_timelinewatch_mac

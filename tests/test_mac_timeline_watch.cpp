@@ -6,6 +6,7 @@
 
 #include "MacTimelineWatch.h"
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -149,6 +150,11 @@ static void testSpawnPipedProcess()
     if (pid <= 0) {
         return;
     }
+    // Both pipe ends must be close-on-exec: this spawn happens inside
+    // Resolve's process, and any OTHER child Resolve forks meanwhile would
+    // otherwise inherit the write end and keep the pipe open past the
+    // helper's death — the watcher's only wake-up signal would never fire.
+    expectTrue((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0, "read end is close-on-exec");
     FILE* stream = fdopen(fd, "r");
     expectTrue(stream != nullptr, "read fd wraps into a FILE*");
     bool sawStatus = false, sawPath = false, sawNoise = false;
@@ -183,12 +189,30 @@ static void testSpawnPipedProcess()
                "failure reports an error and leaves no pid/fd behind");
 }
 
+static void testExitsCleanly()
+{
+    using ndi_timelinewatch_mac::exitsCleanly;
+
+    // Probe-once for the python fallback (issue #34): an interpreter is only
+    // trusted after it has been seen to run `--version` and exit 0 — a stub
+    // at any path (not just Apple's shim) exits non-zero and is skipped.
+    expectTrue(exitsCleanly({"/bin/sh", "-c", "echo Python 3.9.6; exit 0"}),
+               "a candidate that exits 0 is trusted");
+    expectTrue(!exitsCleanly({"/bin/sh", "-c", "echo note: no developer tools 1>&2; exit 1"}),
+               "a candidate that exits non-zero is rejected");
+    expectTrue(!exitsCleanly({"/nonexistent/python3", "--version"}),
+               "a candidate that cannot spawn is rejected");
+    expectTrue(!exitsCleanly({"/bin/sh", "-c", "kill -TERM $$"}),
+               "a candidate that dies by signal is rejected");
+}
+
 int main()
 {
     testFuscriptPathForHostExecutable();
     testPython3CandidatePaths();
     testDescribeWaitStatus();
     testSpawnPipedProcess();
+    testExitsCleanly();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

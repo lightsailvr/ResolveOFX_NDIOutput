@@ -34,6 +34,7 @@ constexpr int kRespawnBackoffSeconds = 30;
 std::mutex gMutex;                 // guards everything below
 bool gStarted = false;
 std::atomic<bool> gStop{false};
+std::atomic<bool> gReaderDone{false};  // readerLoop has returned
 std::thread gThread;
 pid_t gHelperPid = -1;
 int gHelperFd = -1;                // read end of the helper's stdout pipe
@@ -110,7 +111,10 @@ std::string fuscriptPath()
 // Never /usr/bin/python3: that is Apple's libxcselect shim, which without the
 // Command Line Tools prints a note to stderr and exits — the silent respawn
 // loop of issue #34 (and it can pop the CLT install dialog). The seam
-// resolves the developer-dir python the way the shim would, then Homebrew.
+// resolves the developer-dir python the way the shim would, then Homebrew —
+// and each candidate is trusted only after it has been seen to run
+// `--version` and exit 0, so any future stub at any of these paths is
+// skipped rather than looped on.
 std::string pythonPath()
 {
     const char* developerDirEnv = getenv("DEVELOPER_DIR");
@@ -120,7 +124,8 @@ std::string pythonPath()
                                               : std::string();
     for (const std::string& candidate : ndi_timelinewatch_mac::python3CandidatePaths(
              developerDirEnv ? developerDirEnv : "", xcodeSelectLink)) {
-        if (isExecutableFile(candidate)) {
+        if (isExecutableFile(candidate) &&
+            ndi_timelinewatch_mac::exitsCleanly({candidate, "--version"})) {
             return candidate;
         }
     }
@@ -138,7 +143,7 @@ void setHealthLocked(bool ok, const std::string& detail)
 bool spawnHelperLocked()
 {
     std::vector<std::string> argv;
-    std::string chain;
+    std::string launchSummary;
     const std::string fuscript = fuscriptPath();
     const std::string luaScript = bundleResourcePath("ndi_timeline_watch.lua");
     if (!fuscript.empty() && !luaScript.empty()) {
@@ -146,7 +151,7 @@ bool spawnHelperLocked()
         // protocol would otherwise read as clip paths; -l lua selects the
         // interpreter (verified against Resolve 20's fuscript, 2026-09-01).
         argv = {fuscript, "-q", "-l", "lua", luaScript};
-        chain = "fuscript [" + fuscript + "] " + luaScript;
+        launchSummary = "fuscript [" + fuscript + "] " + luaScript;
     } else {
         // Fallback: the Python helper — a host without fuscript (standalone
         // test binaries, an exotic Resolve packaging).
@@ -163,7 +168,7 @@ bool spawnHelperLocked()
             return false;
         }
         argv = {python, script};
-        chain = "python [" + python + "] " + script;
+        launchSummary = "python [" + python + "] " + script;
     }
 
     pid_t pid = -1;
@@ -176,7 +181,7 @@ bool spawnHelperLocked()
     gHelperPid = pid;
     gHelperFd = fd;
     setHealthLocked(false, "helper starting");  // healthy once the first line lands
-    WATCH_LOG(("helper started (" + chain + ")").c_str());
+    WATCH_LOG(("helper started (" + launchSummary + ")").c_str());
     return true;
 }
 
@@ -191,6 +196,9 @@ bool spawnHelperLocked()
 // helper (with backoff) whenever it dies, until shutdown.
 void readerLoop()
 {
+    struct DoneFlag {
+        ~DoneFlag() { gReaderDone.store(true); }
+    } doneFlag;
     std::string lastAnnouncedError;
     while (!gStop.load(std::memory_order_relaxed)) {
         int fd = -1;
@@ -301,6 +309,7 @@ void ensureStarted(std::function<void(const std::string&)> onChange)
     }
     gStarted = true;
     gStop.store(false);
+    gReaderDone.store(false);
     gOnChange = std::move(onChange);
     gThread = std::thread(readerLoop);
 }
@@ -322,6 +331,7 @@ bool healthy(std::string* detail)
 
 void shutdown()
 {
+    pid_t helper = -1;
     {
         std::lock_guard<std::mutex> lock(gMutex);
         if (!gStarted) {
@@ -330,8 +340,23 @@ void shutdown()
         gStop.store(true);
         // Killing the helper EOFs the pipe, which unblocks the reader's
         // fgets within one heartbeat; the reader owns the fd (see above).
-        if (gHelperPid > 0) {
-            kill(gHelperPid, SIGTERM);
+        helper = gHelperPid;
+        if (helper > 0) {
+            kill(helper, SIGTERM);
+        }
+    }
+    // A helper that traps SIGTERM would otherwise pin the reader in fgets
+    // and this join in plugin unload forever: escalate to SIGKILL after 2 s
+    // (mirrors the Windows watcher's TerminateProcess fallback). The reader
+    // still reaps it; a pid that already died and was reaped is never
+    // re-signalled (gHelperPid is cleared under the mutex before any reuse).
+    for (int i = 0; i < 20 && !gReaderDone.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!gReaderDone.load()) {
+        std::lock_guard<std::mutex> lock(gMutex);
+        if (gHelperPid > 0 && gHelperPid == helper) {
+            kill(gHelperPid, SIGKILL);
         }
     }
     if (gThread.joinable()) {

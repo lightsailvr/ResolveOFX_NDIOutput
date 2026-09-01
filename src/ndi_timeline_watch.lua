@@ -22,6 +22,9 @@
 local POLL_SECONDS = 0.5
 
 local function say(line)
+  -- One protocol line per call: a multi-line error text would otherwise be
+  -- read back as clip paths.
+  line = tostring(line):gsub("[\r\n]+", " ")
   local ok = io.stdout:write(line, "\n")
   if not ok then os.exit(0) end   -- reader hung up: plugin is gone
   io.stdout:flush()
