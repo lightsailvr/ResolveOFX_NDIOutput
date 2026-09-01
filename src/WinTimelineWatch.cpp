@@ -76,18 +76,23 @@ void setHealthLocked(bool ok, const std::string& detail)
 // Wait for the helper to finish and close its handle. TerminateProcess as
 // the fallback: the helper holds no state worth a graceful exit (its stdout
 // is already being discarded), and a wedged child must never wedge the
-// reader.
-void reapHelperLocked()
+// reader. Returns the child's exit code when it can be read (the WindowsApps
+// python stub's 9009 identified itself only through this), -1 otherwise.
+long reapHelperLocked()
 {
     if (gHelperProcess == nullptr) {
-        return;
+        return -1;
     }
     if (WaitForSingleObject(gHelperProcess, 2000) == WAIT_TIMEOUT) {
         TerminateProcess(gHelperProcess, 0);
         WaitForSingleObject(gHelperProcess, 2000);
     }
+    DWORD code = 0;
+    const long exitCode =
+        GetExitCodeProcess(gHelperProcess, &code) ? static_cast<long>(code) : -1;
     CloseHandle(gHelperProcess);
     gHelperProcess = nullptr;
+    return exitCode;
 }
 
 // Spawn the helper with its stdout on a pipe. Returns false with a health
@@ -223,11 +228,11 @@ void readerLoop()
         {
             std::lock_guard<std::mutex> lock(gMutex);
             gHelperRead = nullptr;
-            reapHelperLocked();
+            const long exitCode = reapHelperLocked();
             if (!gStop.load(std::memory_order_relaxed)) {
                 setHealthLocked(false, "helper exited — retrying");
-                watchLog("helper exited — retrying in 30 s (Manual Path mode is "
-                         "unaffected)");
+                watchLog("helper exited (code " + std::to_string(exitCode) +
+                         ") — retrying in 30 s (Manual Path mode is unaffected)");
             }
         }
         for (int i = 0; i < kRespawnBackoffSeconds * 10 && !gStop.load(); ++i) {

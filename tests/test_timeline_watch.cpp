@@ -139,6 +139,36 @@ static void testBundleResourcePath()
     expectTrue(bundleResourcePath(L"", L"x.py").empty(), "empty module path yields empty");
 }
 
+static void testIsWindowsAppsAliasPath()
+{
+    using ndi_timelinewatch_win::isWindowsAppsAliasPath;
+
+    // The App Execution Alias stub Windows ships even with no Python
+    // installed: spawns fine, prints "Python was not found" to stderr (which
+    // the watcher routes to NUL) and exits — the silent helper-exit loop.
+    expectTrue(isWindowsAppsAliasPath(
+                   L"C:\\Users\\matt\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"),
+               "stock WindowsApps alias path detected");
+    expectTrue(isWindowsAppsAliasPath(
+                   L"C:\\USERS\\X\\APPDATA\\LOCAL\\MICROSOFT\\WINDOWSAPPS\\PYTHON.EXE"),
+               "detection is case-insensitive (NTFS paths are)");
+    expectTrue(isWindowsAppsAliasPath(
+                   L"C:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe"),
+               "python3.exe alias flavor detected too");
+
+    expectTrue(!isWindowsAppsAliasPath(L"C:\\Python311\\python.exe"),
+               "python.org install is not an alias");
+    expectTrue(!isWindowsAppsAliasPath(
+                   L"C:\\Program Files\\Python312\\python.exe"),
+               "machine-wide install is not an alias");
+    expectTrue(!isWindowsAppsAliasPath(
+                   L"C:\\Program Files\\WindowsApps\\PythonSoftwareFoundation."
+                   L"Python.3.12_3.12.2032.0_x64__qbz5n2kfra8p0\\python.exe"),
+               "the real Store package directory (Program Files\\WindowsApps) is "
+               "not the per-user alias directory");
+    expectTrue(!isWindowsAppsAliasPath(L""), "empty path is not an alias");
+}
+
 #ifdef _WIN32
 static void testDiscoverPython()
 {
@@ -208,6 +238,7 @@ int main()
     testPickBestPython();
     testQuoteArg();
     testBundleResourcePath();
+    testIsWindowsAppsAliasPath();
 #ifdef _WIN32
     testDiscoverPython();
     testSpawnHelperProcess();

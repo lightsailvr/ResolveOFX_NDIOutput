@@ -373,6 +373,13 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0 — CI produces `NDIOutput-1.14.0-Windows-x64-STUB.exe` and the acceptance test installs/uninstalls it; the release path refuses that name.
 **Rule:** any artifact a CI job builds without the real redistributables gets a name that cannot be mistaken for a release, plus a guard in the publish path — a warning in a log is not a guard.
 
+### 2026-09-01 — Both OSes ship a python.exe that isn't one — never trust an interpreter you haven't seen speak (tickets #23/#25, issue #34)
+**Symptom:** on the fresh-machine installer test (Tier 1–2, ticket #23), Timeline (Auto) never detected the camera clip; the log looped `TimelineWatch: helper exited — retrying in 30 s` with no `!`-prefixed helper message before it, and Manual Path worked — which also cleared the BRAW runtime of suspicion (both modes share it).
+**Root cause:** the machine had no Python, but discovery's PATH fallback still found one: `%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`, the App Execution Alias stub Windows ships so typing `python` opens the Store. It spawns cleanly, prints "Python was not found" to stderr (which the watcher routes to NUL) and exits 9009 — before the helper's first real line, so no `!` message ever reached the log. macOS has the same disease per field reports: `/usr/bin/python3` without Xcode CLT is Apple's shim, prints an error, exits (filed as issue #34, fix off `dev`).
+**Fix:** `isWindowsAppsAliasPath()` in `src/WinTimelineWatch.h` rejects the per-user alias directory in the PATH fallback only — a genuinely installed Store Python registers PEP 514 keys and is taken by the registry sweep, which never reaches the fallback. The machine now soft-fails by name ("no 64-bit Python 3 found…") instead of looping. And the helper-exit log carries the child's exit code — 9009 would have identified the stub instantly.
+**Validated by:** Tier 0 — new unit tests in `tests/test_timeline_watch.cpp` (alias flavors, case-insensitivity, and that the real Store package dir under Program Files\WindowsApps does NOT match), 12/12 suite green.
+**Rule:** an executable existing on PATH is not evidence of an interpreter — both Windows and macOS ship stubs at the canonical python locations, so validate provenance (registry/xcode-select) or probe it once, and always log a dead child's exit code.
+
 ---
 
 ## Template for new entries
