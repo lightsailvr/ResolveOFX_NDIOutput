@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port in progress on branch `windows-port`: CPU-only build + tests green in CI, first-stream plumbing landed (ticket #21); CUDA pending (see [status](#windows--status-cpu-only-build-green-in-ci-cuda-pending-ticket-22))
+- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline in the build with kernel identity tests (ticket #22); installer pending (see [status](#windows--status-cuda-gpu-native-pipeline-in-the-build-ticket-22-installer-pending-ticket-23))
 
 ---
 
@@ -120,24 +120,26 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows — STATUS: CPU-only build green in CI; CUDA pending (ticket #22)
+## Windows — STATUS: CUDA GPU-native pipeline in the build (ticket #22); installer pending (ticket #23)
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
+
+**Still owed from issue #22 (Tier 1–2, human on the workstation):** GPU-native log lines during real playback with no CPU-fallback lines, 8K stereo rates comparable to macOS, and the render-call probe matrix re-run (Render Cache / proxy modes / stereo per-eye instances) before trusting stereo pairing on Windows — findings to LEARNINGS.md when they happen. Tier 0 (build + all tests, kernel identity on the workstation GPU) is what this section's status line covers.
 
 ### Prerequisites
 
 - **Visual Studio 2022** with the "Desktop development with C++" workload (MSVC v143 + Windows SDK)
 - **CMake** ≥ 3.21 and **vcpkg** (supplies zlib via [vcpkg.json](vcpkg.json))
 - **Windows NDI 6 Advanced SDK** installed at `C:\Program Files\NDI\NDI 6 Advanced SDK` (or pass `-DNDI_SDK_PATH=...`). HDR needs Advanced; the download is access-gated, request early. Without it the build automatically links a **stub import library** built from [third_party/ndi/](third_party/ndi/) — good for compile-proof only; a streaming binary needs the real SDK.
-- **CUDA Toolkit 12.9** — not needed yet; required once the CUDA pipeline lands (nvcc requires MSVC as host compiler; that constraint killed the old MinGW script). Nothing can be cross-compiled from macOS.
+- **CUDA Toolkit 12.9** (pinned; spec decision 8) — compiles the GPU-native pipeline (`src/CudaGPUAcceleration.cu`; nvcc requires MSVC as host compiler — that constraint killed the old MinGW script). Nothing can be cross-compiled from macOS. `-DNDI_ENABLE_CUDA=OFF` builds the CPU-only plugin without the toolkit (no GPU-native path — the documented non-NVIDIA behavior, not a shippable default).
 
 ### Build (Tier 0)
 
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T "cuda=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9" -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
 ```
 
-(`$VCPKG_ROOT` = your vcpkg checkout; the GitHub runner preinstalls one and exposes it as `VCPKG_INSTALLATION_ROOT`, which is what the workflow passes.)
+(`$VCPKG_ROOT` = your vcpkg checkout; the GitHub runner preinstalls one and exposes it as `VCPKG_INSTALLATION_ROOT`, which is what the workflow passes. The `-T "cuda=..."` toolset points the VS generator straight at the CUDA toolkit — required whenever the CUDA **Visual Studio integration** was never copied into the VS installation, an admin-only step the full toolkit installer performs but a scripted/partial install does not; without either, configure fails with `No CUDA toolset found`. Harmless when the integration IS installed, so just always pass it.)
 
 ```bash
 cmake --build build --config Release --parallel
@@ -148,6 +150,8 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 `ctest` runs the same portable unit suite as `make test` on macOS — including `test_platform_paths` (UTF-8→UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus `test_plugin_delayload`, Windows-only: it loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+
+`test_cuda_downscale` (ticket #22) is the Windows counterpart of `make test-metal`: it holds the fused CUDA kernels **byte-identical** to the shared CPU references (`ndi_stream::downscaleRGBABox`, `ndi_stmap::warpRGBABox`, the flipping converters), including identity-STMap ≡ plain-downscale, plus the slot ring and passthrough/readback contracts. It needs a CUDA device — it runs for real on the workstation and skips cleanly on GPU-less machines (hosted CI compiles it, which is CI's whole job here). Byte-identity leans on `--fmad=false` for the CUDA translation units (CMakeLists.txt) — don't "optimize" that flag away.
 
 ### Install (Tier 1)
 
@@ -178,7 +182,7 @@ Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OF
 
 ### CI
 
-[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: configure + CPU-only build on `windows-2022`, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64-cpu-only` artifact. CI has no GPU and no Resolve — Tiers 1–2 stay human, on real hardware.
+[.github/workflows/windows.yml](.github/workflows/windows.yml) runs on every push to `windows-port` and any `feature/win-`-prefixed branch (glob `feature/win-**`), on PRs into `windows-port`, and on manual dispatch: install CUDA Toolkit 12.9 (nvcc + cudart + VS integration, network method), configure + build on `windows-2022` **including the CUDA translation units**, the portable unit suite under MSVC, and a bundle-layout check, uploading the staged tree as the `NDIOutput-win64` artifact. CI has no GPU and no Resolve — kernel identity executes on the workstation, and Tiers 1–2 stay human, on real hardware.
 
 Same rule as macOS: any Windows build change updates this section in the same PR.
 
