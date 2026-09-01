@@ -122,7 +122,7 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25), Camera Metadata (BRAW) projection (#26), and the installer + release wiring (#23) in the build; the fresh-machine installer pass is the Tier 1–2 work still owed
+## Windows — STATUS: CUDA pipeline (#22), Browse dialogs (#24), Timeline (Auto) watcher (#25, fuscript/Lua since v1.14.1), Camera Metadata (BRAW) projection (#26), and the installer + release wiring (#23, fresh-machine pass confirmed 2026-09-01) in the build
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
@@ -216,7 +216,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\test_windows_installer.ps1
 
 from an **elevated** PowerShell with Resolve closed. It drives a real `/VERYSILENT` install, asserts the plugin, the watcher helper and the attribution readme (trademark line + ndi.video link) landed, checks the ARP entry carries the right `DisplayVersion` and an uninstall string, then runs the uninstaller silently and asserts the bundle tree *and* the ARP entry are gone. It refuses to start if a bundle is already installed (it would remove your dev install at the end — `-Force` overrides). CI runs it on every push it covers (`windows-port`, `feature/win-**`, PRs into `windows-port`). Against a `-STUB` installer it skips the NDI-runtime assertions, which that build cannot satisfy by definition; against a real-SDK installer it additionally asserts the runtime DLL and the third-party licenses file landed beside the plugin.
 
-**Tier 1–2 (human, still owed):** on a *fresh* machine — one with no NDI software and no dev checkout — download the installer from a draft release, click through SmartScreen, install, restart Resolve, and see the stream in Studio Monitor from a second machine; then uninstall and confirm the Effects Library entry is gone after a restart. That is the ticket's release bar; the automated test above does not replace it.
+**Tier 1–2: confirmed by Matt 2026-09-01** on a fresh second machine — draft-release download, SmartScreen click-through, install, restart, stream visible in Studio Monitor, and (v1.14.1) Timeline (Auto) working live end to end via the fuscript Lua helper with nothing else installed. The one drill not explicitly re-confirmed by hand: uninstall → restart → Effects Library entry gone (CI's acceptance test covers the uninstall mechanics on every push).
 
 ### Timeline (Auto) camera-clip watcher (ticket #25)
 
