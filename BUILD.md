@@ -188,6 +188,15 @@ Plugin cache on Windows: `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OF
 
 `scripts/install_windows.ps1` above is the **dev** install (copy the stage tree). End users get an **Inno Setup 6** installer: [installer/NDIOutput.iss](installer/NDIOutput.iss), compiled by
 
+**Prerequisite — the Inno Setup 6 compiler** (preinstalled on the CI image; on a workstation, [jrsoftware.org/isdl.php](https://jrsoftware.org/isdl.php) or the vendor's GitHub releases). Its own installer takes `/CURRENTUSER`, which matters here: a per-user install needs no admin, and UAC prompts spawned from automation shells on this machine auto-cancel.
+
+```powershell
+.\innosetup-6.7.3.exe /VERYSILENT /CURRENTUSER /SUPPRESSMSGBOXES /NORESTART /SP-
+```
+
+lands `ISCC.exe` in `%LOCALAPPDATA%\Programs\Inno Setup 6` — one of the locations the packaging script searches (PATH, both Program Files, `%LOCALAPPDATA%`, and the HKLM/HKCU uninstall keys), so nothing needs configuring after.
+
+
 ```powershell
 cmake --install build --config Release --prefix stage
 powershell -ExecutionPolicy Bypass -File .\scripts\package_windows_release.ps1
