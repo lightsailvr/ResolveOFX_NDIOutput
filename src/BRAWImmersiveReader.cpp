@@ -223,9 +223,12 @@ bool getStringAttribute(IBlackmagicRawClipImmersiveVideo* immersive,
 // CreateBlackmagicRawFactoryInstance tries exe-relative "BlackmagicRawAPI\"
 // then the exe's own folder — inside Resolve the latter is
 // <Resolve dir>\BlackmagicRawAPI.dll, Resolve's shipped copy, so user
-// machines need no separate Blackmagic install. The explicit paths only
-// matter to standalone processes (the unit-test binary): the installed
-// Blackmagic RAW SDK, then a default-location Resolve.
+// machines need no separate Blackmagic install. The explicit paths exist
+// for standalone processes (the unit-test binary): the installed Blackmagic
+// RAW SDK, then a default-location Resolve. Inside Resolve they engage only
+// if the host's own copy is missing or unloadable — a broken install —
+// where a separately-installed SDK of a different version beats losing the
+// feature (metadata-only reads; the attribute API is stable across 5.x).
 IBlackmagicRawFactory* createFactory()
 {
     IBlackmagicRawFactory* factory = CreateBlackmagicRawFactoryInstance();

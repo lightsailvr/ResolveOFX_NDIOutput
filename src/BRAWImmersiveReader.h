@@ -11,10 +11,10 @@
   runtime from the host application's own copy — on macOS
   BlackmagicRawAPI.framework out of the host bundle, on Windows
   BlackmagicRawAPI.dll beside the host exe — inside Resolve that is Resolve's
-  shipped copy, so the plugin ships no Blackmagic binaries and can never skew
-  versions against the host. Outside Resolve (the unit-test binary, say) it
-  falls back to the installed Blackmagic RAW SDK, and fails soft when neither
-  exists.
+  shipped copy, so the plugin ships no Blackmagic binaries and, on that
+  primary path, cannot skew versions against the host. When the host carries
+  no copy (the unit-test binary, or a broken install) it falls back to the
+  installed Blackmagic RAW SDK, and fails soft when nothing resolves.
 
   Metadata-only: opening a clip parses headers — no frame decode, no GPU use,
   instant even on multi-GB media. Call it from the same main-thread parameter

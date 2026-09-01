@@ -17,6 +17,8 @@
 #include "BRAWImmersiveReader.h"
 #include "BRAWLensMap.h"
 
+#include <windows.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -34,7 +36,8 @@ static void expectTrue(bool actual, const char* name)
 }
 
 // Missing file: whether or not a BRAW runtime loads, the reader must say no
-// softly. jsonOut must stay clear of stale data on failure paths.
+// softly. jsonOut is written on success only — a failure must not disturb the
+// caller's buffer (same contract as the macOS half).
 static void testNonexistentPath()
 {
     std::string json = "sentinel", error;
@@ -42,6 +45,7 @@ static void testNonexistentPath()
         "Z:\\definitely\\not\\here\\missing_clip.braw", &json, nullptr, nullptr, &error);
     expectTrue(!ok, "nonexistent path returns false");
     expectTrue(!error.empty(), "nonexistent path yields an error message");
+    expectTrue(json == "sentinel", "failure leaves jsonOut untouched");
     std::printf("     (error: %s)\n", error.c_str());
 }
 
@@ -50,12 +54,13 @@ static void testNonexistentPath()
 // false + error, no crash.
 static void testGarbageFile()
 {
-    char path[L_tmpnam_s + 8] = {0};
-    if (tmpnam_s(path, sizeof(path)) != 0) {
-        expectTrue(false, "tmpnam_s produced a scratch path");
+    char tempDir[MAX_PATH] = {0};
+    if (GetTempPathA(sizeof(tempDir), tempDir) == 0) {
+        expectTrue(false, "GetTempPathA produced a scratch directory");
         return;
     }
-    std::string braw = std::string(path) + ".braw";
+    // Deterministic name: a leftover from a killed run just gets overwritten.
+    std::string braw = std::string(tempDir) + "ndi_test_braw_reader_garbage.braw";
     FILE* f = nullptr;
     if (fopen_s(&f, braw.c_str(), "wb") != 0 || !f) {
         expectTrue(false, "scratch .braw is writable");
