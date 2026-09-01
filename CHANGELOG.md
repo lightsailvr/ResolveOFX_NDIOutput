@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.14.1] - 2026-09-01
 
-Unified macOS + Windows tree. The Windows build is a testing build (not yet a public release — see BUILD.md for the release-bar items still owed).
+First release for **Windows** alongside macOS — one codebase, one version, per-platform installers. Windows build: NVIDIA GPUs get the CUDA-native pipeline (verified through 8K stereo playback); other GPUs fall back to the CPU path (HD/UHD-viable — an OpenCL backend for full-resolution AMD/Intel support is deferred until there is demand). **x64 only — Windows on ARM is not supported** (no CUDA exists for it). The Windows installer is not code-signed; see the SmartScreen note in the install section below.
 
 ### Added
 - **Windows installer** (ticket #23): Inno Setup installer to `C:\Program Files\Common Files\OFX\Plugins`, Add-or-Remove-Programs entry, `/VERYSILENT` fleet deployment, NDI attribution readme and third-party licenses beside the binaries. Ships unsigned with the SmartScreen "More info → Run anyway" flow documented. Release flow attaches installer + bare-bundle zip + `SHA256SUMS-Windows.txt` next to the macOS artifacts.
