@@ -5,6 +5,11 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.1] - 2026-09-01
+
+### Fixed
+- **Timeline (Auto) no longer dies silently on Macs without the Xcode Command Line Tools** (#34): the camera-clip watcher used to spawn `/usr/bin/python3`, which on a stock Mac is Apple's CLT shim — it exits immediately, so the helper looped every 30 s with nothing in the log. The watcher now runs a Lua helper under Resolve's own bundled script interpreter (`fuscript`), so nothing needs installing; the Python helper remains an automatic fallback that resolves a real interpreter (Xcode developer dir or Homebrew) and never the shim. When no interpreter exists at all the log names the problem once instead of looping, and a dead helper's exit status is logged.
+
 ## [1.14.0] - 2026-08-30
 
 ### Changed

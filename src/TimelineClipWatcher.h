@@ -7,15 +7,20 @@
   playhead right now?" so the camera-metadata projection can follow the
   timeline across multi-camera edits without a manual pick.
 
-  Mechanism: Resolve's scripting API is only reachable as a Python extension
-  (fusionscript.dylib), so the plugin spawns ONE long-running helper
-  (src/ndi_timeline_watch.py, bundled in Contents/Resources) that polls
-  GetCurrentTimeline().GetCurrentVideoItem() ~2x/s and prints the clip path
-  per poll; a reader thread here dedupes and fans changes out through the
-  registered callback. Requires Resolve Studio's external-scripting
-  preference and a python3 the bundled fusionscript accepts (the macOS
-  system python works — verified live 2026-08-30); everything fails soft
-  into "no path" + a log line, and manual mode remains available.
+  Mechanism: Resolve's scripting API is only reachable from a script
+  interpreter (fusionscript), so the plugin spawns ONE long-running helper
+  that polls GetCurrentTimeline().GetCurrentVideoItem() ~2x/s and prints the
+  clip path per poll; a reader thread here dedupes and fans changes out
+  through the registered callback. The helper is src/ndi_timeline_watch.lua
+  under Resolve's OWN bundled interpreter (Contents/Libraries/Fusion/fuscript
+  -q -l lua) — nothing to install (issue #34: the OS-shipped /usr/bin/python3
+  is Apple's CLT shim, which spawns and dies silently). The Python helper
+  (src/ndi_timeline_watch.py) remains the fallback when fuscript is missing,
+  run with the developer-dir or Homebrew python3 — never the shim. Both ride
+  in Contents/Resources. Requires Resolve Studio's external-scripting
+  preference; everything fails soft into "no path" + a log line (a dead
+  helper's exit status included), and manual mode remains available. The
+  pure discovery/spawn pieces are the tested seam src/MacTimelineWatch.h.
 
   Threading: the change callback fires on the watcher's reader thread —
   callees synchronize their own state (the plugin swaps maps under the same
