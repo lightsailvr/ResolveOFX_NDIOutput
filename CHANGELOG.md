@@ -5,6 +5,19 @@ All notable changes to the NDI Advanced Output Plugin will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.1] - 2026-09-01
+
+First release for **Windows** alongside macOS — one codebase, one version, per-platform installers. Windows build: NVIDIA GPUs get the CUDA-native pipeline (verified through 8K stereo playback); other GPUs fall back to the CPU path (HD/UHD-viable — an OpenCL backend for full-resolution AMD/Intel support is deferred until there is demand). **x64 only — Windows on ARM is not supported** (no CUDA exists for it). The Windows installer is not code-signed; see the SmartScreen note in the install section below.
+
+### Added
+- **Windows installer** (ticket #23): Inno Setup installer to `C:\Program Files\Common Files\OFX\Plugins`, Add-or-Remove-Programs entry, `/VERYSILENT` fleet deployment, NDI attribution readme and third-party licenses beside the binaries. Ships unsigned with the SmartScreen "More info → Run anyway" flow documented. Release flow attaches installer + bare-bundle zip + `SHA256SUMS-Windows.txt` next to the macOS artifacts.
+- **Timeline (Auto) is one-click on both platforms**: the camera-clip watcher now runs a Lua helper under Resolve's own bundled script interpreter (`fuscript`) — no Python install required. The Python helper remains an automatic fallback.
+
+### Fixed
+- **macOS: Timeline (Auto) no longer dies silently on Macs without the Xcode Command Line Tools** (#34): the watcher used to spawn `/usr/bin/python3`, which on a stock Mac is Apple's CLT shim — it exits immediately, so the helper looped every 30 s with nothing in the log. The Python fallback now resolves a real interpreter (Xcode developer dir or Homebrew), probes it once, and never the shim. When no interpreter exists at all the log names the problem once instead of looping, and a dead helper's exit status is logged.
+- **Windows: watcher no longer loops silently on machines without Python**: discovery rejects the Microsoft Store's `python.exe` App Execution Alias stub, and the helper-exit log now carries the child's exit code.
+
+
 ## [1.14.0] - 2026-08-30
 
 ### Changed

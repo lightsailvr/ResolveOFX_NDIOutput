@@ -7,15 +7,27 @@
   playhead right now?" so the camera-metadata projection can follow the
   timeline across multi-camera edits without a manual pick.
 
-  Mechanism: Resolve's scripting API is only reachable as a Python extension
-  (fusionscript.dylib), so the plugin spawns ONE long-running helper
-  (src/ndi_timeline_watch.py, bundled in Contents/Resources) that polls
-  GetCurrentTimeline().GetCurrentVideoItem() ~2x/s and prints the clip path
-  per poll; a reader thread here dedupes and fans changes out through the
-  registered callback. Requires Resolve Studio's external-scripting
-  preference and a python3 the bundled fusionscript accepts (the macOS
-  system python works — verified live 2026-08-30); everything fails soft
-  into "no path" + a log line, and manual mode remains available.
+  Mechanism: Resolve's scripting API is only reachable from a script
+  interpreter (fusionscript), so the plugin spawns ONE long-running helper
+  that polls GetCurrentTimeline().GetCurrentVideoItem() ~2x/s and prints the
+  clip path per poll; a reader thread here dedupes and fans changes out
+  through the registered callback. The helper is src/ndi_timeline_watch.lua
+  under Resolve's OWN bundled interpreter (`fuscript -q -l lua`: macOS
+  Contents/Libraries/Fusion/fuscript, Windows fuscript.exe beside Resolve.exe)
+  — nothing to install (issue #34: both OSes ship a python at the canonical
+  path that isn't one — Apple's CLT shim, the Store alias stub — which spawns
+  and dies silently). The Python helper (src/ndi_timeline_watch.py) remains
+  the fallback when fuscript is missing (macOS: developer-dir or Homebrew
+  python3, never the shim; Windows: PEP 514 registry then PATH — see
+  BUILD.md). Both ride in Contents/Resources. Requires Resolve Studio's external-scripting
+  preference; everything fails soft into "no path" + a log line (a dead
+  helper's exit status included), and manual mode remains available. 
+
+  Per-platform implementations of this one API (ticket #25): macOS
+  posix_spawn/pipe in src/TimelineClipWatcher.cpp, Windows CreateProcessW/
+  anonymous pipe in src/WinTimelineWatch.cpp (spawn + discovery seam in
+  src/WinTimelineWatch.h; the macOS seam is src/MacTimelineWatch.h). NDI_TIMELINE_WATCH gates the plugin's call sites,
+  replacing the __APPLE__ checks from the macOS-only era.
 
   Threading: the change callback fires on the watcher's reader thread —
   callees synchronize their own state (the plugin swaps maps under the same
@@ -24,7 +36,11 @@
   the first callback it is given.
 */
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
+#define NDI_TIMELINE_WATCH 1
+#endif
+
+#ifdef NDI_TIMELINE_WATCH
 
 #include <functional>
 #include <string>
@@ -48,6 +64,6 @@ void shutdown();
 
 } // namespace ndi_timelinewatch
 
-#endif // __APPLE__
+#endif // NDI_TIMELINE_WATCH
 
 #endif

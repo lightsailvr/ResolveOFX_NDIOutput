@@ -1,0 +1,97 @@
+# Windows compile-proof CI (tickets #20/#22/#23; spec decision 9): configure +
+# build the plugin — including the CUDA translation units — under MSVC + CUDA
+# Toolkit 12.9, run the portable unit suite, upload a spec-correct bundle tree,
+# then build the Inno Setup installer and drive it through a real silent
+# install/uninstall cycle on the runner. Hosted runners have no GPU and no Resolve, so test_cuda_downscale
+# skips itself (compile-proof only) and Tiers 1-2 of the testing loop stay
+# human (BUILD.md, Windows section).
+#
+# The NDI Advanced SDK is access-gated and never lives in CI: the build links
+# a stub import library generated from the checked-in export list
+# (third_party/ndi/), so the artifact proves compile + link, not streaming.
+name: windows
+
+on:
+  push:
+    branches:
+      - dev
+      - master
+      - "feature/**"
+  pull_request:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # nvcc + cudart are what the compile needs; visual_studio_integration
+      # supplies the MSBuild files the VS generator's CUDA toolset loads. The
+      # configure step points CMake straight at the toolkit (-T cuda=...) so
+      # the build never depends on the integration being copied into the VS
+      # installation itself — the same recipe BUILD.md documents for a
+      # workstation without admin rights.
+      - name: Install CUDA Toolkit 12.9 (compile only)
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.9.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
+      - name: Configure (CMake + vcpkg toolchain + CUDA)
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -T "cuda=$env:CUDA_PATH"
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+
+      - name: Build (Release, CUDA included)
+        run: cmake --build build --config Release --parallel
+
+      - name: Run portable unit tests (MSVC)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Stage the OFX bundle tree
+        run: cmake --install build --config Release --prefix stage
+
+      - name: Verify spec bundle layout
+        run: |
+          $ofx = "stage/NDIOutput.ofx.bundle/Contents/Win64/NDIOutput.ofx"
+          if (-not (Test-Path $ofx)) {
+            Write-Error "Bundle layout wrong: $ofx missing"
+            exit 1
+          }
+          Get-ChildItem -Recurse stage | Select-Object FullName
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NDIOutput-win64
+          path: stage/
+          if-no-files-found: error
+
+      # Ticket #23. Inno Setup 6 is preinstalled on the runner image. The
+      # payload here is stub-linked (no NDI SDK in CI), so the artifacts are
+      # named ...-STUB and the packaging script says so out loud — this proves
+      # the installer pipeline, never a shippable build.
+      - name: Build the installer (stub payload)
+        run: >
+          powershell -ExecutionPolicy Bypass -File .\scripts\package_windows_release.ps1
+          -AllowStub
+
+      # The runner is already elevated and has no Resolve, so the full silent
+      # install -> verify layout/attribution/ARP -> silent uninstall -> verify
+      # clean cycle runs here. Tiers 1-2 (fresh machine, Resolve restart,
+      # stream in Studio Monitor) stay human.
+      - name: Installer acceptance test (silent install + uninstall)
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\test_windows_installer.ps1
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NDIOutput-win64-installer
+          path: dist/
+          if-no-files-found: error

@@ -52,10 +52,16 @@ test:
 	./build/test_stream_resolution
 	$(CXX) -Isrc tests/test_stereo_pair.cpp -o build/test_stereo_pair
 	./build/test_stereo_pair
+	$(CXX) -Isrc tests/test_platform_paths.cpp -o build/test_platform_paths
+	./build/test_platform_paths
+	$(CXX) -Isrc tests/test_ndi_loader.cpp -o build/test_ndi_loader
+	./build/test_ndi_loader
 	$(CXX) -Isrc tests/test_stmap.cpp -o build/test_stmap -lz
 	./build/test_stmap
 	$(CXX) -Isrc tests/test_brawmap.cpp -o build/test_brawmap -lz
 	./build/test_brawmap
+	$(CXX) -Isrc tests/test_mac_timeline_watch.cpp -o build/test_mac_timeline_watch
+	./build/test_mac_timeline_watch
 
 # GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
 test-metal: src/MetalGPUAcceleration.o
@@ -92,6 +98,7 @@ bundle_structure:
 	cp BaldavengerOFX.NDIOutput.png $(BUNDLE_NAME)/Contents/Resources/
 	cp Info.plist $(BUNDLE_NAME)/Contents/
 	cp src/ndi_timeline_watch.py $(BUNDLE_NAME)/Contents/Resources/
+	cp src/ndi_timeline_watch.lua $(BUNDLE_NAME)/Contents/Resources/
 
 # Installation
 install: $(BUNDLE_EXECUTABLE)
