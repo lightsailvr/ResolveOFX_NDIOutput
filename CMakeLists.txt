@@ -170,9 +170,10 @@ target_include_directories(NDIOutput PRIVATE
     src
     "${NDI_INCLUDE_DIR}")
 target_link_libraries(NDIOutput PRIVATE ZLIB::ZLIB)
-# ole32 + shell32: the browse buttons' IFileOpenDialog (ticket #24,
-# src/WinFileDialog.cpp). System DLLs, so no loader-trap concern.
-target_link_libraries(NDIOutput PRIVATE ole32 shell32)
+# ole32 + shell32 + user32: the browse buttons' IFileOpenDialog and its
+# GUI-thread guard (ticket #24, src/WinFileDialog.cpp). System DLLs, so no
+# loader-trap concern.
+target_link_libraries(NDIOutput PRIVATE ole32 shell32 user32)
 
 # Delay-load the NDI DLL (spec decision 12): Windows' loader never searches a
 # DLL's own folder for load-time imports of another DLL, so a static import

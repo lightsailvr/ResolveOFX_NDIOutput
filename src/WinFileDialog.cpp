@@ -26,7 +26,11 @@ bool win_open_file_dialog(const char* message, const char* extension,
     using ndi_path::detail::utf8ToWide;
     using ndi_path::detail::wideToUtf8;
 
-    if (!outPath || outPathSize == 0) {
+    // GUI thread only — the analog of the mac dialog's main-thread guard: a
+    // modal dialog on a thread with no message pump would hang, and browse
+    // clicks arrive on Resolve's UI thread anyway. IsGUIThread(FALSE) asks
+    // without converting the thread.
+    if (!outPath || outPathSize == 0 || !IsGUIThread(FALSE)) {
         return false;
     }
 
@@ -41,6 +45,14 @@ bool win_open_file_dialog(const char* message, const char* extension,
     IFileOpenDialog* dialog = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                    IID_PPV_ARGS(&dialog)))) {
+        // Filesystem results only: without this a pick from a virtual
+        // location (a library root, a phone) has no SIGDN_FILESYSPATH and
+        // would read as a silent cancel.
+        FILEOPENDIALOGOPTIONS options = 0;
+        if (SUCCEEDED(dialog->GetOptions(&options))) {
+            dialog->SetOptions(options | FOS_FORCEFILESYSTEM);
+        }
+
         std::wstring wide;
         if (message && *message && utf8ToWide(message, &wide)) {
             dialog->SetTitle(wide.c_str());

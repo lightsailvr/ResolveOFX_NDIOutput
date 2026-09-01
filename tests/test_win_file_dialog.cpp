@@ -3,8 +3,9 @@
 // type filter strings, and the truncation-safe copy-out that enforces the
 // "failure leaves outPath untouched" contract. The COM half
 // (win_open_file_dialog itself) needs a user and a desktop, so the Tier 1-2
-// loop covers it; everything here runs headless on any platform.
-// Build & run: ctest (Windows)
+// loop covers it; everything here runs headless — no COM, no window.
+// Build & run: ctest (Windows only — the macOS Makefile doesn't build it,
+// since the dialog these helpers serve exists only in the Windows plugin)
 
 #include "WinFileDialog.h"
 

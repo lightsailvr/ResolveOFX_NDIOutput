@@ -65,9 +65,10 @@ inline bool copyPathOut(const std::string& utf8, char* outPath, size_t outPathSi
 // Same contract as mac_open_file_dialog: initialPath may be NULL/empty; when
 // set, the dialog opens in its directory. Returns true and fills outPath
 // (UTF-8) only when the user picks a file; cancel and every failure return
-// false with outPath untouched. Runs a modal dialog on the calling thread —
-// Resolve delivers browse-button edits on its UI thread, which is where a
-// modal dialog belongs.
+// false with outPath untouched. GUI threads only (the analog of the mac
+// dialog's main-thread guard): returns false immediately from a thread with
+// no message pump — Resolve delivers browse-button edits on its UI thread,
+// which is where a modal dialog belongs.
 bool win_open_file_dialog(const char* message, const char* extension,
                           const char* initialPath, char* outPath, size_t outPathSize);
 

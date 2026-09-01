@@ -3,7 +3,7 @@
 Canonical instructions for building, installing, and verifying the NDI Output OFX plugin. If a build change lands, this file must be updated in the same PR.
 
 - **macOS** — primary platform, working (Metal GPU path)
-- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline in the build with kernel identity tests (ticket #22); installer pending (see [status](#windows--status-cuda-gpu-native-pipeline-in-the-build-ticket-22-installer-pending-ticket-23))
+- **Windows** — port in progress on branch `windows-port`: CUDA GPU-native pipeline with kernel identity tests (ticket #22) and native Browse dialogs (ticket #24) in the build; installer pending (see [status](#windows--status-cuda-gpu-native-pipeline-ticket-22-and-native-browse-dialogs-ticket-24-in-the-build-installer-pending-ticket-23))
 
 ---
 
@@ -151,7 +151,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ctest` runs the same portable unit suite as `make test` on macOS — including `test_platform_paths` (UTF-8→UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus `test_plugin_delayload`, Windows-only: it loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
+`ctest` runs the portable unit suite from `make test` on macOS — including `test_platform_paths` (UTF-8⇄UTF-16 path shims) and `test_ndi_loader` (NDI runtime path derivation) — plus two Windows-side additions the Makefile doesn't build: `test_win_file_dialog` (the browse dialog's pure logic, ticket #24) and `test_plugin_delayload`, which loads the built `.ofx` with a System32-only import search (what Resolve's plugin scanner amounts to), so any stray load-time import fails Tier 0 instead of silently emptying the Effects Library. CMake refuses to configure if `VERSION` and `kPluginVersionString` in `src/NDIOutputPlugin.cpp` disagree — run `scripts/set_version.sh`, never edit either by hand.
 
 `test_cuda_downscale` (ticket #22) is the Windows counterpart of `make test-metal`: it holds the fused CUDA kernels **byte-identical** to the shared CPU references (`ndi_stream::downscaleRGBABox`, `ndi_stmap::warpRGBABox`, the flipping converters), including identity-STMap ≡ plain-downscale, plus the slot ring and passthrough/readback contracts. It needs a CUDA device — it runs for real on the workstation and skips cleanly on GPU-less machines (hosted CI compiles it, which is CI's whole job here). Byte-identity leans on `--fmad=false` for the CUDA translation units (CMakeLists.txt) — don't "optimize" that flag away.
 
