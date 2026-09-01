@@ -1,23 +1,30 @@
 -- Timeline clip watcher helper, Lua flavor (one-click Timeline (Auto);
--- supersedes the Python helper as the primary path on Windows).
+-- supersedes the Python helper as the primary path on macOS and Windows).
 --
--- Runs under Resolve's OWN bundled script interpreter (fuscript.exe, beside
+-- Runs under Resolve's OWN bundled script interpreter (fuscript: macOS
+-- Contents/Libraries/Fusion/fuscript, Windows fuscript.exe beside
 -- Resolve.exe), so it needs no Python - or anything else - installed. The
 -- Python helper (ndi_timeline_watch.py) remains the documented fallback for
--- hosts without fuscript. Why not Python: Resolve's fusionscript.dll only
--- binds a PEP 514 registry-REGISTERED interpreter - never the process that
--- loaded it - so a bundled/embedded Python can never work (LEARNINGS
--- 2026-09-01, the fusionscript registry findings).
+-- hosts without fuscript. Why not Python: both OSes ship a python at the
+-- canonical path that is not one (issue #34 - Apple's /usr/bin/python3 CLT
+-- shim, the Windows Store alias stub), and on Windows Resolve's
+-- fusionscript.dll only binds a PEP 514 registry-REGISTERED interpreter -
+-- never the process that loaded it - so a bundled/embedded Python can never
+-- work (LEARNINGS 2026-09-01, the fusionscript registry findings).
 --
--- Protocol (read by src/WinTimelineWatch.cpp), identical to the Python
--- helper: one line per poll (~2/s); a line starting with '!' is a status
--- message for the plugin log; any other line is the current clip's file
--- path ('' = none). Printing every poll doubles as a liveness heartbeat.
--- Exits when the reader hangs up (stdout write fails => plugin/Resolve gone).
+-- Protocol (read by src/TimelineClipWatcher.cpp on macOS and
+-- src/WinTimelineWatch.cpp on Windows), identical to the Python helper: one
+-- line per poll (~2/s); a line starting with '!' is a status message for the
+-- plugin log; any other line is the current clip's file path ('' = none).
+-- Printing every poll doubles as a liveness heartbeat. Exits when the reader
+-- hangs up (stdout write fails => plugin/Resolve gone).
 
 local POLL_SECONDS = 0.5
 
 local function say(line)
+  -- One protocol line per call: a multi-line error text would otherwise be
+  -- read back as clip paths.
+  line = tostring(line):gsub("[\r\n]+", " ")
   local ok = io.stdout:write(line, "\n")
   if not ok then os.exit(0) end   -- reader hung up: plugin is gone
   io.stdout:flush()
