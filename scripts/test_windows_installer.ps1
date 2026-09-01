@@ -25,13 +25,15 @@ $version = (Get-Content (Join-Path $repo "VERSION") -Raw).Trim()
 
 if ($Installer -eq "") {
     # A real-SDK build if one was packaged, otherwise the stub-linked build CI
-    # produces - the install/uninstall contract is identical either way.
-    foreach ($n in @("NDIOutput-$version-Windows-x64.exe",
-                     "NDIOutput-$version-Windows-x64-STUB.exe")) {
-        $c = Join-Path $repo "dist\v$version\$n"
-        if (Test-Path $c) { $Installer = $c; break }
-        if ($Installer -eq "") { $Installer = $c }   # first candidate names the error
-    }
+    # produces - the install/uninstall contract is identical either way, but a
+    # real build additionally has to carry the NDI runtime and its licenses.
+    $candidates = @("NDIOutput-$version-Windows-x64.exe",
+                    "NDIOutput-$version-Windows-x64-STUB.exe") |
+                  ForEach-Object { Join-Path $repo "dist\v$version\$_" }
+    $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    # Falling back to the first candidate makes the "not found" error name the
+    # artifact a release build would have produced.
+    $Installer = if ($found) { $found } else { $candidates[0] }
 }
 if (-not (Test-Path $Installer)) {
     Write-Error ("No installer at $Installer - build one first: " +
@@ -82,6 +84,30 @@ function Get-ArpEntry {
     return $null
 }
 
+# ------------------------------------------- refusal while Resolve runs ----
+# The fleet-deployment contract documented in README.md and the release notes:
+# with Resolve running, a silent install exits non-zero and installs nothing
+# rather than touching a loaded plugin. The installer looks Resolve up by image
+# name, so a copy of ping.exe named Resolve.exe stands in for it.
+$fakeDir = Join-Path $env:TEMP "ndi-fake-resolve"
+$fake = Join-Path $fakeDir "Resolve.exe"
+New-Item -ItemType Directory -Force $fakeDir | Out-Null
+Copy-Item (Join-Path $env:SystemRoot "System32\PING.EXE") $fake -Force
+$fakeProc = Start-Process -FilePath $fake -ArgumentList "-t", "127.0.0.1" `
+    -PassThru -WindowStyle Hidden
+try {
+    Write-Host "Silent install with a running 'Resolve.exe' (must refuse):"
+    $r = Start-Process -FilePath $Installer -Wait -PassThru `
+        -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+    Check "install refused while Resolve runs (exit $($r.ExitCode), expected non-zero)" `
+        ($r.ExitCode -ne 0)
+    Check "refused install left nothing behind" (-not (Test-Path $bundle))
+} finally {
+    Stop-Process -Id $fakeProc.Id -Force -ErrorAction SilentlyContinue
+    Wait-Process -Id $fakeProc.Id -Timeout 15 -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $fakeDir -ErrorAction SilentlyContinue
+}
+
 # ----------------------------------------------------------------- install ----
 $log = Join-Path $env:TEMP "ndioutput-install.log"
 Write-Host "Silent install: $Installer"
@@ -95,6 +121,19 @@ $watcher = Join-Path $bundle "Contents\Resources\ndi_timeline_watch.py"
 Check "plugin at Contents\Win64\NDIOutput.ofx" (Test-Path $ofx)
 Check "timeline watcher staged in Contents\Resources" (Test-Path $watcher)
 Check "attribution readme beside the payload" (Test-Path $readme)
+
+# A release build must additionally land the NDI runtime and the third-party
+# licenses file beside the binary (spec decision 13). A -STUB installer was
+# packaged without an SDK by definition, so those are not expected there.
+$isStubBuild = (Split-Path -Leaf $Installer) -like "*-STUB.exe"
+if ($isStubBuild) {
+    Write-Host "  [skip] NDI runtime + licenses file (STUB installer - built without the SDK)"
+} else {
+    Check "NDI runtime DLL installed beside the plugin" `
+        (Test-Path (Join-Path $bundle "Contents\Win64\Processing.NDI.Lib.Advanced.x64.dll"))
+    Check "NDI third-party licenses file installed beside the plugin" `
+        (Test-Path (Join-Path $bundle "Contents\Win64\Processing.NDI.Lib.Licenses.txt"))
+}
 
 if (Test-Path $readme) {
     $text = Get-Content $readme -Raw
@@ -124,6 +163,8 @@ if ($arp -and $arp.UninstallString) {
         Start-Sleep -Milliseconds 500
     }
     Check "uninstall removes the bundle tree" (-not (Test-Path $bundle))
+    # Its own budget: a slow payload removal must not starve this poll.
+    $deadline = (Get-Date).AddSeconds(90)
     while ((Get-ArpEntry) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
     Check "uninstall removes the ARP entry" ($null -eq (Get-ArpEntry))
 } else {

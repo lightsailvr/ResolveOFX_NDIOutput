@@ -22,8 +22,9 @@ unreachable from other machines (the "listed but black" symptom).
 
 Requirements
 ------------
-DaVinci Resolve 17 or later (tested on 20) on 64-bit Windows 10/11. Nothing
-else is required: the NDI runtime ships inside the plugin bundle.
+DaVinci Resolve 17 or later (tested on 20) on 64-bit x64 Windows 10/11 -
+Windows on ARM is not supported. Nothing else is required: the NDI runtime
+ships inside the plugin bundle.
 
 
 Unsigned installer / SmartScreen
@@ -39,6 +40,9 @@ against SHA256SUMS-Windows.txt published with the release:
 Silent install (fleet deployment)
 ---------------------------------
   NDIOutput-<version>-Windows-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+
+Push it to machines with Resolve closed: with Resolve running the installer
+exits non-zero and installs nothing rather than touching a loaded plugin.
 
 Uninstall from "Add or Remove Programs", or run the registered uninstaller with
 the same switches. DaVinci Resolve must be closed for both — a loaded plugin

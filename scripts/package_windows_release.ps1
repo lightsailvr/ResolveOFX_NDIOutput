@@ -133,12 +133,15 @@ Remove-Item -Recurse -Force $zipStage
 Write-Host "  zipped bundle: $zipOut"
 
 # --------------------------------------------------------------- checksums ----
-$sums = Join-Path $OutDir "SHA256SUMS-Windows.txt"
+$sums = Join-Path (Resolve-Path $OutDir).Path "SHA256SUMS-Windows.txt"
 $lines = foreach ($f in @($exeOut, $zipOut)) {
     "{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $f)
 }
-# ASCII, not utf8: PowerShell 5.1 would prepend a BOM that trips `sha256sum -c`.
-Set-Content -Path $sums -Value $lines -Encoding ascii
+# Written by hand rather than Set-Content: this file is consumed by `sha256sum -c`
+# on other platforms, which chokes on both a BOM and the CRLF line endings
+# PowerShell would otherwise write (the macOS SHA256SUMS.txt is plain LF ASCII).
+[System.IO.File]::WriteAllText($sums, ($lines -join "`n") + "`n",
+    (New-Object System.Text.ASCIIEncoding))
 Write-Host "  checksums: $sums"
 
 Write-Host ""

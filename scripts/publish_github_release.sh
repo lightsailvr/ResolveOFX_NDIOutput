@@ -49,6 +49,12 @@ WIN_ZIP="$DIST/NDIOutput-$VERSION-Windows-x64.zip"
 WIN_SUMS="$DIST/SHA256SUMS-Windows.txt"
 WIN_FILES=()
 win_present=0
+# A STUB build is the CI pipeline proof — it loads but never streams. Checked
+# before the count so its presence reports the real problem, not "1 of 3".
+if ls "$DIST"/*-STUB.* >/dev/null 2>&1; then
+    echo "STUB artifacts present in $DIST — those never ship. Remove them and package against the real NDI SDK."
+    exit 1
+fi
 for f in "$WIN_EXE" "$WIN_ZIP" "$WIN_SUMS"; do
     [ -f "$f" ] && win_present=$((win_present + 1))
 done
@@ -63,11 +69,6 @@ else
         [ -f "$f" ] || echo "  missing: $f"
     done
     echo "Copy all three from the Windows machine (scripts/package_windows_release.ps1), or remove them."
-    exit 1
-fi
-# A STUB build is the CI pipeline proof — it loads but never streams.
-if ls "$DIST"/*-STUB.* >/dev/null 2>&1; then
-    echo "STUB artifacts present in $DIST — those never ship. Remove them and package against the real NDI SDK."
     exit 1
 fi
 
@@ -117,7 +118,9 @@ if [ "$win_present" -eq 3 ]; then
 
 ### Install — Windows
 
-Download `NDIOutput-*-Windows-x64.exe` and run it (quit DaVinci Resolve first — the installer refuses to replace a loaded plugin). Restart Resolve, then find the plugin on the Color page under **OpenFX → LSVR → NDIOutput**. Requires 64-bit Windows 10/11; the NDI runtime is included.
+Download `NDIOutput-*-Windows-x64.exe` and run it (quit DaVinci Resolve first — the installer refuses to replace a loaded plugin). Restart Resolve, then find the plugin on the Color page under **OpenFX → LSVR → NDIOutput**. Requires 64-bit **x64** Windows 10/11 — **Windows on ARM is not supported**. The NDI runtime is included.
+
+The GPU-native path needs an NVIDIA GPU; on other hardware the plugin falls back to the CPU path automatically, which carries a lower practical resolution ceiling (use the Resolution control to stream Half or Quarter).
 
 **This installer is not code-signed**, so Windows SmartScreen shows *"Windows protected your PC"*. Click **More info → Run anyway**. To verify the download instead of trusting a signature, compare its SHA-256 against `SHA256SUMS-Windows.txt`:
 
@@ -125,7 +128,7 @@ Download `NDIOutput-*-Windows-x64.exe` and run it (quit DaVinci Resolve first �
 Get-FileHash .\NDIOutput-<version>-Windows-x64.exe -Algorithm SHA256
 ```
 
-Silent install for fleet deployment: `NDIOutput-<version>-Windows-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`. Uninstall from **Add or Remove Programs**.
+Silent install for fleet deployment: `NDIOutput-<version>-Windows-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`. Push it to machines with Resolve closed — with Resolve running the installer exits non-zero and installs nothing rather than touching a loaded plugin. Uninstall from **Add or Remove Programs**.
 
 The `.zip` contains the bare plugin bundle for manual installs into `C:\Program Files\Common Files\OFX\Plugins`.
 
