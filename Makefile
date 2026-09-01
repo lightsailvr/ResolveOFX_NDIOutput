@@ -56,6 +56,8 @@ test:
 	./build/test_stmap
 	$(CXX) -Isrc tests/test_brawmap.cpp -o build/test_brawmap -lz
 	./build/test_brawmap
+	$(CXX) -Isrc tests/test_mac_timeline_watch.cpp -o build/test_mac_timeline_watch
+	./build/test_mac_timeline_watch
 
 # GPU kernel correctness tests (needs a Metal device, but no Resolve or NDI SDK)
 test-metal: src/MetalGPUAcceleration.o
@@ -92,6 +94,7 @@ bundle_structure:
 	cp BaldavengerOFX.NDIOutput.png $(BUNDLE_NAME)/Contents/Resources/
 	cp Info.plist $(BUNDLE_NAME)/Contents/
 	cp src/ndi_timeline_watch.py $(BUNDLE_NAME)/Contents/Resources/
+	cp src/ndi_timeline_watch.lua $(BUNDLE_NAME)/Contents/Resources/
 
 # Installation
 install: $(BUNDLE_EXECUTABLE)

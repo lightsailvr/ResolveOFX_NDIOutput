@@ -4,12 +4,13 @@
 
 #include "TimelineClipWatcher.h"
 
+#include "MacTimelineWatch.h"  // fuscript/python discovery + spawn seam (tested)
+
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <libgen.h>
+#include <mach-o/dyld.h>
 #include <os/log.h>
 #include <signal.h>
-#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -20,10 +21,9 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #define WATCH_LOG(str) os_log(OS_LOG_DEFAULT, "NDI Plugin: TimelineWatch: %{public}s", str)
-
-extern char** environ;
 
 namespace ndi_timelinewatch {
 
@@ -62,16 +62,65 @@ std::string bundleResourcePath(const char* name)
     return std::string();
 }
 
+// Resolve's executable (this code runs inside its process) — the anchor for
+// finding the bundled fuscript in any install directory. Empty on failure.
+std::string hostExecutablePath()
+{
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);  // reports the needed size
+    std::string buf(size + 1, '\0');
+    if (_NSGetExecutablePath(&buf[0], &size) != 0) {
+        return std::string();
+    }
+    buf.resize(strlen(buf.c_str()));
+    char resolved[PATH_MAX];
+    if (realpath(buf.c_str(), resolved) != nullptr) {
+        return std::string(resolved);
+    }
+    return buf;
+}
+
+bool isExecutableFile(const std::string& path)
+{
+    struct stat st;
+    return !path.empty() && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+           access(path.c_str(), X_OK) == 0;
+}
+
+// Primary interpreter: Resolve's own bundled fuscript (Contents/Libraries/
+// Fusion/fuscript) — nothing to install, and immune to the OS-shipped python
+// stubs of issue #34. Located from the host executable; the stock install
+// path is the fallback for a standalone harness or an odd host layout.
+std::string fuscriptPath()
+{
+    static const char* kDefaultFuscriptPath =
+        "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fuscript";
+    const std::string fromHost =
+        ndi_timelinewatch_mac::fuscriptPathForHostExecutable(hostExecutablePath());
+    if (isExecutableFile(fromHost)) {
+        return fromHost;
+    }
+    if (isExecutableFile(kDefaultFuscriptPath)) {
+        return kDefaultFuscriptPath;
+    }
+    return std::string();
+}
+
+// Fallback interpreter for the Python helper, only when fuscript is missing.
+// Never /usr/bin/python3: that is Apple's libxcselect shim, which without the
+// Command Line Tools prints a note to stderr and exits — the silent respawn
+// loop of issue #34 (and it can pop the CLT install dialog). The seam
+// resolves the developer-dir python the way the shim would, then Homebrew.
 std::string pythonPath()
 {
-    static const char* kCandidates[] = {
-        "/usr/bin/python3",
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3",
-    };
-    for (const char* candidate : kCandidates) {
-        struct stat st;
-        if (stat(candidate, &st) == 0 && (st.st_mode & S_IXUSR)) {
+    const char* developerDirEnv = getenv("DEVELOPER_DIR");
+    char link[PATH_MAX];
+    const ssize_t n = readlink("/var/db/xcode_select_link", link, sizeof(link) - 1);
+    const std::string xcodeSelectLink = n > 0 ? std::string(link, static_cast<size_t>(n))
+                                              : std::string();
+    for (const std::string& candidate : ndi_timelinewatch_mac::python3CandidatePaths(
+             developerDirEnv ? developerDirEnv : "", xcodeSelectLink)) {
+        if (isExecutableFile(candidate)) {
             return candidate;
         }
     }
@@ -88,47 +137,46 @@ void setHealthLocked(bool ok, const std::string& detail)
 // detail already set (caller holds gMutex).
 bool spawnHelperLocked()
 {
-    const std::string script = bundleResourcePath("ndi_timeline_watch.py");
-    if (script.empty()) {
-        setHealthLocked(false, "helper script missing from the plugin bundle's Resources");
-        return false;
-    }
-    const std::string python = pythonPath();
-    if (python.empty()) {
-        setHealthLocked(false, "no python3 found (/usr/bin/python3) — install the "
-                               "Xcode Command Line Tools or set a Manual Path clip");
-        return false;
+    std::vector<std::string> argv;
+    std::string chain;
+    const std::string fuscript = fuscriptPath();
+    const std::string luaScript = bundleResourcePath("ndi_timeline_watch.lua");
+    if (!fuscript.empty() && !luaScript.empty()) {
+        // -q suppresses the banner fuscript writes to stdout, which the line
+        // protocol would otherwise read as clip paths; -l lua selects the
+        // interpreter (verified against Resolve 20's fuscript, 2026-09-01).
+        argv = {fuscript, "-q", "-l", "lua", luaScript};
+        chain = "fuscript [" + fuscript + "] " + luaScript;
+    } else {
+        // Fallback: the Python helper — a host without fuscript (standalone
+        // test binaries, an exotic Resolve packaging).
+        const std::string script = bundleResourcePath("ndi_timeline_watch.py");
+        if (script.empty()) {
+            setHealthLocked(false, "helper scripts missing from the plugin bundle's Resources");
+            return false;
+        }
+        const std::string python = pythonPath();
+        if (python.empty()) {
+            setHealthLocked(false, "no fuscript in the host app bundle and no python3 (Xcode "
+                                   "Command Line Tools or Homebrew) — reinstall DaVinci Resolve, "
+                                   "run xcode-select --install, or set a Manual Path clip");
+            return false;
+        }
+        argv = {python, script};
+        chain = "python [" + python + "] " + script;
     }
 
-    int fds[2];
-    if (pipe(fds) != 0) {
-        setHealthLocked(false, "pipe() failed");
-        return false;
-    }
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&actions, fds[0]);
-    posix_spawn_file_actions_addclose(&actions, fds[1]);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-
-    const char* argv[] = {python.c_str(), script.c_str(), nullptr};
     pid_t pid = -1;
-    const int rc = posix_spawn(&pid, python.c_str(), &actions, nullptr,
-                               const_cast<char**>(argv), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(fds[1]);
-    if (rc != 0) {
-        close(fds[0]);
-        setHealthLocked(false, std::string("posix_spawn failed: ") + strerror(rc));
+    int fd = -1;
+    std::string error;
+    if (!ndi_timelinewatch_mac::spawnPipedProcess(argv, &pid, &fd, &error)) {
+        setHealthLocked(false, "helper spawn failed: " + error);
         return false;
     }
     gHelperPid = pid;
-    gHelperFd = fds[0];
+    gHelperFd = fd;
     setHealthLocked(false, "helper starting");  // healthy once the first line lands
-    WATCH_LOG(("helper started (" + python + " " + script + ")").c_str());
+    WATCH_LOG(("helper started (" + chain + ")").c_str());
     return true;
 }
 
@@ -220,15 +268,21 @@ void readerLoop()
         {
             std::lock_guard<std::mutex> lock(gMutex);
             gHelperFd = -1;
+            // The exit status is how a dying helper identifies itself — a
+            // stub interpreter dies before its first protocol line, so it is
+            // the only evidence that ever reaches the log (issue #34).
+            std::string exitDetail = "status unknown";
             if (gHelperPid > 0) {
                 int status = 0;
-                waitpid(gHelperPid, &status, 0);
+                if (waitpid(gHelperPid, &status, 0) == gHelperPid) {
+                    exitDetail = ndi_timelinewatch_mac::describeWaitStatus(status);
+                }
                 gHelperPid = -1;
             }
             if (!gStop.load(std::memory_order_relaxed)) {
-                setHealthLocked(false, "helper exited — retrying");
-                WATCH_LOG("helper exited — retrying in 30 s (Manual Path mode is "
-                          "unaffected)");
+                setHealthLocked(false, "helper exited (" + exitDetail + ") — retrying");
+                WATCH_LOG(("helper exited (" + exitDetail + ") — retrying in 30 s (Manual "
+                           "Path mode is unaffected)").c_str());
             }
         }
         for (int i = 0; i < kRespawnBackoffSeconds * 10 && !gStop.load(); ++i) {
