@@ -30,7 +30,7 @@ make dev
 
 Incremental build; produces `NDIOutput.ofx.bundle/` in the repo root. `make` (default target) is identical — despite older docs, **no target auto-increments the version**. `make clean` removes the bundle, all object files, and the `build/` test-binary directory.
 
-The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks) and, on macOS, AppKit + UniformTypeIdentifiers (for the Browse buttons' native open panel, `src/MacFileDialog.mm`). All ship with the macOS SDK — no extra install. A future Windows build needs a zlib to match; the browse buttons are macOS-only.
+The plugin links against zlib (`-lz`, for the STMap EXR reader's Zip-compressed chunks) and, on macOS, AppKit + UniformTypeIdentifiers (for the Browse buttons' native open panel, `src/MacFileDialog.mm`). All ship with the macOS SDK — no extra install. The Windows build gets its zlib from vcpkg and its Browse dialogs from `src/WinFileDialog.cpp` (IFileOpenDialog; ole32 + shell32) — see the Windows section.
 
 The Camera Metadata projection (v1.10.0) compiles against [third_party/braw/](third_party/braw/) — the Blackmagic RAW API header and dispatch shim, vendored from Blackmagic RAW SDK 5.1 under their Boost-style license (notices intact; re-copy both files from `/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Include/` to update). **Nothing Blackmagic is linked or bundled**: the shim resolves `BlackmagicRawAPI.framework` at runtime from the host application's own bundle — inside Resolve that is Resolve's shipped copy (identical to the SDK's, verified 5.1/50100.40.160) — falling back to the standalone SDK install, and failing soft (passthrough + Stream Status message) when neither exists. Building the plugin therefore needs no Blackmagic install at all.
 
@@ -120,11 +120,13 @@ A release build differs from the dev build (universal, deployment target, bundle
 
 ---
 
-## Windows — STATUS: CUDA GPU-native pipeline in the build (ticket #22); installer pending (ticket #23)
+## Windows — STATUS: CUDA GPU-native pipeline (ticket #22) and native Browse dialogs (ticket #24) in the build; installer pending (ticket #23)
 
 The May-2025 scaffold (commit `50eacc1`) never built, was never diagnosed, and predated the plugin's modern architecture — the port is being **redone, not repaired**, on the long-lived `windows-port` branch (its dead pieces — the MinGW script, the D3D11 "fallback", the OpenGL vestiges, the host-memory CUDA sketch — are deleted; git history keeps them). Plan and decisions: [docs/windows-port-spec.md](docs/windows-port-spec.md); research: [docs/2026-08-30-windows-port-feasibility.md](docs/2026-08-30-windows-port-feasibility.md); work items: GitHub issues labeled `windows`. Findings still go to [LEARNINGS.md](LEARNINGS.md).
 
 **Still owed from issue #22 (Tier 1–2, human on the workstation):** GPU-native log lines during real playback with no CPU-fallback lines, 8K stereo rates comparable to macOS, and the render-call probe matrix re-run (Render Cache / proxy modes / stereo per-eye instances) before trusting stereo pairing on Windows — findings to LEARNINGS.md when they happen. Tier 0 (build + all tests, kernel identity on the workstation GPU) is what this section's status line covers.
+
+**Still owed from issue #24 (Tier 1–2, human in Resolve):** the four Browse buttons appear next to their path fields, a picked file (including a non-ASCII path) lands in the field and the map/clip loads, and Cancel changes nothing — findings to LEARNINGS.md.
 
 ### Prerequisites
 

@@ -69,6 +69,56 @@ static void testUtf8ToWide()
     expectTrue(!utf8ToWide("\xED\xA0\x80", &w), "lone surrogate rejected");
 }
 
+// The reverse direction feeds the Windows browse dialog (ticket #24): the
+// picked path comes back from COM as UTF-16 and must reach the OFX string
+// param as UTF-8. Same strictness contract as utf8ToWide.
+static void testWideToUtf8()
+{
+    using ndi_path::detail::utf8ToWide;
+    using ndi_path::detail::wideToUtf8;
+    std::string u;
+
+    expectTrue(wideToUtf8(L"abc", &u) && u == "abc", "ASCII converts back");
+    expectTrue(wideToUtf8(L"", &u) && u.empty(), "empty wide string converts");
+
+    // U+00E9 -> 2-byte sequence
+    expectTrue(wideToUtf8(L"\u00E9", &u) && u == "\xC3\xA9", "BMP 2-byte (e-acute)");
+
+    // U+65E5 -> 3-byte sequence
+    expectTrue(wideToUtf8(L"\u65E5", &u) && u == "\xE6\x97\xA5", "BMP 3-byte (CJK)");
+
+    // Surrogate pair D834 DD1E -> U+1D11E -> 4-byte sequence
+    {
+        const wchar_t pair[] = {0xD834, 0xDD1E, 0};
+        expectTrue(wideToUtf8(pair, &u) && u == "\xF0\x9D\x84\x9E",
+                   "surrogate pair becomes a 4-byte sequence");
+    }
+
+    // Mixed path-like string survives intact.
+    expectTrue(wideToUtf8(L"C:\\maps\\st\u00E9r\u00E9o\\map.exr", &u) &&
+                   u == "C:\\maps\\st\xC3\xA9r\xC3\xA9o\\map.exr",
+               "mixed path converts back");
+
+    // Lone surrogates are rejected, not silently mangled (WTF-8 is not a
+    // valid OFX param value).
+    {
+        const wchar_t loneHigh[] = {0xD834, 0};
+        const wchar_t loneLow[] = {0xDD1E, L'x', 0};
+        const wchar_t highBeforeBmp[] = {0xD834, 0x0041, 0};
+        expectTrue(!wideToUtf8(loneHigh, &u), "lone high surrogate rejected");
+        expectTrue(!wideToUtf8(loneLow, &u), "lone low surrogate rejected");
+        expectTrue(!wideToUtf8(highBeforeBmp, &u), "high surrogate before BMP char rejected");
+    }
+
+    // Round trip through both converters is the identity.
+    {
+        const char* path = "D:\\\xE3\x82\xAF\xE3\x83\xAA\xE3\x83\x83\xE3\x83\x97\\st\xC3\xA9r\xC3\xA9o_\xF0\x9D\x84\x9E.exr";
+        std::wstring w;
+        expectTrue(utf8ToWide(path, &w) && wideToUtf8(w.c_str(), &u) && u == path,
+                   "utf8 -> wide -> utf8 round trip is identity");
+    }
+}
+
 // Round-trip a file whose name needs every byte width: write via the shim,
 // stat it, read it back, remove it. On macOS/Linux the shims are thin
 // passthroughs; on Windows this is the behavior the port exists for.
@@ -117,6 +167,7 @@ static void testMissingFile()
 int main()
 {
     testUtf8ToWide();
+    testWideToUtf8();
     testFileRoundTrip();
     testMissingFile();
 
