@@ -400,6 +400,13 @@ The `50eacc1` scaffold (host-memory CUDA sketch, D3D11 "fallback" that converted
 **Validated by:** Tier 0 on the merged tree on macOS — `make dev` + full `make test` (all suites incl. the Windows-authored platform-path/NDI-loader tests and the new mac timeline-watch seam) green; Windows CI compile on the PR.
 **Rule:** never park a platform port on a long-lived branch when it shares the version line — integrate into `dev` behind file-level platform isolation and let the release bar gate `master`, not `dev`.
 
+### 2026-09-01 — The release zip fails `codesign --verify` after `unzip`, but is fine: AppleDouble `._` files (v1.14.1 release check)
+**Symptom:** verifying the v1.14.1 release zip by `unzip` + `codesign --verify --strict --deep` reported "a sealed resource is missing or invalid", with `file added: …/Contents/MacOS/._NDIOutput.ofx` and friends — while the pkg had just passed strict verification and notarization.
+**Root cause:** `package_release.sh` zips with `ditto -c -k --keepParent`, which stores extended attributes as AppleDouble `._*` sidecar entries. Info-ZIP `unzip` extracts those sidecars as real files inside the bundle, and codesign's seal walker sees them as unsealed additions. Finder / Archive Utility / `ditto -x -k` re-fold them into xattrs, and the bundle verifies ("valid on disk, satisfies its Designated Requirement"). The 1.14.0 zip behaves identically; nothing regressed.
+**Fix:** none needed for the artifacts (the zip itself was notarized). Candidate hardening for the next release, to be verified with a `--skip-notarize` packaging run: `ditto -c -k --keepParent --norsrc` so the archive carries no sidecars and `unzip` users get a clean bundle too.
+**Validated by:** `ditto -x -k` extraction of the 1.14.1 and 1.14.0 zips both pass `codesign --verify --strict --deep`; Gatekeeper `spctl -a -t install` accepts the pkg as "Notarized Developer ID".
+**Rule:** verify a release zip with `ditto -x -k`, never `unzip`, before concluding the signature is broken — and consider `--norsrc` when producing it.
+
 ### OPEN — Windows/CUDA build failing (as of 2026-08-28)
 Commit `50eacc1` added the CMake + CUDA port ([CMakeLists.txt](CMakeLists.txt), [src/CudaGPUAcceleration.cu](src/CudaGPUAcceleration.cu), two build .bat variants) but it has not yet produced a working build. Needs a Windows machine with VS 2019+/CUDA 11+/NDI 6 Advanced SDK to iterate. Record the actual failure output here when work resumes — "failing" without the error text is unactionable.
 
